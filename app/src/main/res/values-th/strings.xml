@@ -295,10 +295,10 @@
     <string name="daemon_name_surveillance">Daemon การสังเกต</string>
     <string name="daemon_name_acc_surveillance">ACC การติดตาม</string>
     <string name="daemon_name_singbox">Sing-box Proxy</string>
-    <string name="daemon_name_cloudflared">อุโมงค์ Cloudflared</string>
-    <string name="daemon_name_zrok">เส้นทาง Zrok</string>
-    <string name="daemon_name_tailscale">เส้นทาง Tailscale</string>
-    <string name="daemon_name_telegram">โบ๊ต Telegram</string>
+    <string name="daemon_name_cloudflared">Cloudflared Tunnel</string>
+    <string name="daemon_name_zrok">Zrok Tunnel</string>
+    <string name="daemon_name_tailscale">Tailscale Tunnel</string>
+    <string name="daemon_name_telegram">Bot Telegram</string>
     <string name="clip_label_access_code">รหัสเข้าถึง</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">ไม่ต้องตั้งค่าสำหรับ %1$s</string>
