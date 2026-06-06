@@ -261,10 +261,14 @@
      *     a roof-down silhouette with the front pointing UP. Used by the
      *     Live View camera selector so FRONT/REAR/LEFT/RIGHT hotspots
      *     align with the rendered body.
+      *   view='three-quarter' — slightly angled profile for dashboard
+      *     hero cards: keeps side readability while adding depth.
      */
     function OverdriveEvCard3D(canvasEl, opts) {
         this.canvas = canvasEl;
-        this.view = (opts && opts.view === 'top') ? 'top' : 'side';
+          this.view = 'side';
+          if (opts && opts.view === 'top') this.view = 'top';
+          else if (opts && opts.view === 'three-quarter') this.view = 'three-quarter';
         this.scene = null;
         this.camera = null;
         this.renderer = null;
@@ -345,6 +349,10 @@
             this.camera.up.set(0, 0, -1);
             this.camera.position.set(0, 3, 0);
             this.camera.lookAt(0, 0, 0);
+        } else if (this.view === 'three-quarter') {
+            // 3/4 profile for larger hero canvases.
+            this.camera.position.set(0.9, 0.45, 3.2);
+            this.camera.lookAt(0, 0.05, 0);
         } else {
             // Pure side profile. Camera held close (distance 3) with
             // a narrow FOV so the GLB fills the ~196×200 canvas
@@ -672,6 +680,8 @@
             //              pointing south on the canvas.
             if (self.view === 'top') {
                 self.carModel.rotation.y = Math.PI;
+            } else if (self.view === 'three-quarter') {
+                self.carModel.rotation.y = Math.PI / 4;
             } else {
                 self.carModel.rotation.y = Math.PI / 2;
             }

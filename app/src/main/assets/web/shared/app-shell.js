@@ -933,7 +933,9 @@
     // the latest values once the renderer module is in place.
     window.OverdriveAppShell.mountVehicleCanvas = function (canvasEl, opts) {
         if (!canvasEl) return null;
-        var view = (opts && opts.view === 'top') ? 'top' : 'side';
+        var view = 'side';
+        if (opts && opts.view === 'top') view = 'top';
+        else if (opts && opts.view === 'three-quarter') view = 'three-quarter';
 
         // Sprite-cache fast path. If we have a webp for this
         // (model, colour, view), paint the canvas in 2D and stop.

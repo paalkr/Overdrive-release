@@ -47,6 +47,10 @@
                         </div>
                     </div>
                     <div class="dash-vehicle-canvas-wrap">
+                        <div class="dash-hero-soc" aria-live="polite">
+                            <span data-i18n="dashboard.metric_battery">Battery</span>
+                            <strong id="dashHeroSoc">--</strong>
+                        </div>
                         <canvas id="dashHero3d" class="dash-vehicle-canvas" aria-hidden="true"></canvas>
                     </div>
                 </section>
@@ -193,7 +197,18 @@
             align-items: stretch;
             gap: 18px;
             padding: 20px;
-            background: var(--bg-surface);
+            background:
+                radial-gradient(80% 60% at 18% 12%,
+                    rgba(0, 212, 170, 0.16) 0%,
+                    rgba(0, 212, 170, 0.04) 40%,
+                    transparent 70%),
+                radial-gradient(60% 40% at 50% 100%,
+                    rgba(0, 212, 170, 0.08) 0%,
+                    transparent 65%),
+                linear-gradient(135deg,
+                    var(--bg-elevated) 0%,
+                    var(--bg-surface) 60%,
+                    var(--bg-base) 100%);
             border: 1px solid var(--border-subtle);
             border-radius: 8px;
             overflow: hidden;
@@ -270,6 +285,7 @@
         .dash-vehicle-canvas-wrap {
             position: relative;
             width: 100%;
+            --dash-canvas-pad: 10px;
             /* Stable height for old BYD WebViews without aspect-ratio.
                Desktop fills the unified hero card; mobile trims to 200px. */
             min-height: 270px;
@@ -280,27 +296,49 @@
                  1. broad teal radial highlight from upper-left,
                  2. faint warm glow under the car (ground bounce),
                  3. base elevated surface. */
-            background:
-                radial-gradient(80% 60% at 18% 12%,
-                    rgba(0, 212, 170, 0.16) 0%,
-                    rgba(0, 212, 170, 0.04) 40%,
-                    transparent 70%),
-                radial-gradient(60% 40% at 50% 100%,
-                    rgba(0, 212, 170, 0.08) 0%,
-                    transparent 65%),
-                linear-gradient(135deg,
-                    var(--bg-elevated) 0%,
-                    var(--bg-surface) 60%,
-                    var(--bg-base) 100%);
+            background: transparent;
+            padding: var(--dash-canvas-pad);
+            box-sizing: border-box;
         }
 
         .dash-vehicle-canvas {
             position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
+            top: var(--dash-canvas-pad);
+            left: var(--dash-canvas-pad);
+            width: calc(100% - (var(--dash-canvas-pad) * 2));
+            height: calc(100% - (var(--dash-canvas-pad) * 2));
             display: block;
+        }
+
+        .dash-hero-soc {
+            position: absolute;
+            top: 14px;
+            right: 14px;
+            z-index: 2;
+            min-width: 90px;
+            padding: 8px 10px;
+            border-radius: 10px;
+            border: 1px solid rgba(0, 212, 170, 0.28);
+            background: rgba(4, 18, 22, 0.68);
+            backdrop-filter: blur(4px);
+            text-align: right;
+        }
+
+        .dash-hero-soc span {
+            display: block;
+            color: var(--text-muted);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 2px;
+        }
+
+        .dash-hero-soc strong {
+            display: block;
+            color: var(--text-primary);
+            font-size: 20px;
+            line-height: 1;
         }
 
         .dash-grid {
@@ -703,7 +741,14 @@
                 setText('dashAcc', tOnOff(status.acc));
 
                 if (status.battery && status.battery.voltage) setText('dash12v', status.battery.voltage.toFixed(1) + 'V');
-                if (status.soc && status.soc.percent !== undefined) setText('dashSoc', Math.round(status.soc.percent) + '%');
+                if (status.soc && status.soc.percent !== undefined) {
+                    var socText = Math.round(status.soc.percent) + '%';
+                    setText('dashSoc', socText);
+                    setText('dashHeroSoc', socText);
+                } else {
+                    setText('dashSoc', '--');
+                    setText('dashHeroSoc', '--');
+                }
                 if (status.range && status.range.elecRangeKm !== undefined) setText('dashRange', BYD.units.dist(status.range.elecRangeKm));
 
                 if (status.network && status.network.type === 'wifi') setText('dashNetwork', status.network.ssid || 'WiFi');
@@ -774,9 +819,8 @@
                 if (!canvas) return;
                 var shell = window.OverdriveAppShell;
                 if (!shell || typeof shell.mountVehicleCanvas !== 'function') return;
-                if (!document.getElementById('evCardCanvas')) return; // sidebar not mounted yet
                 didMount = true;
-                shell.mountVehicleCanvas(canvas, { view: 'side' });
+                shell.mountVehicleCanvas(canvas, { view: 'three-quarter' });
             }
             document.addEventListener('app-shell:ready', mountHero);
             if (document.readyState === 'loading') {
