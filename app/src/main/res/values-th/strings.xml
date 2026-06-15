@@ -96,7 +96,7 @@
     <string name="url_connecting">กำลังเชื่อมต่อ…</string>
     <!-- Shown when an external link can't open (no browser on the head unit):
          the URL is copied to the clipboard instead. %1$s = the URL. -->
-    <string name="url_copied_no_browser">No browser found. Link copied: %1$s</string>
+    <string name="url_copied_no_browser">ไม่พบเบราว์เซอร์ คัดลอกลิงก์แล้ว: %1$s</string>
     <!-- dialog_tailscale_settings -->
     <string name="tailscale_generate_login_url">สร้าง URL เข้าสู่ระบบ</string>
     <string name="tailscale_scan_to_login">สแกนเพื่อเข้าสู่ระบบ</string>
@@ -138,8 +138,8 @@
     <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
     <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
     <string name="camera_oem_dashcam_save">Save</string>
-    <string name="camera_concurrent_probe_label">Test dual-camera support on next boot</string>
-    <string name="camera_concurrent_probe_subtitle">One-time check that opens both cameras at once to confirm this vehicle can run pano + dashcam concurrently. Runs once on the next restart while parked. Leave OFF unless recordings look wrong — it is not required and may briefly interrupt a recording if one is active when it runs.</string>
+    <string name="camera_concurrent_probe_label">ทดสอบรองรับกล้องคู่เมื่อบูตครั้งถัดไป</string>
+    <string name="camera_concurrent_probe_subtitle">การตรวจสอบครั้งเดียวที่เปิดกล้องทั้งสองตัวพร้อมกันเพื่อยืนยันว่ารถคันนี้รองรับพาโนพร้อมกล้องหน้ารถพร้อมกันได้ ทำงานครั้งเดียวเมื่อรีสตาร์ทครั้งถัดไปขณะจอด ปล่อยปิดไว้เว้นแต่ภาพบันทึกดูผิดปกติ — ไม่จำเป็นต้องใช้และอาจขัดจังหวะการบันทึกชั่วครู่หากมีการบันทึกอยู่ขณะทำงาน</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
          OEM dashcam id is the opposite of the pano id, so the helpful
          "this is what your trim should pick" hint flips between the two
@@ -374,45 +374,45 @@
     <string name="toast_updated_to">อัปเดตเป็น %1$s เรียบร้อยแล้ว</string>
     <string name="toast_update_install_failed">การติดตั้งอัปเดตล้มเหลว: %1$s</string>
     <string name="toast_checking_for_updates">กำลังตรวจสอบการอัปเดต…</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">แอปพลิเคชันเป็นเวอร์ชันล่าสุดแล้ว (v%1$s)</string>
     <string name="toast_update_check_failed">การตรวจสอบอัปเดตล้มเหลว: %1$s</string>
     <!-- Update dialog + version picker -->
-    <string name="update_dialog_available_title">Update available</string>
-    <string name="update_dialog_subtitle">A newer build is ready to install</string>
-    <string name="update_dialog_current">Current: v%1$s</string>
-    <string name="update_dialog_new">New: v%1$s</string>
-    <string name="update_dialog_current_label">Installed</string>
-    <string name="update_dialog_new_label">New version</string>
-    <string name="update_dialog_whats_new">What\'s new</string>
-    <string name="update_dialog_install_now">Install now</string>
-    <string name="update_dialog_later">Later</string>
-    <string name="update_picker_title">Choose a version</string>
-    <string name="update_picker_subtitle">Install any published build — newer or older</string>
-    <string name="update_picker_empty">No versions published yet.</string>
-    <string name="update_picker_current_suffix">%1$s (installed)</string>
-    <string name="update_picker_older_suffix">%1$s (older)</string>
+    <string name="update_dialog_available_title">มีอัปเดตใหม่</string>
+    <string name="update_dialog_subtitle">มีเวอร์ชันใหม่พร้อมติดตั้ง</string>
+    <string name="update_dialog_current">ปัจจุบัน: v%1$s</string>
+    <string name="update_dialog_new">ใหม่: v%1$s</string>
+    <string name="update_dialog_current_label">ติดตั้งแล้ว</string>
+    <string name="update_dialog_new_label">เวอร์ชันใหม่</string>
+    <string name="update_dialog_whats_new">มีอะไรใหม่</string>
+    <string name="update_dialog_install_now">ติดตั้งตอนนี้</string>
+    <string name="update_dialog_later">ภายหลัง</string>
+    <string name="update_picker_title">เลือกเวอร์ชัน</string>
+    <string name="update_picker_subtitle">ติดตั้งเวอร์ชันที่เผยแพร่แล้ว — จะใหม่กว่าหรือเก่ากว่าก็ได้</string>
+    <string name="update_picker_empty">ยังไม่มีเวอร์ชันที่เผยแพร่</string>
+    <string name="update_picker_current_suffix">%1$s (ติดตั้งแล้ว)</string>
+    <string name="update_picker_older_suffix">%1$s (เก่ากว่า)</string>
     <!-- Update progress (title + per-step status; no emoji — state icon carries the cue) -->
-    <string name="update_progress_title">Updating Overdrive</string>
-    <string name="update_step_downloading">Downloading update…</string>
-    <string name="update_step_verifying">Verifying download…</string>
-    <string name="update_step_stopping">Stopping daemons…</string>
-    <string name="update_step_installing">Installing update…</string>
-    <string name="update_step_installed">Update installed</string>
-    <string name="update_step_restarting">Restarting app…</string>
-    <string name="update_step_queued">Starting update…</string>
-    <string name="update_error_title">Update failed</string>
-    <string name="update_error_daemon_down">Camera daemon isn\'t running. Start it from the Daemons screen, then try updating again.</string>
-    <string name="update_error_start_failed">Couldn\'t start the update: %1$s</string>
-    <string name="update_error_lost_headunit">Lost contact with the head unit before the install finished. On a tunnel? Check Telegram for the new URL, or use the local IP.</string>
-    <string name="update_hide">Hide</string>
+    <string name="update_progress_title">กำลังอัปเดต Overdrive</string>
+    <string name="update_step_downloading">กำลังดาวน์โหลดอัปเดต…</string>
+    <string name="update_step_verifying">กำลังตรวจสอบการดาวน์โหลด…</string>
+    <string name="update_step_stopping">กำลังหยุด daemon…</string>
+    <string name="update_step_installing">กำลังติดตั้งอัปเดต…</string>
+    <string name="update_step_installed">ติดตั้งอัปเดตแล้ว</string>
+    <string name="update_step_restarting">กำลังรีสตาร์ทแอป…</string>
+    <string name="update_step_queued">กำลังเริ่มอัปเดต…</string>
+    <string name="update_error_title">อัปเดตล้มเหลว</string>
+    <string name="update_error_daemon_down">daemon กล้องไม่ได้ทำงาน โปรดเริ่มจากหน้าจอ Daemons แล้วลองอัปเดตอีกครั้ง</string>
+    <string name="update_error_start_failed">ไม่สามารถเริ่มการอัปเดตได้: %1$s</string>
+    <string name="update_error_lost_headunit">ขาดการติดต่อกับ head unit ก่อนการติดตั้งเสร็จสิ้น อยู่ในอุโมงค์ใช่หรือไม่? ตรวจสอบ Telegram เพื่อดู URL ใหม่ หรือใช้ IP ภายในเครื่อง</string>
+    <string name="update_hide">ซ่อน</string>
     <!-- Update channel selector (Settings → About) -->
-    <string name="settings_update_channel_title">Update channel</string>
+    <string name="settings_update_channel_title">ช่องทางการอัปเดต</string>
     <string name="settings_update_channel_alpha">Alpha</string>
     <string name="settings_update_channel_braveheart">Braveheart</string>
-    <string name="settings_update_channel_alpha_desc">The stable release. Every published version is kept — pick any to install (downgrades allowed). Recommended for everyday use.</string>
-    <string name="settings_update_channel_braveheart_desc">Bleeding-edge builds, delivered the moment they\'re published. You get new features first, but they may be unstable or buggy. If something breaks, open the Daemons screen, tap a daemon\'s log, choose \"Upload &amp; get a code\", and share the code with us on the community channels.</string>
-    <string name="settings_update_channel_save_failed">Could not save the update channel</string>
-    <string name="settings_update_channel_braveheart_toast">Switched to Braveheart. Builds may be unstable — if something breaks, send the daemon log and report it on Discord/GitHub/WhatsApp.</string>
+    <string name="settings_update_channel_alpha_desc">เวอร์ชันเสถียร ทุกเวอร์ชันที่เผยแพร่จะถูกเก็บไว้ — เลือกเวอร์ชันใดก็ได้เพื่อติดตั้ง (อนุญาตให้ดาวน์เกรดได้) แนะนำสำหรับการใช้งานทั่วไป</string>
+    <string name="settings_update_channel_braveheart_desc">เวอร์ชันทดลองใหม่ล่าสุด จะถูกเผยแพร่ทันทีที่พร้อมใช้งาน คุณจะได้รับฟีเจอร์ใหม่ก่อนใคร แต่อาจไม่เสถียรหรือมีข้อผิดพลาด หากเกิดปัญหา ให้เปิดหน้าจอ Daemons แตะที่บันทึกของ daemon เลือก \"อัปโหลดและรับรหัส\" แล้วแชร์รหัสกับเราในช่องทางชุมชน</string>
+    <string name="settings_update_channel_save_failed">ไม่สามารถบันทึกช่องทางการอัปเดตได้</string>
+    <string name="settings_update_channel_braveheart_toast">เปลี่ยนเป็น Braveheart แล้ว เวอร์ชันอาจไม่เสถียร — หากเกิดปัญหา โปรดส่งบันทึก daemon และรายงานบน Discord/GitHub/WhatsApp</string>
     <!-- Community / report-a-bug links -->
     <string name="toast_storage_permission_required">จำเป็นต้องอนุญาตให้เข้าถึงพื้นที่เก็บข้อมูลเพื่อใช้สำหรับการบันทึกวิดีโอ</string>
     <string name="toast_url_copied_short">คัดลอก URL เรียบร้อยแล้ว</string>
@@ -543,22 +543,22 @@
     <string name="log_header_exported">ส่งออกเมื่อ: %1$s</string>
     <string name="log_header_truncated">หมายเหตุ: ตัดทอนข้อมูลให้แสดงเฉพาะ 10,000 บรรทัดล่าสุด (ทั้งหมด: %1$d บรรทัด)</string>
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
-    <string name="logs_send_title">Send %1$s log</string>
-    <string name="logs_send_title_plain">Send daemon log</string>
+    <string name="logs_send_title">ส่งบันทึก %1$s</string>
+    <string name="logs_send_title_plain">ส่งบันทึก daemon</string>
     <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
-    <string name="logs_send_upload">Upload &amp; get a code</string>
-    <string name="logs_send_upload_desc">Sends the log to us and gives you a short code. Easiest for support.</string>
-    <string name="logs_send_share">Share file…</string>
-    <string name="logs_send_share_desc">Save or send the log yourself via the share sheet.</string>
-    <string name="logs_uploading_title">Uploading log…</string>
-    <string name="logs_uploading_subtitle">Redacting secrets and sending securely</string>
-    <string name="logs_uploaded_title">Log uploaded</string>
-    <string name="logs_uploaded_instructions">Share this code with us, along with a note on what you were doing when it broke. Post it on Discord, GitHub Issues or WhatsApp — links are on the About screen.</string>
+    <string name="logs_send_upload">อัปโหลดและรับรหัส</string>
+    <string name="logs_send_upload_desc">ส่งบันทึกให้เราและให้รหัสสั้นๆ แก่คุณ สะดวกที่สุดสำหรับการสนับสนุน</string>
+    <string name="logs_send_share">แชร์ไฟล์…</string>
+    <string name="logs_send_share_desc">บันทึกหรือส่งบันทึกด้วยตนเองผ่านแผ่นแชร์</string>
+    <string name="logs_uploading_title">กำลังอัปโหลดบันทึก…</string>
+    <string name="logs_uploading_subtitle">กำลังปกปิดข้อมูลลับและส่งอย่างปลอดภัย</string>
+    <string name="logs_uploaded_title">อัปโหลดบันทึกแล้ว</string>
+    <string name="logs_uploaded_instructions">แชร์รหัสนี้กับเรา พร้อมระบุว่าคุณกำลังทำอะไรอยู่เมื่อเกิดปัญหา โพสต์บน Discord, GitHub Issues หรือ WhatsApp — ลิงก์อยู่ในหน้าจอเกี่ยวกับ</string>
     <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
-    <string name="logs_copy_code">Copy code</string>
-    <string name="logs_done">Done</string>
+    <string name="logs_copy_code">คัดลอกรหัส</string>
+    <string name="logs_done">เสร็จสิ้น</string>
     <string name="placeholder_dash">—</string>
-    <string name="errors_network">Network error</string>
+    <string name="errors_network">ข้อผิดพลาดเครือข่าย</string>
     <!-- Recording controls -->
     <!-- Recording library -->
     <string name="toast_cannot_play_video">ไม่สามารถเล่นวิดีโอได้: %1$s</string>
@@ -569,7 +569,7 @@
     <string name="toast_batch_delete_partial">ลบสำเร็จ %1$d ไฟล์, ล้มเหลว %2$d ไฟล์</string>
     <string name="play_with_chooser">เล่นด้วย</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">อัปเดตเป็น v%1$s เรียบร้อยแล้ว — กรุณายืนยันการตั้งค่าการทำงานอัตโนมัติอีกครั้ง เนื่องจากระบบ BYD จะรีเซ็ตค่าทุกครั้งที่มีการติดตั้งแอปพลิเคชัน</string>
     <string name="setup_overlay_already_granted">อนุญาตเรียบร้อยแล้ว</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">คำแนะนำและการแก้ปัญหา</string>
@@ -978,7 +978,7 @@
          RoadSense — road-hazard detection feature
          ============================================================ -->
     <string name="rail_roadsense">RoadSense</string>
-    <string name="rail_hazard_map">Map</string>
+    <string name="rail_hazard_map">แผนที่</string>
     <string name="roadsense_title">RoadSense</string>
     <string name="roadsense_pill_scanning">Scanning</string>
     <string name="roadsense_pill_idle">RoadSense</string>
@@ -1027,21 +1027,21 @@
     <!-- ============================================================== -->
     <!-- RoadSense Map (native MapLibre map view + tap-to-verify sheet). -->
     <!-- ============================================================== -->
-    <string name="roadsense_map_title">Map</string>
-    <string name="roadsense_map_route_clear">Clear</string>
-    <string name="roadsense_map_route_unmapped">Not mapped yet</string>
-    <string name="roadsense_map_back">Back</string>
-    <string name="roadsense_map_recenter">Recenter on my location</string>
+    <string name="roadsense_map_title">แผนที่</string>
+    <string name="roadsense_map_route_clear">ล้าง</string>
+    <string name="roadsense_map_route_unmapped">ยังไม่ได้ทำแผนที่</string>
+    <string name="roadsense_map_back">ย้อนกลับ</string>
+    <string name="roadsense_map_recenter">จัดกึ่งกลางที่ตำแหน่งของฉัน</string>
     <!-- Tap-to-verify bottom sheet -->
-    <string name="roadsense_map_severity_label">Severity</string>
-    <string name="roadsense_map_type_label">Type</string>
-    <string name="roadsense_map_type_unknown">Unknown</string>
-    <string name="roadsense_map_confirm">Confirm</string>
-    <string name="roadsense_map_delete">Delete</string>
+    <string name="roadsense_map_severity_label">ระดับความรุนแรง</string>
+    <string name="roadsense_map_type_label">ประเภท</string>
+    <string name="roadsense_map_type_unknown">ไม่ทราบ</string>
+    <string name="roadsense_map_confirm">ยืนยัน</string>
+    <string name="roadsense_map_delete">ลบ</string>
     <!-- Status chip labels: candidate / on-device / shared with fleet -->
-    <string name="roadsense_map_status_candidate">Candidate</string>
-    <string name="roadsense_map_status_local">On device</string>
-    <string name="roadsense_map_status_cloud">Shared</string>
+    <string name="roadsense_map_status_candidate">ข้อเสนอแนะ</string>
+    <string name="roadsense_map_status_local">บนอุปกรณ์</string>
+    <string name="roadsense_map_status_cloud">ที่แชร์</string>
     <!-- Meta line: "Moderate · 82% confidence · 3 reports" -->
     <string name="roadsense_map_meta_format">%1$s · %2$d%% confidence · %3$s</string>
     <!-- "3 reports" / "1 report" -->
@@ -1049,110 +1049,110 @@
         <item quantity="other">%1$d reports</item>
     </plurals>
     <!-- Snackbar / toast confirmations -->
-    <string name="roadsense_map_confirmed_toast">Hazard confirmed</string>
-    <string name="roadsense_map_deleted_toast">Hazard removed</string>
-    <string name="roadsense_map_action_failed">Could not reach RoadSense. Try again.</string>
-    <string name="roadsense_map_no_location">Waiting for GPS fix…</string>
+    <string name="roadsense_map_confirmed_toast">ยืนยันอันตรายแล้ว</string>
+    <string name="roadsense_map_deleted_toast">ลบอันตรายแล้ว</string>
+    <string name="roadsense_map_action_failed">ไม่สามารถเชื่อมต่อ RoadSense ได้ ลองอีกครั้ง</string>
+    <string name="roadsense_map_no_location">กำลังรอสัญญาณ GPS…</string>
     <!-- Navigation: search + routing + turn-by-turn -->
-    <string name="roadsense_map_search_hint">Search destination</string>
-    <string name="roadsense_map_search_action">Search</string>
-    <string name="roadsense_map_searching">Searching…</string>
-    <string name="roadsense_map_no_results">No places found</string>
-    <string name="roadsense_map_pick_destination">Choose destination</string>
-    <string name="roadsense_map_routing">Finding route…</string>
-    <string name="roadsense_map_route_failed">Could not find a route. Try again.</string>
-    <string name="roadsense_map_need_key">Add a routing key in RoadSense settings to navigate.</string>
-    <string name="roadsense_map_rerouting">Off route — recalculating…</string>
-    <string name="roadsense_map_arrived">You have arrived.</string>
-    <string name="roadsense_map_nav_started">Navigating to %1$s</string>
-    <string name="roadsense_map_nav_ended">Navigation ended</string>
-    <string name="roadsense_map_end_nav">End navigation</string>
-    <string name="roadsense_map_zoom_in">Zoom in</string>
-    <string name="roadsense_map_zoom_out">Zoom out</string>
+    <string name="roadsense_map_search_hint">ค้นหาปลายทาง</string>
+    <string name="roadsense_map_search_action">ค้นหา</string>
+    <string name="roadsense_map_searching">กำลังค้นหา…</string>
+    <string name="roadsense_map_no_results">ไม่พบสถานที่</string>
+    <string name="roadsense_map_pick_destination">เลือกปลายทาง</string>
+    <string name="roadsense_map_routing">กำลังค้นหาเส้นทาง…</string>
+    <string name="roadsense_map_route_failed">ไม่พบเส้นทาง ลองอีกครั้ง</string>
+    <string name="roadsense_map_need_key">เพิ่มคีย์การนำทางในการตั้งค่า RoadSense เพื่อนำทาง</string>
+    <string name="roadsense_map_rerouting">ออกนอกเส้นทาง — กำลังคำนวณใหม่…</string>
+    <string name="roadsense_map_arrived">คุณมาถึงแล้ว</string>
+    <string name="roadsense_map_nav_started">กำลังนำทางไปยัง %1$s</string>
+    <string name="roadsense_map_nav_ended">สิ้นสุดการนำทางแล้ว</string>
+    <string name="roadsense_map_end_nav">สิ้นสุดการนำทาง</string>
+    <string name="roadsense_map_zoom_in">ซูมเข้า</string>
+    <string name="roadsense_map_zoom_out">ซูมออก</string>
     <!-- Hazard visibility filter -->
-    <string name="roadsense_map_hazards_filter">Hazard visibility</string>
-    <string name="roadsense_map_hazards_all">Show all hazards</string>
-    <string name="roadsense_map_hazards_moderate">Moderate and severe</string>
-    <string name="roadsense_map_hazards_severe">Severe only</string>
-    <string name="roadsense_map_hazards_hidden">Hide hazards</string>
+    <string name="roadsense_map_hazards_filter">การแสดงอันตราย</string>
+    <string name="roadsense_map_hazards_all">แสดงอันตรายทั้งหมด</string>
+    <string name="roadsense_map_hazards_moderate">ปานกลางและรุนแรง</string>
+    <string name="roadsense_map_hazards_severe">รุนแรงเท่านั้น</string>
+    <string name="roadsense_map_hazards_hidden">ซ่อนอันตราย</string>
     <!-- POI along route (EV charging / fuel) -->
-    <string name="roadsense_map_poi_toggle">Charging and fuel</string>
+    <string name="roadsense_map_poi_toggle">การชาร์จและเชื้อเพลิง</string>
     <!-- 2D / 3D buildings toggle -->
-    <string name="roadsense_map_dimension_toggle">2D / 3D buildings</string>
-    <string name="roadsense_map_3d_on">3D buildings on</string>
-    <string name="roadsense_map_3d_off">3D buildings off</string>
-    <string name="roadsense_map_poi_loading">Finding charging and fuel stops…</string>
-    <string name="roadsense_map_poi_none">No stations found nearby</string>
-    <string name="roadsense_map_poi_need_route">Choose a destination first</string>
+    <string name="roadsense_map_dimension_toggle">อาคาร 2D / 3D</string>
+    <string name="roadsense_map_3d_on">เปิดอาคาร 3D</string>
+    <string name="roadsense_map_3d_off">ปิดอาคาร 3D</string>
+    <string name="roadsense_map_poi_loading">กำลังค้นหาสถานีชาร์จและเติมเชื้อเพลิง…</string>
+    <string name="roadsense_map_poi_none">ไม่พบสถานีใกล้เคียง</string>
+    <string name="roadsense_map_poi_need_route">เลือกปลายทางก่อน</string>
     <!-- POI tap action sheet -->
-    <string name="roadsense_map_stop_added">Stop added</string>
-    <string name="roadsense_map_remove_stop_action">Remove stop</string>
-    <string name="roadsense_map_poi_navigate">Navigate here</string>
-    <string name="roadsense_map_poi_kind_charging">Charging station</string>
-    <string name="roadsense_map_poi_kind_fuel">Fuel station</string>
-    <string name="roadsense_map_poi_charging_generic">Charging station</string>
-    <string name="roadsense_map_poi_fuel_generic">Fuel station</string>
-    <string name="roadsense_map_route_switched">Switched route</string>
+    <string name="roadsense_map_stop_added">เพิ่มจุดแวะแล้ว</string>
+    <string name="roadsense_map_remove_stop_action">ลบจุดแวะ</string>
+    <string name="roadsense_map_poi_navigate">นำทางมาที่นี่</string>
+    <string name="roadsense_map_poi_kind_charging">สถานีชาร์จ</string>
+    <string name="roadsense_map_poi_kind_fuel">สถานีเติมเชื้อเพลิง</string>
+    <string name="roadsense_map_poi_charging_generic">สถานีชาร์จ</string>
+    <string name="roadsense_map_poi_fuel_generic">สถานีเติมเชื้อเพลิง</string>
+    <string name="roadsense_map_route_switched">เปลี่ยนเส้นทางแล้ว</string>
     <!-- "then <next maneuver>" preview shown in the maneuver banner -->
-    <string name="roadsense_map_then">then</string>
+    <string name="roadsense_map_then">จากนั้น</string>
     <!-- Roundabout exit ordinal in the maneuver banner (%1$d = exit number) -->
-    <string name="roadsense_map_exit_n">exit %1$d</string>
+    <string name="roadsense_map_exit_n">ออก %1$d</string>
     <!-- Hazards-along-route pills (%1$d = count) -->
-    <string name="roadsense_map_pill_severe">%1$d severe</string>
-    <string name="roadsense_map_pill_moderate">%1$d moderate</string>
-    <string name="roadsense_map_pill_minor">%1$d minor</string>
+    <string name="roadsense_map_pill_severe">รุนแรง %1$d รายการ</string>
+    <string name="roadsense_map_pill_moderate">ปานกลาง %1$d รายการ</string>
+    <string name="roadsense_map_pill_minor">เล็กน้อย %1$d รายการ</string>
     <!-- Shown briefly if the basemap can\'t be reached. -->
-    <string name="roadsense_map_offline">Map data unavailable offline</string>
+    <string name="roadsense_map_offline">ข้อมูลแผนที่ใช้งานไม่ได้ขณะออฟไลน์</string>
     <!-- Navigation: autocomplete + route options -->
-    <string name="roadsense_map_clear_search">Clear search</string>
+    <string name="roadsense_map_clear_search">ล้างการค้นหา</string>
     <!-- Route-options sheet -->
-    <string name="roadsense_map_routes_title">Choose a route</string>
-    <string name="roadsense_map_routes_to">Routes to %1$s</string>
-    <string name="roadsense_map_routes_cancel">Cancel</string>
+    <string name="roadsense_map_routes_title">เลือกเส้นทาง</string>
+    <string name="roadsense_map_routes_to">เส้นทางไปยัง %1$s</string>
+    <string name="roadsense_map_routes_cancel">ยกเลิก</string>
     <!-- Per-route row label, %1$d is the 1-based route number. -->
-    <string name="roadsense_map_route_option">Route %1$d</string>
-    <string name="roadsense_map_fastest">Fastest</string>
-    <string name="roadsense_map_start">Start</string>
+    <string name="roadsense_map_route_option">เส้นทางที่ %1$d</string>
+    <string name="roadsense_map_fastest">เร็วที่สุด</string>
+    <string name="roadsense_map_start">เริ่ม</string>
     <!-- Stops / waypoints in the route-options sheet -->
-    <string name="roadsense_map_your_location">Your location</string>
-    <string name="roadsense_map_add_stop">Add stop</string>
-    <string name="roadsense_map_add_stop_hint">Search a stop to add</string>
-    <string name="roadsense_map_stop_removed">Stop removed</string>
-    <string name="roadsense_map_remove_stop">Remove stop</string>
-    <string name="roadsense_map_move_stop_up">Move stop up</string>
-    <string name="roadsense_map_move_stop_down">Move stop down</string>
+    <string name="roadsense_map_your_location">ตำแหน่งของคุณ</string>
+    <string name="roadsense_map_add_stop">เพิ่มจุดแวะ</string>
+    <string name="roadsense_map_add_stop_hint">ค้นหาจุดแวะเพื่อเพิ่ม</string>
+    <string name="roadsense_map_stop_removed">ลบจุดแวะแล้ว</string>
+    <string name="roadsense_map_remove_stop">ลบจุดแวะ</string>
+    <string name="roadsense_map_move_stop_up">เลื่อนจุดแวะขึ้น</string>
+    <string name="roadsense_map_move_stop_down">เลื่อนจุดแวะลง</string>
     <!-- %1$d is the maximum number of stops allowed. -->
-    <string name="roadsense_map_max_stops">Up to %1$d stops allowed</string>
+    <string name="roadsense_map_max_stops">อนุญาตให้มีจุดแวะได้สูงสุด %1$d จุด</string>
     <!-- Map day/night override (Auto → Light → Dark) -->
-    <string name="roadsense_map_theme_toggle">Map theme</string>
-    <string name="roadsense_map_theme_auto">Map theme: Auto</string>
-    <string name="roadsense_map_theme_light">Map theme: Light</string>
-    <string name="roadsense_map_theme_dark">Map theme: Dark</string>
+    <string name="roadsense_map_theme_toggle">ธีมแผนที่</string>
+    <string name="roadsense_map_theme_auto">ธีมแผนที่: อัตโนมัติ</string>
+    <string name="roadsense_map_theme_light">ธีมแผนที่: สว่าง</string>
+    <string name="roadsense_map_theme_dark">ธีมแผนที่: มืด</string>
     <!-- Saved places (Home / Work / custom favourites) -->
-    <string name="roadsense_map_saved_home">Home</string>
-    <string name="roadsense_map_saved_work">Work</string>
-    <string name="roadsense_map_saved_set_home">Set Home</string>
-    <string name="roadsense_map_saved_set_work">Set Work</string>
+    <string name="roadsense_map_saved_home">บ้าน</string>
+    <string name="roadsense_map_saved_work">ที่ทำงาน</string>
+    <string name="roadsense_map_saved_set_home">ตั้งค่าบ้าน</string>
+    <string name="roadsense_map_saved_set_work">ตั้งค่าที่ทำงาน</string>
     <!-- Short action label for the "save as a custom favourite" button. -->
-    <string name="roadsense_map_saved_favourite">Favourite</string>
-    <string name="roadsense_map_save_place">Save place</string>
-    <string name="roadsense_map_save_as_home">Save as Home</string>
-    <string name="roadsense_map_save_as_work">Save as Work</string>
-    <string name="roadsense_map_save_as_custom">Save as favourite…</string>
-    <string name="roadsense_map_saved_added">Saved</string>
-    <string name="roadsense_map_saved_removed">Removed from saved</string>
-    <string name="roadsense_map_saved_remove">Remove</string>
-    <string name="roadsense_map_recent_remove">Remove from recents</string>
-    <string name="roadsense_map_recent_removed">Removed from recents</string>
-    <string name="roadsense_map_custom_label_hint">Label (e.g. Gym, Mum\'s)</string>
-    <string name="roadsense_map_custom_label_title">Name this place</string>
-    <string name="roadsense_map_save">Save</string>
-    <string name="roadsense_map_cancel">Cancel</string>
+    <string name="roadsense_map_saved_favourite">รายการโปรด</string>
+    <string name="roadsense_map_save_place">บันทึกสถานที่</string>
+    <string name="roadsense_map_save_as_home">บันทึกเป็นบ้าน</string>
+    <string name="roadsense_map_save_as_work">บันทึกเป็นที่ทำงาน</string>
+    <string name="roadsense_map_save_as_custom">บันทึกเป็นรายการโปรด…</string>
+    <string name="roadsense_map_saved_added">บันทึกแล้ว</string>
+    <string name="roadsense_map_saved_removed">ลบออกจากที่บันทึกไว้แล้ว</string>
+    <string name="roadsense_map_saved_remove">ลบ</string>
+    <string name="roadsense_map_recent_remove">ลบออกจากล่าสุด</string>
+    <string name="roadsense_map_recent_removed">ลบออกจากล่าสุดแล้ว</string>
+    <string name="roadsense_map_custom_label_hint">ป้ายกำกับ (เช่น ยิม, บ้านแม่)</string>
+    <string name="roadsense_map_custom_label_title">ตั้งชื่อสถานที่นี้</string>
+    <string name="roadsense_map_save">บันทึก</string>
+    <string name="roadsense_map_cancel">ยกเลิก</string>
     <!-- Place-action sheet (long-press the map or a search result to save/navigate) -->
-    <string name="roadsense_map_dropped_pin">Dropped pin</string>
-    <string name="roadsense_map_navigate_here">Navigate here</string>
+    <string name="roadsense_map_dropped_pin">หมุดที่ปัก</string>
+    <string name="roadsense_map_navigate_here">นำทางมาที่นี่</string>
     <!-- Shown after tapping an unset Home/Work chip: search picks the place to save. -->
-    <string name="roadsense_map_search_to_save">Search a place to set as %1$s</string>
+    <string name="roadsense_map_search_to_save">ค้นหาสถานที่เพื่อตั้งเป็น %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
-    <string name="roadsense_map_trip_restored">Trip restored</string>
+    <string name="roadsense_map_trip_restored">กู้คืนการเดินทางแล้ว</string>
 </resources>
