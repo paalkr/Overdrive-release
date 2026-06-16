@@ -392,7 +392,7 @@
     <string name="update_picker_current_suffix">%1$s (已安装)</string>
     <string name="update_picker_older_suffix">%1$s (旧)</string>
     <!-- Update progress (title + per-step status; no emoji — state icon carries the cue) -->
-    <string name="update_progress_title">正在更新过多驱动器</string>
+    <string name="update_progress_title">正在更新 Overdrive</string>
     <string name="update_step_downloading">正在下载更新…</string>
     <string name="update_step_verifying">正在验证下载…</string>
     <string name="update_step_stopping">停止守护进程…</string>
@@ -403,7 +403,7 @@
     <string name="update_error_title">更新失败</string>
     <string name="update_error_daemon_down">相机守护进程未运行。从守护进程屏幕启动，然后再次尝试更新。</string>
     <string name="update_error_start_failed">无法开始更新： %1$s</string>
-    <string name="update_error_lost_headunit">安装完成前丢失了与头部的联系。在隧道上吗？检查新的 URL，或使用本地IP。</string>
+    <string name="update_error_lost_headunit">安装完成前丢失了与头部的联系。在隧道上吗？请查看 Telegram 获取新的 URL，或使用本地IP。</string>
     <string name="update_hide">隐藏</string>
     <!-- Update channel selector (Settings → About) -->
     <string name="settings_update_channel_title">更新频道</string>
@@ -605,7 +605,7 @@
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">超载驱动器激活</string>
+    <string name="daemon_keepalive_notif_title">Overdrive 激活</string>
     <string name="daemon_keepalive_notif_text">监测车辆系统</string>
     <string name="overdrive_status_summary_title">超载驱动器</string>
     <string name="overdrive_status_summary_text">后台服务运行</string>
@@ -853,7 +853,7 @@
     <string name="settings_security_title">安全</string>
     <string name="settings_security_subtitle">锁定OverDrive应用，否则乘客和阀无法在没有您的 PIN 码的情况下打开它。</string>
     <string name="settings_security_stance_title">仅锁定界面</string>
-    <string name="settings_security_stance_body">监视、录制、威慑、警报和后台服务在锁定应用程序时继续运行。PIN码关卡超载驱动器接口，别无其他。</string>
+    <string name="settings_security_stance_body">监视、录制、威慑、警报和后台服务在锁定应用程序时继续运行。PIN码仅锁定 OverDrive 界面，别无其他。</string>
     <string name="settings_security_overline_lock">应用锁</string>
     <string name="settings_security_overline_recovery">如果您忘记了您的 PIN</string>
     <string name="settings_security_toggle_title">需要 PIN</string>
