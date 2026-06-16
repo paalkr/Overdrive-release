@@ -383,7 +383,7 @@
     <string name="toast_updated_to">Обновлено на %1$s</string>
     <string name="toast_update_install_failed">Не удалось установить обновление: %1$s</string>
     <string name="toast_checking_for_updates">Проверяю обновления...</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">Приложение обновлено (%1$s)</string>
     <string name="toast_update_check_failed">Не удалось проверить обновление: %1$s</string>
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">Доступно обновление</string>
@@ -578,7 +578,7 @@
     <string name="toast_batch_delete_partial">%1$d удалено, %2$d не удалось</string>
     <string name="play_with_chooser">Играть с</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">Обновлено до %1$s — повторно подтвердите автозапуск, BYD удаляет его при каждой установке</string>
     <string name="setup_overlay_already_granted">Уже предоставлено</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">Советы и решение проблем</string>
@@ -616,7 +616,7 @@
          or only the keepalive survived an OOM respawn. -->
     <string name="daemon_keepalive_notif_title">Overdrive активна</string>
     <string name="daemon_keepalive_notif_text">Мониторинг систем транспортных средств</string>
-    <string name="overdrive_status_summary_title">Overdrive</string>
+    <string name="overdrive_status_summary_title">Перегрузка</string>
     <string name="overdrive_status_summary_text">Фоновые службы запущены</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
@@ -920,9 +920,9 @@
     <string name="pin_lock_backspace_cd">Заднее место</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="one">Введена цифра %1$d</item>
-        <item quantity="few">%1$d digits entered</item>
-        <item quantity="many">%1$d digits entered</item>
-        <item quantity="other">%1$d digits entered</item>
+        <item quantity="few">Введены цифры %1$d</item>
+        <item quantity="many">Введены цифры %1$d</item>
+        <item quantity="other">Введена цифра %1$d</item>
     </plurals>
     <!-- Place tagging (reverse geocoding) — recording row chip fallback. -->
     <string name="recording_unknown_location">Нет места.</string>
@@ -1004,11 +1004,11 @@
     <!-- ============================================================
          RoadSense — road-hazard detection feature
          ============================================================ -->
-    <string name="rail_roadsense">RoadSense</string>
+    <string name="rail_roadsense">РоудСенс</string>
     <string name="rail_hazard_map">Карта</string>
-    <string name="roadsense_title">RoadSense</string>
+    <string name="roadsense_title">РоудСенс</string>
     <string name="roadsense_pill_scanning">Сканирование</string>
-    <string name="roadsense_pill_idle">RoadSense</string>
+    <string name="roadsense_pill_idle">РоудСенс</string>
     <string name="roadsense_status_idle">Простой</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
@@ -1130,7 +1130,7 @@
     <!-- Hazards-along-route pills (%1$d = count) -->
     <string name="roadsense_map_pill_severe">Тяжелое %1$d</string>
     <string name="roadsense_map_pill_moderate">%1$d модерируемый</string>
-    <string name="roadsense_map_pill_minor">%1$d minor</string>
+    <string name="roadsense_map_pill_minor">%1$d младший</string>
     <!-- Shown briefly if the basemap can\'t be reached. -->
     <string name="roadsense_map_offline">Данные карты недоступны в автономном режиме</string>
     <!-- Navigation: autocomplete + route options -->
