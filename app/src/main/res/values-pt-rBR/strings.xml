@@ -377,7 +377,7 @@
     <string name="toast_updated_to">Atualizado para %1$s</string>
     <string name="toast_update_install_failed">Instalação de atualização falhou: %1$s</string>
     <string name="toast_checking_for_updates">Verificando as atualizações...</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">O aplicativo está atualizado (%1$s)</string>
     <string name="toast_update_check_failed">Verificação de atualização falhou: %1$s</string>
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">Atualização disponível</string>
@@ -572,7 +572,7 @@
     <string name="toast_batch_delete_partial">%1$d apagado, %2$d falhado</string>
     <string name="play_with_chooser">Jogar com</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">Atualizado para %1$s — confirme novamente a inicialização automática, a BYD a remove a cada instalação</string>
     <string name="setup_overlay_already_granted">Já concedido</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">Dicas e solução de problemas</string>
@@ -914,7 +914,7 @@
     <string name="pin_lock_backspace_cd">Retroceder</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="one">Entrada de dígito %1$d</item>
-        <item quantity="other">%1$d digits entered</item>
+        <item quantity="other">%1$d dígitos inseridos</item>
     </plurals>
     <!-- Place tagging (reverse geocoding) — recording row chip fallback. -->
     <string name="recording_unknown_location">Nenhuma localização</string>
@@ -1120,7 +1120,7 @@
     <string name="roadsense_map_routes_to">Rotas para %1$s</string>
     <string name="roadsense_map_routes_cancel">cancelar</string>
     <!-- Per-route row label, %1$d is the 1-based route number. -->
-    <string name="roadsense_map_route_option">Route %1$d</string>
+    <string name="roadsense_map_route_option">Rota %1$d</string>
     <string name="roadsense_map_fastest">Super-rápida</string>
     <string name="roadsense_map_start">Iniciar</string>
     <!-- Stops / waypoints in the route-options sheet -->
