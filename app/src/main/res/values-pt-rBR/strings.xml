@@ -616,7 +616,7 @@
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
     <!-- ============================================================== -->
     <!-- Top-level destinations (navigation rail labels) -->
-    <string name="rail_dashboard">Painel de instrumentos</string>
+    <string name="rail_dashboard">Painel</string>
     <string name="rail_live">Vivo</string>
     <string name="rail_recordings">Gravações</string>
     <string name="rail_vehicle">Veículo</string>
