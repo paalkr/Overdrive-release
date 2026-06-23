@@ -219,6 +219,10 @@
     <string name="zrok_token_storage_note">Le jeton est stocké en toute sécurité et partagé entre les processus de l\'application et du daemon.</string>
     <string name="zrok_reset_environment">Réinitialiser l\'environnement Zrok</string>
     <string name="zrok_reset_environment_desc">Vous devrez réactiver avec votre jeton (utilisez un emplacement d\'appareil).</string>
+    <!-- dialog_cloudflared_settings -->
+    <string name="cloudflared_token_storage_note">Le jeton est stocké de manière sécurisée et partagé entre les processus d\'application et de démon.</string>
+    <string name="cloudflared_token_hint">Entrez le jeton cloudflared</string>
+    <string name="cloudflare_paid_version">Version payante de Cloudflare</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Réinitialisation des données</string>
     <string name="reset_subtitle">Effacer les données accumulées par catégorie</string>
@@ -504,6 +508,10 @@
     <string name="clip_label_url">URL</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
+    <string name="dialog_cloudflared_settings_title">🌐 Paramètres Cloudflared</string>
+    <string name="dialog_cloudflared_settings_message">Définissez si vous utilisez une fusée nuageuse ou une fusée éclairante payante. Si vous utilisez une fusée nuageuse payante, entrez le jeton de votre tunnel.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Si vous définissez une version payante, le jeton ne peut pas être vide</string>
+    <string name="toast_cloudflared_saved_settings">Paramètres Cloudflared enregistrés</string>
     <string name="toast_no_config_needed">Aucune configuration n\'est nécessaire pour %1$s</string>
     <string name="dialog_zrok_token_title">Token du tunnel Zrok</string>
     <string name="dialog_zrok_token_message">Entrez votre jeton Zrok activé.\n Obtenez un à: zrok.io</string>
@@ -610,7 +618,7 @@
          or only the keepalive survived an OOM respawn. -->
     <string name="daemon_keepalive_notif_title">Overdrive actif</string>
     <string name="daemon_keepalive_notif_text">Surveillance des systèmes de véhicules</string>
-    <string name="overdrive_status_summary_title">Overdrive</string>
+    <string name="overdrive_status_summary_title">Surcharge</string>
     <string name="overdrive_status_summary_text">Services en arrière-plan en cours d\'exécution</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
@@ -986,11 +994,11 @@
     <!-- ============================================================
          RoadSense — road-hazard detection feature
          ============================================================ -->
-    <string name="rail_roadsense">RoadSense</string>
+    <string name="rail_roadsense">Sens de route</string>
     <string name="rail_hazard_map">Carte</string>
-    <string name="roadsense_title">RoadSense</string>
+    <string name="roadsense_title">Sens de route</string>
     <string name="roadsense_pill_scanning">Analyse en cours</string>
-    <string name="roadsense_pill_idle">RoadSense</string>
+    <string name="roadsense_pill_idle">Sens de route</string>
     <string name="roadsense_status_idle">Inactif</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
