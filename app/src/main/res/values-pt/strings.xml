@@ -219,6 +219,10 @@
     <string name="zrok_token_storage_note">O token é armazenado de forma segura e compartilhado entre o aplicativo e os processos daemon.</string>
     <string name="zrok_reset_environment">Redefinir Ambiente Zrok</string>
     <string name="zrok_reset_environment_desc">Remove ambiente e token. Você precisará reativar com seu token (usa um slot do dispositivo).</string>
+    <!-- dialog_cloudflared_settings -->
+    <string name="cloudflared_token_storage_note">O token é armazenado de forma segura e compartilhado entre o aplicativo e os processos daemon.</string>
+    <string name="cloudflared_token_hint">Digite o token cloudflared</string>
+    <string name="cloudflare_paid_version">Versão paga do Cloudflare</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Redefinir os Dados</string>
     <string name="reset_subtitle">Limpar dados acumulados por categoria</string>
@@ -504,6 +508,10 @@
     <string name="clip_label_url">URL:</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
+    <string name="dialog_cloudflared_settings_title">🌐 Configurações Nuvens</string>
+    <string name="dialog_cloudflared_settings_message">Defina se você está usando o Cloudflare pago ou o trycloudflare. Se você estiver usando o Cloudflare, insira o token do túnel.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Se você definir para versão paga o token não pode estar vazio</string>
+    <string name="toast_cloudflared_saved_settings">Configurações Cloudflared salvas</string>
     <string name="toast_no_config_needed">Nenhuma configuração necessária para %1$s</string>
     <string name="dialog_zrok_token_title">Token de Túnel Zrok</string>
     <string name="dialog_zrok_token_message">Enter your Zrok enable token.\nGet one at: zrok.io</string>
