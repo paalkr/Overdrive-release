@@ -219,10 +219,6 @@
     <string name="zrok_token_storage_note">Token je bezpečně uložen a sdílen mezi aplikacemi a démonovými procesy.</string>
     <string name="zrok_reset_environment">Obnovit Zrok prostředí</string>
     <string name="zrok_reset_environment_desc">Odstraní prostředí a token. Budete muset znovu povolit s tokenem (používá slot zařízení).</string>
-    <!-- dialog_cloudflared_settings -->
-    <string name="cloudflared_token_storage_note">Token je bezpečně uložen a sdílen mezi aplikacemi a démonovými procesy.</string>
-    <string name="cloudflared_token_hint">Vstoupit do cloudflared token</string>
-    <string name="cloudflare_paid_version">Placená verze Cloudflare</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Resetovat data</string>
     <string name="reset_subtitle">Vymazat shromážděná data podle kategorie</string>
@@ -266,6 +262,12 @@
     <string name="recording_lib_filter_section_severity">Závažnost</string>
     <string name="recording_lib_filter_section_type">Typ</string>
     <string name="recording_lib_filter_section_place">Umístění</string>
+    <string name="recording_lib_filter_section_storage">Úložiště</string>
+    <!-- Storage filter chip labels (full words; the tile badge uses the short
+         SD/USB/INT forms above). -->
+    <string name="recording_lib_storage_filter_internal">Interní</string>
+    <string name="recording_lib_storage_filter_sd">Karta SD</string>
+    <string name="recording_lib_storage_filter_usb">USB</string>
     <string name="recording_lib_place_search_hint">Hledat místa…</string>
     <string name="recording_lib_chip_type_normal">Normální</string>
     <string name="recording_lib_chip_type_proximity">Přiblížení</string>
@@ -306,6 +308,11 @@
     <string name="recording_lib_type_event">UDÁLOSTI</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
+    <!-- Per-clip storage tag — where the clip actually landed. Surfaces the
+         silent SD→internal fallback (SD bridged behind the USB power rail). -->
+    <string name="recording_lib_storage_sd">SD</string>
+    <string name="recording_lib_storage_usb">USB</string>
+    <string name="recording_lib_storage_internal">&lt;unk&gt; &lt;unk&gt;</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
     <string name="toast_share_recordings">Sdílení %1$d nahrávání</string>
     <!-- fragment_sentry_config -->
@@ -514,10 +521,6 @@
     <string name="clip_label_url">URL</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
-    <string name="dialog_cloudflared_settings_title">🌐 Nastavení Cloudflared</string>
-    <string name="dialog_cloudflared_settings_message">Definujte, zda používáte placené Cloudflare nebo trycloudflare. Pokud používáte placené Cloudflare, zadejte svůj tunel tokenu.</string>
-    <string name="toast_cloudflared_token_cannot_be_empty">Pokud jste nastavili na placenou verzi, token nemůže být prázdný</string>
-    <string name="toast_cloudflared_saved_settings">Nastavení oblačnosti uloženo</string>
     <string name="toast_no_config_needed">Pro %1$s není potřeba žádná konfigurace</string>
     <string name="dialog_zrok_token_title">Zrok tunelový token</string>
     <string name="dialog_zrok_token_message">Zadejte svůj Zrok povolit token.\nZískejte jeden na: zrok.io</string>
@@ -666,6 +669,33 @@
     <string name="settings_about_version_label">Verze</string>
     <string name="settings_about_package_label">Postavit</string>
     <string name="settings_about_check_update_value">Zkontrolujte nejnovější verzi GitHub a nainstalujte ji pokud je novější.</string>
+    <!-- Backup & Restore (same-device). The backup file contains credentials +
+         the device key, so the copy warns the user to keep it private. -->
+    <string name="settings_backup_export_title">Exportovat nastavení</string>
+    <string name="settings_backup_export_value">Uložte záložní soubor vašeho aktuálního nastavení. Uchovávejte jej v soukromí - uložte vaše přihlašovací údaje.</string>
+    <string name="settings_backup_import_title">Obnovit nastavení</string>
+    <string name="settings_backup_import_value">Načíst záložní soubor vytvořený na stejné hlavičce.</string>
+    <string name="settings_backup_default_filename">overdrive-backup.json</string>
+    <string name="settings_backup_exporting">Vytváření zálohy…</string>
+    <string name="settings_backup_export_failed">Export zálohy se nezdařil</string>
+    <string name="settings_backup_saved">Záloha uložena</string>
+    <string name="settings_backup_saved_to">Záloha uložena do %1$s</string>
+    <string name="settings_backup_save_failed">Soubor zálohy nelze uložit</string>
+    <string name="settings_backup_pick_file">Vyberte zálohu k obnovení</string>
+    <string name="settings_backup_no_files">Nebyly nalezeny žádné záložní soubory. Nejdříve je třeba je exportovat, nebo zkopírovat ze zálohy .json do %1$sa pak to zkuste znovu.</string>
+    <string name="settings_backup_read_failed">Nelze číst soubor</string>
+    <string name="settings_backup_invalid_file">Tento soubor není platnou zálohou přepsání</string>
+    <string name="settings_backup_restoring">Obnovuji…</string>
+    <string name="settings_backup_restored">Nastavení obnoveno</string>
+    <string name="settings_backup_restore_failed">Obnovení se nezdařilo</string>
+    <string name="settings_backup_daemon_down">Služba fotoaparátu musí běžet pro zálohování nebo obnovení. Spusťte ji z Démonů, poté to zkuste znovu.</string>
+    <string name="settings_backup_restore_confirm_title">Obnovit nastavení?</string>
+    <string name="settings_backup_restore_confirm_msg">Toto nahrazuje vaše aktuální nastavení přetažení zálohováním a znovu načítáním služeb. Funguje pouze na stejné hlavové jednotce, na které bylo zálohování provedeno.</string>
+    <string name="settings_backup_restore_confirm_btn">Obnovit</string>
+    <string name="settings_backup_restart_hint">Nastavení obnoveno. Restartujte démon kamery (Daemons → Kamera → Restart), abyste se ujistili, že je použito každé obnovené nastavení.</string>
+    <string name="settings_backup_trips_prompt">Zahrnout historii jízdy (vzdálenost, energie, náklady, skóre, start/end location)? Detailní telemetrie pro jízdu není zahrnuta. Soubor bude obsahovat historii polohy — uchovat ho soukromí.</string>
+    <string name="settings_backup_settings_only">Pouze nastavení</string>
+    <string name="settings_backup_with_trips">Zahrnout jízdy</string>
     <!-- Support-development section: tiered options, low-cost first.
          star → spread → coffee, in that visual order. Copy aims for
          personality without being corny — short, warm, specific. -->
@@ -1100,6 +1130,9 @@
     <string name="roadsense_map_routing">Hledání trasy…</string>
     <string name="roadsense_map_route_failed">Nelze najít trasu. Zkuste to znovu.</string>
     <string name="roadsense_map_need_key">Přidejte klíč směrování v nastavení RoadSense pro navigaci.</string>
+    <string name="roadsense_map_route_key_rejected">Směrovací klíč byl zamítnut. Zkontrolujte váš klíč v nastavení RoadSense</string>
+    <string name="roadsense_map_route_network">Síť je příliš pomalá pro nalezení trasy. Zkontrolujte připojení a zkuste to znovu.</string>
+    <string name="roadsense_map_route_http">Chyba služby směrování (%1$d). Zkuste to krátce znovu.</string>
     <string name="roadsense_map_rerouting">Mimo trať – přepočítání…</string>
     <string name="roadsense_map_arrived">Přijel jste.</string>
     <string name="roadsense_map_nav_started">Navigace do %1$s</string>
@@ -1193,4 +1226,13 @@
     <string name="roadsense_map_search_to_save">Hledat místo, které chcete nastavit jako %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
     <string name="roadsense_map_trip_restored">Jízda obnovena</string>
+    <!-- Cloudflared paid-tunnel settings -->
+    <string name="cloudflared_token_storage_note">Token je bezpečně uložen a sdílen mezi aplikacemi a démonovými procesy.</string>
+    <string name="cloudflared_token_hint">Vstoupit do cloudflared token</string>
+    <string name="cloudflare_paid_version">Placená verze Cloudflare</string>
+    <string name="dialog_cloudflared_settings_title">🌐 Nastavení Cloudflared</string>
+    <string name="dialog_cloudflared_settings_message">Definujte, zda používáte placené Cloudflare nebo trycloudflare. Pokud používáte placené Cloudflare, zadejte svůj tunel tokenu.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Pokud jste nastavili na placenou verzi, token nemůže být prázdný</string>
+    <string name="toast_cloudflared_token_invalid">Neplatný token: použijte pouze písmena, čísla a . _ - = znaky</string>
+    <string name="toast_cloudflared_saved_settings">Nastavení oblačnosti uloženo</string>
 </resources>
