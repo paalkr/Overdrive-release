@@ -219,6 +219,10 @@
     <string name="zrok_token_storage_note">Token được lưu trữ an toàn và chia sẻ giữa các quy trình ứng dụng và daemon.</string>
     <string name="zrok_reset_environment">Tái thiết Zrok Môi trường</string>
     <string name="zrok_reset_environment_desc">Xóa môi trường và token. Bạn sẽ cần phải bật lại với token của bạn (sử dụng một khe thiết bị).</string>
+    <!-- dialog_cloudflared_settings -->
+    <string name="cloudflared_token_storage_note">Token is stored securely and shared between app and daemon processes.</string>
+    <string name="cloudflared_token_hint">Enter cloudflared token</string>
+    <string name="cloudflare_paid_version">Cloudflare Paid Version</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Data Reset</string>
     <string name="reset_subtitle">Xóa dữ liệu tích lũy theo các loại</string>
@@ -501,6 +505,10 @@
     <string name="clip_label_url">URL</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
+    <string name="dialog_cloudflared_settings_title">🌐 Cloudflared Settings</string>
+    <string name="dialog_cloudflared_settings_message">Define whether you are using paid Cloudflare or trycloudflare. If you are using paid Cloudflare, enter your tunnel token.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">If you set to paid version the token cannot be empty</string>
+    <string name="toast_cloudflared_saved_settings">Cloudflared settings saved</string>
     <string name="toast_no_config_needed">Không cần thiết cấu hình cho %1$s</string>
     <string name="dialog_zrok_token_title">Zrok Tunnel Token</string>
     <string name="dialog_zrok_token_message">Nhập mã hiệu kích hoạt Zrok của bạn.</string>
