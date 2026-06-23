@@ -219,10 +219,6 @@
     <string name="zrok_token_storage_note">Token lagres sikkert og delt mellom app og daemon-prosesser.</string>
     <string name="zrok_reset_environment">Tilbakestill Zrok miljø</string>
     <string name="zrok_reset_environment_desc">Fjerner miljø og token. Du må aktivere på nytt med tokenet (bruker en enhets spor).</string>
-    <!-- dialog_cloudflared_settings -->
-    <string name="cloudflared_token_storage_note">Token lagres sikkert og delt mellom app og daemon-prosesser.</string>
-    <string name="cloudflared_token_hint">Angi skyvnet token</string>
-    <string name="cloudflare_paid_version">Cloudflare betalt versjon</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Tilbakestill data</string>
     <string name="reset_subtitle">Oppsamlet data etter kategori</string>
@@ -266,6 +262,12 @@
     <string name="recording_lib_filter_section_severity">Alvorlighetsgrad</string>
     <string name="recording_lib_filter_section_type">Type:</string>
     <string name="recording_lib_filter_section_place">Sted</string>
+    <string name="recording_lib_filter_section_storage">Lagring</string>
+    <!-- Storage filter chip labels (full words; the tile badge uses the short
+         SD/USB/INT forms above). -->
+    <string name="recording_lib_storage_filter_internal">Intern</string>
+    <string name="recording_lib_storage_filter_sd">SD kort</string>
+    <string name="recording_lib_storage_filter_usb">USB</string>
     <string name="recording_lib_place_search_hint">Søke steder…</string>
     <string name="recording_lib_chip_type_normal">Vanlig</string>
     <string name="recording_lib_chip_type_proximity">Nærhet</string>
@@ -306,6 +308,11 @@
     <string name="recording_lib_type_event">EVENT</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OE</string>
+    <!-- Per-clip storage tag — where the clip actually landed. Surfaces the
+         silent SD→internal fallback (SD bridged behind the USB power rail). -->
+    <string name="recording_lib_storage_sd">SD</string>
+    <string name="recording_lib_storage_usb">USB</string>
+    <string name="recording_lib_storage_internal">Inn</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
     <string name="toast_share_recordings">Deler %1$d opptak</string>
     <!-- fragment_sentry_config -->
@@ -508,10 +515,6 @@
     <string name="clip_label_url">Nettadresse</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
-    <string name="dialog_cloudflared_settings_title">🌐 Innstillinger for Cloudflared</string>
-    <string name="dialog_cloudflared_settings_message">Definer om du bruker betalt Cloudflare eller trycloudflare. Hvis du bruker betalt Cloudflare, skriv inn tunnel token.</string>
-    <string name="toast_cloudflared_token_cannot_be_empty">Hvis du har satt til betalt versjon, kan tokenet ikke være tomt</string>
-    <string name="toast_cloudflared_saved_settings">Innstillinger lagret i skyflensen</string>
     <string name="toast_no_config_needed">Ingen konfigurasjon nødvendig for %1$s</string>
     <string name="dialog_zrok_token_title">Zrok Tunnel Token</string>
     <string name="dialog_zrok_token_message">Skriv inn din Zrok aktiver koden.\nFå en på: zrok.io</string>
@@ -660,6 +663,33 @@
     <string name="settings_about_version_label">Versjon</string>
     <string name="settings_about_package_label">Versjon</string>
     <string name="settings_about_check_update_value">Sjekk den nyeste GitHub versjonen og installer hvis nyere.</string>
+    <!-- Backup & Restore (same-device). The backup file contains credentials +
+         the device key, so the copy warns the user to keep it private. -->
+    <string name="settings_backup_export_title">Eksporter innstillingene</string>
+    <string name="settings_backup_export_value">Lagre en sikkerhetskopifil av dine gjeldende innstillinger. Behold den privat – den har din legitimasjon.</string>
+    <string name="settings_backup_import_title">Gjenopprett innstillinger</string>
+    <string name="settings_backup_import_value">Last inn en sikkerhetskopifil som er gjort på dette hodet enhet.</string>
+    <string name="settings_backup_default_filename">overdrive-backup.json</string>
+    <string name="settings_backup_exporting">Lager sikkerhetskopi…</string>
+    <string name="settings_backup_export_failed">Eksport av sikkerhetskopiering mislyktes</string>
+    <string name="settings_backup_saved">Sikkerhetskopi lagret</string>
+    <string name="settings_backup_saved_to">Sikkerhetskopi lagret til %1$s</string>
+    <string name="settings_backup_save_failed">Kunne ikke lagre sikkerhetskopifilen</string>
+    <string name="settings_backup_pick_file">Velg en backup å gjenopprette</string>
+    <string name="settings_backup_no_files">Ingen sikkerhetskopifiler funnet. Eksporter først eller kopier en sikkerhetskopi .json til %1$s, og prøv på nytt.</string>
+    <string name="settings_backup_read_failed">Kan ikke lese filen</string>
+    <string name="settings_backup_invalid_file">Den filen er ikke en gyldig overdriv-sikkerhetskopi</string>
+    <string name="settings_backup_restoring">Gjenoppretter…</string>
+    <string name="settings_backup_restored">Innstillinger gjenopprettet</string>
+    <string name="settings_backup_restore_failed">Gjenoppretting mislyktes</string>
+    <string name="settings_backup_daemon_down">Kameratjenesten må kjøres for å sikkerhetskopiere eller gjenopprette. Start den fra Daemons, og prøv på nytt.</string>
+    <string name="settings_backup_restore_confirm_title">Gjenopprett innstillinger?</string>
+    <string name="settings_backup_restore_confirm_msg">Dette erstatter de gjeldende Overdriv-innstillingene med backup og reload tjenesten. Det fungerer bare på samme hode enhet som sikkerhetskopien ble tatt på.</string>
+    <string name="settings_backup_restore_confirm_btn">Gjenopprett</string>
+    <string name="settings_backup_restart_hint">Innstillinger gjenopprettet. Start kameraets daemon på nytt (Daemons → Kamera → Restart) for å sikre at alle gjenopprettede innstillinger brukes.</string>
+    <string name="settings_backup_trips_prompt">Inkluder reiseloggen (distanse, energi, kostnad, poengsum, start/slutt-plassering)? Detaljerte telemetri per tur er ikke inkludert. Filen vil inneholde din posisjonshistorikk - behold den privat.</string>
+    <string name="settings_backup_settings_only">Kun innstillinger</string>
+    <string name="settings_backup_with_trips">Inkluder reiser</string>
     <!-- Support-development section: tiered options, low-cost first.
          star → spread → coffee, in that visual order. Copy aims for
          personality without being corny — short, warm, specific. -->
@@ -1080,6 +1110,9 @@
     <string name="roadsense_map_routing">Finner rute…</string>
     <string name="roadsense_map_route_failed">Kunne ikke finne en rute. Prøv igjen.</string>
     <string name="roadsense_map_need_key">Legg til en rutingsnøkkel i RoadSense innstillinger for å navigere.</string>
+    <string name="roadsense_map_route_key_rejected">Rutenøkkel avvist. Sjekk nøkkelen i RoadSense innstillinger.</string>
+    <string name="roadsense_map_route_network">Nettverk er for treg til å finne en rute. Sjekk tilkoblingen din og prøv igjen.</string>
+    <string name="roadsense_map_route_http">Routing service feil (%1$d). Prøv igjen snart.</string>
     <string name="roadsense_map_rerouting">Av rute — omberegne…</string>
     <string name="roadsense_map_arrived">Du har ankommet.</string>
     <string name="roadsense_map_nav_started">Naviger til %1$s</string>
@@ -1173,4 +1206,13 @@
     <string name="roadsense_map_search_to_save">Søk et sted for å angi som %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
     <string name="roadsense_map_trip_restored">Reise gjenopprettet</string>
+    <!-- Cloudflared paid-tunnel settings -->
+    <string name="cloudflared_token_storage_note">Token lagres sikkert og delt mellom app og daemon-prosesser.</string>
+    <string name="cloudflared_token_hint">Angi skyvnet token</string>
+    <string name="cloudflare_paid_version">Cloudflare betalt versjon</string>
+    <string name="dialog_cloudflared_settings_title">🌐 Innstillinger for Cloudflared</string>
+    <string name="dialog_cloudflared_settings_message">Definer om du bruker betalt Cloudflare eller trycloudflare. Hvis du bruker betalt Cloudflare, skriv inn tunnel token.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Hvis du har satt til betalt versjon, kan tokenet ikke være tomt</string>
+    <string name="toast_cloudflared_token_invalid">Ugyldig token: bruk bare bokstaver, tall og . _ - = tegn</string>
+    <string name="toast_cloudflared_saved_settings">Innstillinger lagret i skyflensen</string>
 </resources>
