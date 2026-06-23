@@ -219,10 +219,6 @@
     <string name="zrok_token_storage_note">Токен хранится безопасно и делится между процессами приложения и демона.</string>
     <string name="zrok_reset_environment">Перезагрузка окружающей среды Zrok</string>
     <string name="zrok_reset_environment_desc">Удалить среду и токен. Вам нужно будет повторно включить с помощью своего токен (использует слот устройства).</string>
-    <!-- dialog_cloudflared_settings -->
-    <string name="cloudflared_token_storage_note">Токен надежно хранится между приложениями и демонами.</string>
-    <string name="cloudflared_token_hint">Ввести в облачный токен</string>
-    <string name="cloudflare_paid_version">Платная версия Cloudflare</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Перезагрузка данных</string>
     <string name="reset_subtitle">Стерть накопленные данные по категориям</string>
@@ -266,6 +262,12 @@
     <string name="recording_lib_filter_section_severity">Тяжесть</string>
     <string name="recording_lib_filter_section_type">Тип</string>
     <string name="recording_lib_filter_section_place">Место</string>
+    <string name="recording_lib_filter_section_storage">Хранилище</string>
+    <!-- Storage filter chip labels (full words; the tile badge uses the short
+         SD/USB/INT forms above). -->
+    <string name="recording_lib_storage_filter_internal">Внутренний</string>
+    <string name="recording_lib_storage_filter_sd">SD-карта</string>
+    <string name="recording_lib_storage_filter_usb">USB</string>
     <string name="recording_lib_place_search_hint">Поиск мест…</string>
     <string name="recording_lib_chip_type_normal">Норм.</string>
     <string name="recording_lib_chip_type_proximity">Близость</string>
@@ -306,6 +308,11 @@
     <string name="recording_lib_type_event">СОБЫТИЕ</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
+    <!-- Per-clip storage tag — where the clip actually landed. Surfaces the
+         silent SD→internal fallback (SD bridged behind the USB power rail). -->
+    <string name="recording_lib_storage_sd">УР</string>
+    <string name="recording_lib_storage_usb">USB</string>
+    <string name="recording_lib_storage_internal">СОБСТВЕННЫЙ</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
     <string name="toast_share_recordings">Совместное использование %1$d записей</string>
     <!-- fragment_sentry_config -->
@@ -514,10 +521,6 @@
     <string name="clip_label_url">URL</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
-    <string name="dialog_cloudflared_settings_title">🌐 Настройки облака</string>
-    <string name="dialog_cloudflared_settings_message">Определите, используете ли вы платный Cloudflare или trycloudflare. Если вы используете платный Cloudflare, введите свой маркер туннеля.</string>
-    <string name="toast_cloudflared_token_cannot_be_empty">Если вы установили платную версию, токен не может быть пустым</string>
-    <string name="toast_cloudflared_saved_settings">Настройки облака сохранены</string>
     <string name="toast_no_config_needed">Не требуется конфигурации для %1$s</string>
     <string name="dialog_zrok_token_title">Токен туннеля Zrok</string>
     <string name="dialog_zrok_token_message">Введите свой токен Zrok включить.\nПолучайте один на: zrok.io</string>
@@ -666,6 +669,33 @@
     <string name="settings_about_version_label">Версия</string>
     <string name="settings_about_package_label">Построение</string>
     <string name="settings_about_check_update_value">Проверьте последнюю версию GitHub и установите, если она новее.</string>
+    <!-- Backup & Restore (same-device). The backup file contains credentials +
+         the device key, so the copy warns the user to keep it private. -->
+    <string name="settings_backup_export_title">Настройки экспорта</string>
+    <string name="settings_backup_export_value">Сохраните резервную копию ваших текущих настроек. Сохраните её конфиденциальной — в ней хранятся ваши учетные данные.</string>
+    <string name="settings_backup_import_title">Восстановить настройки</string>
+    <string name="settings_backup_import_value">Загрузить файл резервной копии с той же самой головной единицей.</string>
+    <string name="settings_backup_default_filename">overdrive-backup.json</string>
+    <string name="settings_backup_exporting">Создание резервной копии…</string>
+    <string name="settings_backup_export_failed">Не удалось сделать резервную копию</string>
+    <string name="settings_backup_saved">Резервная копия сохранена</string>
+    <string name="settings_backup_saved_to">Резервная копия сохранена в %1$s</string>
+    <string name="settings_backup_save_failed">Не удалось сохранить файл резервной копии</string>
+    <string name="settings_backup_pick_file">Выберите резервную копию для восстановления</string>
+    <string name="settings_backup_no_files">Файлы резервных копий не найдены. Экспортируйте один раз или копируйте резервную копию .json в %1$s, затем попробуйте снова.</string>
+    <string name="settings_backup_read_failed">Не удалось прочитать файл</string>
+    <string name="settings_backup_invalid_file">Этот файл не является допустимой резервной копией Overdrive</string>
+    <string name="settings_backup_restoring">Восстановление…</string>
+    <string name="settings_backup_restored">Настройки восстановлены</string>
+    <string name="settings_backup_restore_failed">Не удалось восстановить</string>
+    <string name="settings_backup_daemon_down">Служба камеры должна быть запущена для резервного копирования или восстановления. Запустите её из демонов, а затем повторите попытку.</string>
+    <string name="settings_backup_restore_confirm_title">Восстановить настройки?</string>
+    <string name="settings_backup_restore_confirm_msg">Это заменяет ваши текущие настройки Overdrive на службы резервного копирования и перезагрузки. Он работает только на том же блоке резервного копирования, на котором была сделана резервная копия.</string>
+    <string name="settings_backup_restore_confirm_btn">Восстановить</string>
+    <string name="settings_backup_restart_hint">Настройки восстановлены. Перезапустите демон камеры (Daemons → Camera → Перезапустить), чтобы убедиться, что все восстановленные настройки будут применены.</string>
+    <string name="settings_backup_trips_prompt">Включите историю вашей поездки (расстояние, энергия, стоимость, результаты, начальные и конечные места)? Детали телеметрии по поездкам не включены. Файл будет содержать историю вашего местоположения — сохранить его приватным.</string>
+    <string name="settings_backup_settings_only">Только настройки</string>
+    <string name="settings_backup_with_trips">Включить поездки</string>
     <!-- Support-development section: tiered options, low-cost first.
          star → spread → coffee, in that visual order. Copy aims for
          personality without being corny — short, warm, specific. -->
@@ -1100,6 +1130,9 @@
     <string name="roadsense_map_routing">Поиск маршрута…</string>
     <string name="roadsense_map_route_failed">Не удалось найти маршрут. Попробуйте еще раз.</string>
     <string name="roadsense_map_need_key">Добавьте ключ маршрутизации в настройках RoadSense для навигации.</string>
+    <string name="roadsense_map_route_key_rejected">Ключ маршрутизации отклонен. Проверьте ваш ключ в настройках RoadSense</string>
+    <string name="roadsense_map_route_network">Сеть слишком медленно, чтобы найти маршрут. Проверьте подключение и повторите попытку.</string>
+    <string name="roadsense_map_route_http">Ошибка службы маршрутизации (%1$d). Попробуйте позже.</string>
     <string name="roadsense_map_rerouting">Выходной маршрут — пересчет…</string>
     <string name="roadsense_map_arrived">Вы прибыли.</string>
     <string name="roadsense_map_nav_started">Переход к %1$s</string>
@@ -1193,4 +1226,13 @@
     <string name="roadsense_map_search_to_save">Искать место для установки как %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
     <string name="roadsense_map_trip_restored">Поездка восстановлена</string>
+    <!-- Cloudflared paid-tunnel settings -->
+    <string name="cloudflared_token_storage_note">Токен надежно хранится между приложениями и демонами.</string>
+    <string name="cloudflared_token_hint">Ввести в облачный токен</string>
+    <string name="cloudflare_paid_version">Платная версия Cloudflare</string>
+    <string name="dialog_cloudflared_settings_title">🌐 Настройки облака</string>
+    <string name="dialog_cloudflared_settings_message">Определите, используете ли вы платный Cloudflare или trycloudflare. Если вы используете платный Cloudflare, введите свой маркер туннеля.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Если вы установили платную версию, токен не может быть пустым</string>
+    <string name="toast_cloudflared_token_invalid">Неверный токен: используйте только буквы, цифры и . _ - = символы</string>
+    <string name="toast_cloudflared_saved_settings">Настройки облака сохранены</string>
 </resources>
