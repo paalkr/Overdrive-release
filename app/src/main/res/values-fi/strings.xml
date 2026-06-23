@@ -219,6 +219,10 @@
     <string name="zrok_token_storage_note">Tunnus on tallennettu turvallisesti ja jaettu sovelluksen ja taustaprosessien välillä.</string>
     <string name="zrok_reset_environment">Nollaa Zrok-ympäristö</string>
     <string name="zrok_reset_environment_desc">Poistaa ympäristön ja tokenin. Sinun täytyy ottaa käyttöön tokenilla (käyttää laiterajaa).</string>
+    <!-- dialog_cloudflared_settings -->
+    <string name="cloudflared_token_storage_note">Tunnus on tallennettu turvallisesti ja jaettu sovelluksen ja taustaprosessien välillä.</string>
+    <string name="cloudflared_token_hint">Syötä pilvipohjainen tunnus</string>
+    <string name="cloudflare_paid_version">Cloudflare Maksettu Versio</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Nollaa Tiedot</string>
     <string name="reset_subtitle">Pyyhi kerätyt tiedot luokittain</string>
@@ -504,6 +508,10 @@
     <string name="clip_label_url">URL-osoite</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
+    <string name="dialog_cloudflared_settings_title">🌐 Cloudflared asetukset</string>
+    <string name="dialog_cloudflared_settings_message">Määritä, käytätkö maksullista Cloudflare tai trycloudflare. Jos käytät maksettu Cloudflare, kirjoita tunneli tunneliin.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Jos asetettu maksulliseen versioon, tunnus ei voi olla tyhjä</string>
+    <string name="toast_cloudflared_saved_settings">Cloudflared asetukset tallennettu</string>
     <string name="toast_no_config_needed">%1$s ei tarvita konfiguraatiota</string>
     <string name="dialog_zrok_token_title">Zrok Tunnel Token</string>
     <string name="dialog_zrok_token_message">Anna Zrok ottaa käyttöön token.\nHanki yksi osoitteessa: zrok.io</string>
