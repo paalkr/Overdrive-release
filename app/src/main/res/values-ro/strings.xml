@@ -219,10 +219,6 @@
     <string name="zrok_token_storage_note">Tokenul este stocat în siguranță și partajat între procesele aplicației și vitezei.</string>
     <string name="zrok_reset_environment">Resetează mediul Zrok</string>
     <string name="zrok_reset_environment_desc">Elimină mediul și tokenul. Va trebui să reactivați cu token-ul dvs. (utilizează slotul unui dispozitiv).</string>
-    <!-- dialog_cloudflared_settings -->
-    <string name="cloudflared_token_storage_note">Tokenul este stocat în siguranță și partajat între procesele aplicației și vitezei.</string>
-    <string name="cloudflared_token_hint">Introduceți token cloudflared</string>
-    <string name="cloudflare_paid_version">Versiune cu plată Cloudflare</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">Resetare date</string>
     <string name="reset_subtitle">Ştergeţi datele acumulate pe categorii</string>
@@ -266,6 +262,12 @@
     <string name="recording_lib_filter_section_severity">Severitate</string>
     <string name="recording_lib_filter_section_type">Tip</string>
     <string name="recording_lib_filter_section_place">Locul</string>
+    <string name="recording_lib_filter_section_storage">Depozitare</string>
+    <!-- Storage filter chip labels (full words; the tile badge uses the short
+         SD/USB/INT forms above). -->
+    <string name="recording_lib_storage_filter_internal">Intern</string>
+    <string name="recording_lib_storage_filter_sd">Card SD</string>
+    <string name="recording_lib_storage_filter_usb">USB</string>
     <string name="recording_lib_place_search_hint">Căutare locuri…</string>
     <string name="recording_lib_chip_type_normal">Normală</string>
     <string name="recording_lib_chip_type_proximity">Proximitate</string>
@@ -306,6 +308,11 @@
     <string name="recording_lib_type_event">EVENIMENTUL</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
+    <!-- Per-clip storage tag — where the clip actually landed. Surfaces the
+         silent SD→internal fallback (SD bridged behind the USB power rail). -->
+    <string name="recording_lib_storage_sd">BD</string>
+    <string name="recording_lib_storage_usb">USB</string>
+    <string name="recording_lib_storage_internal">INT</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
     <string name="toast_share_recordings">Partajare înregistrări %1$d</string>
     <!-- fragment_sentry_config -->
@@ -511,10 +518,6 @@
     <string name="clip_label_url">URL</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
-    <string name="dialog_cloudflared_settings_title">🌐 Setări Cloudflared</string>
-    <string name="dialog_cloudflared_settings_message">Define whether you are using paid Cloudflare or trycloudflare. If you are using paid Cloudflare, enter your tunnel token.</string>
-    <string name="toast_cloudflared_token_cannot_be_empty">If you set to paid version the token cannot be empty</string>
-    <string name="toast_cloudflared_saved_settings">Cloudflared settings saved</string>
     <string name="toast_no_config_needed">Nu este necesară nicio configurare pentru %1$s</string>
     <string name="dialog_zrok_token_title">Tunelul Zrok Token</string>
     <string name="dialog_zrok_token_message">Introduceți tokenul de activare Zrok.\nObțineți unul la: zrok.io</string>
@@ -663,6 +666,33 @@
     <string name="settings_about_version_label">Versiune</string>
     <string name="settings_about_package_label">Construire</string>
     <string name="settings_about_check_update_value">Verificați ultima versiune GitHub și instalați dacă este mai nouă.</string>
+    <!-- Backup & Restore (same-device). The backup file contains credentials +
+         the device key, so the copy warns the user to keep it private. -->
+    <string name="settings_backup_export_title">Exportă setările</string>
+    <string name="settings_backup_export_value">Salvați un fișier de rezervă din setările curente. Păstrați-l privat - deține datele de autentificare.</string>
+    <string name="settings_backup_import_title">Restabilire setări</string>
+    <string name="settings_backup_import_value">Încărcaţi un fişier de rezervă făcut pe aceeaşi unitate cap.</string>
+    <string name="settings_backup_default_filename">overdrive-backup.json</string>
+    <string name="settings_backup_exporting">Construire copie de rezervă…</string>
+    <string name="settings_backup_export_failed">Exportare nereușită</string>
+    <string name="settings_backup_saved">Backup salvat</string>
+    <string name="settings_backup_saved_to">Copie de rezervă salvată la %1$s</string>
+    <string name="settings_backup_save_failed">Nu s-a putut salva copia de rezervă</string>
+    <string name="settings_backup_pick_file">Alege o copie de rezervă pentru a restabili</string>
+    <string name="settings_backup_no_files">Nu au fost găsite fișiere de rezervă. Exportă unul, sau copiază o copie de rezervă .json în %1$s, apoi încearcă din nou.</string>
+    <string name="settings_backup_read_failed">Nu s-a putut citi fișierul</string>
+    <string name="settings_backup_invalid_file">Acest fișier nu este o copie de rezervă validă Overdrive</string>
+    <string name="settings_backup_restoring">Restaurare…</string>
+    <string name="settings_backup_restored">Setări restaurate</string>
+    <string name="settings_backup_restore_failed">Restabilirea a eșuat</string>
+    <string name="settings_backup_daemon_down">Serviciul camerei foto trebuie să ruleze pentru a face o copie de rezervă sau pentru a restabili. Porniți-l din Daemons, apoi încercați din nou.</string>
+    <string name="settings_backup_restore_confirm_title">Restaurați setările?</string>
+    <string name="settings_backup_restore_confirm_msg">Aceasta înlocuiește setările curente Overdrive cu serviciile de backup și reîncărcare. Funcționează doar pe aceeași unitate capului pe care a fost făcută copia de rezervă.</string>
+    <string name="settings_backup_restore_confirm_btn">Restaurează</string>
+    <string name="settings_backup_restart_hint">Setările au fost restaurate. Reporniți decodorul camerei (Doamne → Camera → Restart) pentru a vă asigura că fiecare setare restaurată este aplicată.</string>
+    <string name="settings_backup_trips_prompt">Includeți istoricul cursei (distanță, energie, costuri, scoruri, locații de pornire/sfârș)? Telemetria detaliată pe traseu nu este inclusă. Fișierul va conține istoricul locațiilor tale - păstrează-l privat.</string>
+    <string name="settings_backup_settings_only">Doar setări</string>
+    <string name="settings_backup_with_trips">Include curse</string>
     <!-- Support-development section: tiered options, low-cost first.
          star → spread → coffee, in that visual order. Copy aims for
          personality without being corny — short, warm, specific. -->
@@ -1090,6 +1120,9 @@
     <string name="roadsense_map_routing">Se caută ruta…</string>
     <string name="roadsense_map_route_failed">Nu s-a putut găsi ruta. Încearcă din nou.</string>
     <string name="roadsense_map_need_key">Adăugați o cheie de rutare în setările RoadSense pentru a naviga.</string>
+    <string name="roadsense_map_route_key_rejected">Cheie de rutare respinsă. Verificați cheia în setările RoadSense.</string>
+    <string name="roadsense_map_route_network">Reţeaua este prea încet pentru a găsi o rută. Verificaţi conexiunea şi încercaţi din nou.</string>
+    <string name="roadsense_map_route_http">Eroare de redirecționare a serviciului (%1$d). Încercați din nou.</string>
     <string name="roadsense_map_rerouting">Oprire rută — recalculare…</string>
     <string name="roadsense_map_arrived">Ai ajuns.</string>
     <string name="roadsense_map_nav_started">Navigare la %1$s</string>
@@ -1183,4 +1216,13 @@
     <string name="roadsense_map_search_to_save">Căutați un loc pentru a seta ca %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
     <string name="roadsense_map_trip_restored">Cursă restaurată</string>
+    <!-- Cloudflared paid-tunnel settings -->
+    <string name="cloudflared_token_storage_note">Tokenul este stocat în siguranță și partajat între procesele aplicației și vitezei.</string>
+    <string name="cloudflared_token_hint">Introduceți token cloudflared</string>
+    <string name="cloudflare_paid_version">Versiune cu plată Cloudflare</string>
+    <string name="dialog_cloudflared_settings_title">🌐 Setări Cloudflared</string>
+    <string name="dialog_cloudflared_settings_message">Definește dacă folosești Cloudflare sau trycloudflare plătite. Dacă folosești Cloudflare plătită, intră în tokenul tău de tunel.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Dacă setați versiunea cu plată, codul nu poate fi gol</string>
+    <string name="toast_cloudflared_token_invalid">Token nevalid: utilizați doar litere, numere și . _ - = caractere</string>
+    <string name="toast_cloudflared_saved_settings">Setări Cloudflared salvate</string>
 </resources>
