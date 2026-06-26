@@ -1494,6 +1494,8 @@
     "ha_discovery": "Home Assistant discovery",
     "ha_discovery_desc": "Auto-create entities in Home Assistant. Publishes per-field retained topics (no aggregate JSON).",
     "ha_prefix": "Discovery prefix",
+    "high_rate": "High-rate power (ms)",
+    "high_rate_desc": "Dense publishing of signed power (regen = negative) at this cadence, bypassing the interval window. 0 = off. 250 recommended. Reads power via a fast poll, so it stays dense even when the push-listener is dormant.",
     "ha_short": "Home Assistant",
     "allow_control": "Allow vehicle control",
     "allow_control_desc": "Expose controllable entities (climate, windows, seats, settings…) and act on commands from Home Assistant. Local SDK only — never the BYD cloud. Off by default.",

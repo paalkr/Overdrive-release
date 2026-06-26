@@ -199,6 +199,7 @@ const MQTT = {
         document.getElementById('formChangeOnly').checked = true;
         document.getElementById('formHaDiscovery').checked = false;
         document.getElementById('formDiscoveryPrefix').value = 'homeassistant';
+        var hr0 = document.getElementById('formHighRate'); if (hr0) hr0.value = '0';
         document.getElementById('formAllowControl').checked = false;
         document.getElementById('formRetain').checked = false;
         document.getElementById('formEnabled').checked = true;
@@ -230,6 +231,7 @@ const MQTT = {
         document.getElementById('formChangeOnly').checked = conn.changeOnly !== false;
         document.getElementById('formHaDiscovery').checked = conn.homeAssistantDiscovery || false;
         document.getElementById('formDiscoveryPrefix').value = conn.discoveryPrefix || 'homeassistant';
+        var hrE = document.getElementById('formHighRate'); if (hrE) hrE.value = conn.highRateMs || 0;
         document.getElementById('formAllowControl').checked = conn.allowControl || false;
         document.getElementById('formRetain').checked = conn.retainMessages || false;
         document.getElementById('formEnabled').checked = conn.enabled || false;
@@ -271,8 +273,10 @@ const MQTT = {
         var on = ha && ha.checked;
         var prefixRow = document.getElementById('formDiscoveryPrefixRow');
         var controlRow = document.getElementById('formAllowControlRow');
+        var highRateRow = document.getElementById('formHighRateRow');
         if (prefixRow) prefixRow.style.display = on ? '' : 'none';
         if (controlRow) controlRow.style.display = on ? 'flex' : 'none';
+        if (highRateRow) highRateRow.style.display = on ? '' : 'none';
     },
 
     async saveForm() {
@@ -288,6 +292,7 @@ const MQTT = {
             minIntervalSeconds: parseInt(document.getElementById('formMinInterval').value) || 5,
             maxIntervalSeconds: parseInt(document.getElementById('formMaxInterval').value) || 300,
             changeOnly: document.getElementById('formChangeOnly').checked,
+            highRateMs: (function () { var e = document.getElementById('formHighRate'); var v = e ? parseInt(e.value) : 0; return (isNaN(v) || v < 0) ? 0 : v; })(),
             homeAssistantDiscovery: document.getElementById('formHaDiscovery').checked,
             discoveryPrefix: (document.getElementById('formDiscoveryPrefix').value || 'homeassistant').trim(),
             allowControl: document.getElementById('formAllowControl').checked,

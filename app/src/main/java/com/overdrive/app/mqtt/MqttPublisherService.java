@@ -367,8 +367,14 @@ public class MqttPublisherService implements MqttCallback {
             Set<String> keys = sendAll ? discoverableKeys(snapshot) : changed;
             if (!sendAll && keys.isEmpty()) return true;
 
+            // When the high-rate tier owns the drivetrain keys, the fast scheduler
+            // publishes them; skip them here so we don't double-send or contend with
+            // the differ (they're still tracked below via markKeysSent so a later
+            // disable cleanly hands them back to this path).
+            boolean highRate = config.isHighRateEnabled();
             boolean ok = true;
             for (String k : keys) {
+                if (highRate && TelemetryFieldCatalog.isHighRate(k)) continue;
                 if (!TelemetryFieldCatalog.isPublishable(k)) continue;
                 Object v = snapshot.opt(k);
                 if (v == null || v == JSONObject.NULL || v instanceof JSONArray) continue;
@@ -394,6 +400,44 @@ public class MqttPublisherService implements MqttCallback {
         }
         differ.markAllSent(snapshot, now);
         return true;
+    }
+
+    /**
+     * High-rate tier publish: push ONLY the high-rate-flagged keys present in this
+     * snapshot to their per-field retained state topics, bypassing the min-interval
+     * floor, the per-field deadband and the {@link TelemetryDiffer} entirely. Used by
+     * the manager's dedicated fast scheduler for dense drivetrain telemetry (power,
+     * motor rpm, torque). HA-mode only — there is no aggregate-mode high-rate path.
+     *
+     * <p>Deliberately does NOT touch the differ (which the slow {@code publishTelemetry}
+     * thread owns) and does NOT announce discovery — it is a no-op until the slow path
+     * has run its first cycle and announced the device bundle, so the entities already
+     * exist by the time fast state arrives.
+     *
+     * @return true if nothing went wrong (a deliberate skip also returns true)
+     */
+    public synchronized boolean publishHighRate(JSONObject snapshot) {
+        if (!running) return false;
+        if (!config.isHomeAssistant()) return true;
+        // Wait for the slow path to announce discovery so HA has the entities first.
+        if (!discoveryAnnounced) return true;
+        if (!ensureConnected()) return false;
+
+        boolean ok = true;
+        Iterator<String> it = snapshot.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            if (!TelemetryFieldCatalog.isHighRate(k)) continue;
+            if (!TelemetryFieldCatalog.isPublishable(k)) continue;
+            Object v = snapshot.opt(k);
+            if (v == null || v == JSONObject.NULL || v instanceof JSONArray) continue;
+            if (!publishString(HomeAssistantDiscovery.stateTopic(config.topic, k),
+                    String.valueOf(v), true, config.qos)) {
+                ok = false;
+                break;
+            }
+        }
+        return ok;
     }
 
     /**
@@ -452,6 +496,29 @@ public class MqttPublisherService implements MqttCallback {
         return keys;
     }
 
+    /**
+     * Return a copy of the snapshot with every high-rate key guaranteed present, so
+     * the discovery bundle creates those entities even before the fast read poll has
+     * landed a value. Keys already in the snapshot keep their real value; missing ones
+     * get a 0 placeholder (the real value follows immediately on the fast state topic).
+     */
+    private static JSONObject withHighRateKeys(JSONObject snap) {
+        JSONObject copy = new JSONObject();
+        try {
+            Iterator<String> it = snap.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                copy.put(k, snap.opt(k));
+            }
+            for (String k : TelemetryFieldCatalog.highRateKeys()) {
+                if (!copy.has(k)) copy.put(k, 0);
+            }
+        } catch (Exception ignored) {
+            return snap;
+        }
+        return copy;
+    }
+
     private void publishLocation(JSONObject snap) {
         try {
             JSONObject loc = new JSONObject();
@@ -465,8 +532,17 @@ public class MqttPublisherService implements MqttCallback {
     private void announceDiscovery(JSONObject snapshot) {
         try {
             String topic = HomeAssistantDiscovery.deviceConfigTopic(config.discoveryPrefix, deviceId);
+            // When the high-rate tier owns the drivetrain keys, the fast scheduler (not
+            // this slow path) carries their state — and a parked car may not have read a
+            // motor rpm yet when this first announce fires. Seed the high-rate keys into
+            // the bundle snapshot so HA always creates the entities; their real values
+            // arrive on the fast topics. buildBundle stays purely data-driven.
+            JSONObject discoverySnap = snapshot;
+            if (config.isHighRateEnabled()) {
+                discoverySnap = withHighRateKeys(snapshot);
+            }
             String bundle = HomeAssistantDiscovery.buildBundle(deviceId, haVin, haModel, haSwVersion,
-                    config.topic, snapshot, config.isControlEnabled());
+                    config.topic, discoverySnap, config.isControlEnabled());
             if (publishString(topic, bundle, true, 1)) {
                 discoveryAnnounced = true;
                 logger.info("Published HA discovery bundle to " + topic);

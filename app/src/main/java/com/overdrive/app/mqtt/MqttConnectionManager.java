@@ -49,6 +49,12 @@ public class MqttConnectionManager {
     private final ConcurrentHashMap<String, ScheduledExecutorService> schedulers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ScheduledFuture<?>> scheduledTasks = new ConcurrentHashMap<>();
 
+    // Per-connection HIGH-RATE schedulers (drivetrain fast tier): connectionId → scheduler.
+    // Separate from the slow scheduler so the dense drivetrain publish can't be throttled
+    // by — or throttle — the report-by-exception loop. Only created when a connection has
+    // the high-rate tier enabled (highRateMs > 0 on an HA connection).
+    private final ConcurrentHashMap<String, ScheduledExecutorService> highRateSchedulers = new ConcurrentHashMap<>();
+
     // Serial executor for connection lifecycle (connect/disconnect). Paho's connect blocks up to
     // ~10s and disconnect up to 5s; running them on the caller's thread would blow the IPC socket's
     // 3s read timeout (MqttApiHandler) and make add/update/delete look like they failed. Offloading
@@ -163,6 +169,13 @@ public class MqttConnectionManager {
         }
         schedulers.clear();
 
+        // High-rate tier: stop every fast scheduler and the shared power poll.
+        for (Map.Entry<String, ScheduledExecutorService> entry : highRateSchedulers.entrySet()) {
+            entry.getValue().shutdownNow();
+        }
+        highRateSchedulers.clear();
+        try { BydDataCollector.getInstance().stopPowerPoll(); } catch (Exception ignored) {}
+
         for (Map.Entry<String, MqttPublisherService> entry : publishers.entrySet()) {
             entry.getValue().disconnect();
         }
@@ -205,6 +218,12 @@ public class MqttConnectionManager {
 
         // Schedule publish loop at the min-interval floor.
         scheduleNext(config.id, scheduler, Math.max(1, config.minIntervalSeconds));
+
+        // High-rate power tier (opt-in, HA connections only): a separate fast
+        // scheduler + the collector's power read poll. Off by default.
+        if (config.isHighRateEnabled()) {
+            startHighRate(config);
+        }
     }
 
     /**
@@ -219,6 +238,10 @@ public class MqttConnectionManager {
 
         MqttPublisherService publisher = publishers.remove(connectionId);
         if (publisher != null) publisher.disconnect();
+
+        // Tear down the high-rate tier AFTER removing the publisher so anyHighRateActive()
+        // doesn't count the connection we're stopping when deciding to halt the poll.
+        stopHighRate(connectionId);
 
         // Once no connection remains, clear the process-global SOCKS proxy props so
         // unrelated daemon sockets (zrok, APK download, push) aren't routed through
@@ -294,6 +317,102 @@ public class MqttConnectionManager {
 
         // Schedule next on the same scheduler this cycle ran on.
         scheduleNext(connectionId, scheduler, nextInterval);
+    }
+
+    // ==================== HIGH-RATE TIER ====================
+
+    /**
+     * Build a minimal payload of ONLY the high-rate keys, read live from the
+     * BydDataCollector snapshot (no 2 s collect cache — the power poll keeps the
+     * snapshot fresh at its own cadence). The high-rate set is signed power only
+     * (regen = negative); motor rpm/torque are NOT high-rate on this car (see
+     * BydDataCollector.startPowerPoll). Mapping + validation mirror the power section
+     * of {@link #collectTelemetry()} exactly, so a value published on the fast path is
+     * identical to the same value on the slow path.
+     */
+    private JSONObject collectHighRateTelemetry() {
+        JSONObject p = new JSONObject();
+        try {
+            BydDataCollector collector = BydDataCollector.getInstance();
+            BydVehicleData vd = collector.isInitialized() ? collector.getData() : null;
+            if (vd == null) return p;
+
+            // power — only the live drivetrain value; the parked/charging fallback that
+            // collectTelemetry() applies belongs to the slow path (charging is not a
+            // high-rate signal). Same range/sign as collectTelemetry().
+            if (!Double.isNaN(vd.enginePowerKw)
+                    && Math.abs(vd.enginePowerKw) > 0.1
+                    && Math.abs(vd.enginePowerKw) <= 300) {
+                p.put("power", vd.enginePowerKw);
+            }
+        } catch (Exception e) {
+            logger.debug("High-rate collect error: " + e.getMessage());
+        }
+        return p;
+    }
+
+    /** One fast publish cycle for a high-rate connection. Reschedules itself. */
+    private void runHighRateCycle(String connectionId, ScheduledExecutorService scheduler) {
+        if (highRateSchedulers.get(connectionId) != scheduler) return; // restarted/stopped
+        MqttPublisherService publisher = publishers.get(connectionId);
+        if (publisher == null || !publisher.isRunning()) return;
+        MqttConnectionConfig config = publisher.getConfig();
+        if (!config.isHighRateEnabled()) return; // disabled mid-flight
+
+        try {
+            JSONObject fast = collectHighRateTelemetry();
+            if (fast.length() > 0) publisher.publishHighRate(fast);
+        } catch (Exception e) {
+            logger.error("High-rate cycle error for " + config.name + ": " + e.getMessage());
+        }
+
+        long periodMs = Math.max(100, config.highRateMs);
+        scheduleNextHighRate(connectionId, scheduler, periodMs);
+    }
+
+    private void scheduleNextHighRate(String connectionId, ScheduledExecutorService scheduler, long delayMs) {
+        if (scheduler == null || scheduler.isShutdown()) return;
+        if (highRateSchedulers.get(connectionId) != scheduler) return;
+        try {
+            scheduler.schedule(() -> runHighRateCycle(connectionId, scheduler), delayMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+        }
+    }
+
+    /** Start the fast scheduler for a connection and the shared power read poll. */
+    private void startHighRate(MqttConnectionConfig config) {
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "MQTT-HR-" + config.id);
+            t.setDaemon(true);
+            return t;
+        });
+        highRateSchedulers.put(config.id, scheduler);
+        // Make sure power is actually fresh — start the collector's high-rate read
+        // poll at (at most) the fastest publish cadence requested.
+        try {
+            BydDataCollector.getInstance().startPowerPoll(Math.max(100, config.highRateMs));
+        } catch (Exception e) {
+            logger.warn("startPowerPoll failed: " + e.getMessage());
+        }
+        scheduleNextHighRate(config.id, scheduler, Math.max(100, config.highRateMs));
+        logger.info("High-rate tier started for " + config.name + " (" + config.highRateMs + "ms)");
+    }
+
+    /** Stop the fast scheduler for a connection; stop the power poll if it was the last. */
+    private void stopHighRate(String connectionId) {
+        ScheduledExecutorService scheduler = highRateSchedulers.remove(connectionId);
+        if (scheduler != null) scheduler.shutdownNow();
+        // Stop the shared collector poll once no connection still needs it.
+        if (!anyHighRateActive()) {
+            try { BydDataCollector.getInstance().stopPowerPoll(); } catch (Exception ignored) {}
+        }
+    }
+
+    private boolean anyHighRateActive() {
+        for (MqttPublisherService pub : publishers.values()) {
+            if (pub.isRunning() && pub.getConfig().isHighRateEnabled()) return true;
+        }
+        return false;
     }
 
     // ==================== CRUD OPERATIONS (called from IPC) ====================

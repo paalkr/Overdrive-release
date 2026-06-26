@@ -553,6 +553,88 @@ public class BydDataCollector {
         fastDynamics.set(null);
     }
 
+    // ================ Power high-rate poll (MQTT high-rate tier) ================
+    // The only dynamic drivetrain signal that is actually readable at high rate on
+    // this car is SIGNED ENGINE POWER (regen = negative kW). On-car probing found:
+    //   - motor rpm/torque: every callGet motor-speed id (OverDrive's AND the real
+    //     per-car ids) returns sentinels, parked and driving, on every device — they
+    //     are only available via the BYD event-subscription channel (separate effort),
+    //     so they are NOT high-rate here.
+    //   - power: callGet(ENGINE_POWER) returns a sentinel too, BUT the TYPED getter
+    //     getEnginePower() returns real signed kW (~ -42..106 while driving). So this
+    //     poll reads power via the typed getter only — the exact same path as
+    //     collectEngine()'s typed fallback (range-check, no dual-scale).
+    //
+    // This is an OPT-IN poll that mirrors the RoadSense fast-dynamics pattern: it reads
+    // ONLY power off the engine device handle at a fast cadence and writes it into the
+    // SAME snapshot field (enginePowerKw) the slow path writes, so getData(), HA
+    // discovery and the MQTT high-rate publish tier all pick it up densely. It does NOT
+    // touch any other field. Started by MqttConnectionManager only while a high-rate HA
+    // connection is active; zero cost otherwise.
+
+    private java.util.concurrent.ScheduledExecutorService powerPollScheduler;
+    /** Default power high-rate cadence (4 Hz) — one cheap typed getter on one device. */
+    public static final long POWER_POLL_INTERVAL_MS = 250;
+
+    /**
+     * Start the power high-rate poll (idempotent). Reads signed engine power via the
+     * typed {@code getEnginePower()} getter on {@code engineDevice} every
+     * {@code intervalMs} (clamped to a sane floor) and writes it into the snapshot.
+     * No-op if the engine device isn't available on this trim. Safe from any thread.
+     */
+    public synchronized void startPowerPoll(long intervalMs) {
+        if (powerPollScheduler != null) return;        // already running
+        if (engineDevice == null) return;              // nothing to poll on this trim
+        final long period = Math.max(100, intervalMs);
+        powerPollScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "PowerFastPoll");
+            t.setDaemon(true);
+            return t;
+        });
+        powerPollScheduler.scheduleWithFixedDelay(this::pollPowerOnce,
+                0, period, java.util.concurrent.TimeUnit.MILLISECONDS);
+        logger.info("Power high-rate poll started (" + period + "ms)");
+    }
+
+    /** Stop the power high-rate poll (idempotent). */
+    public synchronized void stopPowerPoll() {
+        if (powerPollScheduler != null) {
+            powerPollScheduler.shutdownNow();
+            powerPollScheduler = null;
+            logger.info("Power high-rate poll stopped");
+        }
+    }
+
+    /**
+     * One fast read of signed engine power, merged into the snapshot. Uses the SAME
+     * typed-getter path as collectEngine()'s fallback (getEnginePower(), range-checked
+     * -200..400 kW, no dual-scale — the dual-scale heuristic only applies to the
+     * callGet path, which returns a sentinel on this car). Negative = regen / charge.
+     * A sentinel / out-of-range read leaves enginePowerKw untouched (keeps the last
+     * good value) rather than blanking it.
+     */
+    private void pollPowerOnce() {
+        if (engineDevice == null) return;
+        try {
+            Object power = BydDeviceHelper.callGetter(engineDevice, "getEnginePower");
+            if (!(power instanceof Number)) return;
+            double kw = ((Number) power).doubleValue();
+            if (Double.isNaN(kw) || kw < -200.0 || kw > 400.0) return;
+            // Mirror the listener's ACC-off guard: while parked, only current INTO the
+            // pack (kw < 0, plug-in charging / regen) is physically plausible; reject
+            // positive residue so the ChargingDetector's inference isn't misled.
+            if (!accIsOn && kw > -ENGINE_POWER_CHARGING_DEADBAND) return;
+
+            BydVehicleData current = snapshot.get();
+            if (current == null) return;   // wait for the first full collectAll to seed the snapshot
+            // Compare-and-set so we don't clobber a concurrent collectAll write with a
+            // stale base; on a lost race just skip this tick (the next one re-reads).
+            snapshot.compareAndSet(current, current.toBuilder().enginePowerKw(kw).build());
+        } catch (Throwable t) {
+            logger.debug("Power poll error: " + t.getMessage());
+        }
+    }
+
     // ── Turn-indicator read (Blind Spot) ─────────────────────────────────────
     // The main light poll runs on the 5s full-snapshot cadence — far too slow to
     // pop the blind-spot overlay the instant the driver flicks the indicator.
@@ -626,6 +708,7 @@ public class BydDataCollector {
             pollScheduler = null;
         }
         stopFastDynamicsPoll();
+        stopPowerPoll();
         unregisterPlugEdgeReceiver();
         initialized = false;
     }
