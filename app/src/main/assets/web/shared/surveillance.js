@@ -912,7 +912,6 @@ BYD.surveillance = {
                     } else {
                         this.config.segmentDurationMinutes = 2;
                     }
-                }
                 try {
                     var mode = uData.config.camera && uData.config.camera.cameraMode;
                     var card = document.getElementById('survRectifyCard');
