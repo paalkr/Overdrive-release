@@ -198,7 +198,7 @@
     <string name="onboarding_exit">退出游览</string>
     <string name="onboarding_done_short">明白了</string>
     <!-- Step 0: authorize the daemon (system ADB popup) -->
-    <string name="onboarding_authorize_title">唤醒过多驱动器</string>
+    <string name="onboarding_authorize_title">唤醒 Overdrive</string>
     <string name="onboarding_authorize_body">Overdrive runs your cameras through a small on-device helper. Android will ask once to allow USB debugging — tap <b>Allow</b> and check <b>Always allow from this device</b> so it stays on after every restart.</string>
     <string name="onboarding_authorize_button">允许访问</string>
     <string name="onboarding_authorize_waiting_title">等待权限…</string>
@@ -209,7 +209,7 @@
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">相机 · 步长 %1$d ，共 %2$d</string>
     <string name="onboarding_camera_intro_title">设置您的摄像头</string>
-    <string name="onboarding_camera_intro_body">让我们告诉Overdric 哪个摄像头是您的360张照片，哪个摄像头是您的摄像头。这需要大约一分钟的时间，您可以稍后更改它。</string>
+    <string name="onboarding_camera_intro_body">让我们告诉 Overdrive 哪个摄像头是您的 360 全景视图，哪个是您的 dashcam。大约需要一分钟，稍后您也可以更改。</string>
     <string name="onboarding_camera_intro_primary">开始</string>
     <string name="onboarding_camera_opening_title">打开相机设置…</string>
     <string name="onboarding_camera_opening_body">从您的摄像头加载现场预览。这可能需要几秒钟。</string>
@@ -218,7 +218,7 @@
     <string name="onboarding_camera_dashcam_title">现在找到前方摄像头</string>
     <string name="onboarding_camera_dashcam_body">步过照相机的箭头并停止显示风盾/前进视图。 注意它的数字 — — 你下一步会挑选它。</string>
     <string name="onboarding_camera_pick_title">选择您的360个摄像头</string>
-    <string name="onboarding_camera_pick_body">在顶部卡片中，选择您360/普通摄像头的数字。不确定吗？将其留在自动转发器和超载器上以数字表示。</string>
+    <string name="onboarding_camera_pick_body">在顶部卡片中，选择您的 360 / 普通摄像头对应的编号。不确定？保持 AUTO 设置，Overdrive 会自动识别。</string>
     <string name="onboarding_camera_pick_primary">下一个</string>
     <string name="onboarding_camera_pick_dash_title">选择您的摄像头摄像头</string>
     <string name="onboarding_camera_pick_dash_body">在这张卡片中选择您早些时候发现的 dashcam 号码 — 或将它留在AUTO上。</string>
@@ -234,7 +234,7 @@
     <string name="onboarding_camera_windshield_primary">显示我</string>
     <string name="onboarding_camera_windshield_skip">不要谢谢。</string>
     <!-- Vehicle profile chapter -->
-    <string name="onboarding_vehicle_title">告诉您过剩的电池</string>
+    <string name="onboarding_vehicle_title">告诉 Overdrive 您的电池信息</string>
     <string name="onboarding_vehicle_body">选择您的模型，我们填充了 kWh，或者输入自己(15-120)。 这使得范围和充电估计准确。您可以跳过并稍后设置。</string>
     <string name="onboarding_vehicle_primary">设置电池</string>
     <!-- Dashboard orientation chapter -->
@@ -264,12 +264,12 @@
     <string name="onboarding_expert_live_body">从这里打开现场实时监视所有摄像头。在驱动器前或停在附近时操作查看视图。</string>
     <string name="onboarding_expert_trips_title">修剪历史</string>
     <string name="onboarding_expert_trips_body">行程记录每个驱动器——路线、距离、持续时间和能量使用——以便你可以检查车在哪里。</string>
-    <string name="onboarding_expert_roadsense_title">道路Sense</string>
-    <string name="onboarding_expert_roadsense_body">道路传感器使用汽车运动传感器和全球定位系统探测道路危险——公共汽车、马铃薯、步行断器——并在已知道路之前警告你。 它的标签覆盖检测、危险地图、警告棋子和闪光点。开启主开关来使用其中任何一个。</string>
+    <string name="onboarding_expert_roadsense_title">RoadSense</string>
+    <string name="onboarding_expert_roadsense_body">RoadSense 利用车辆的运动传感器和 GPS 来检测路面隐患——颠簸、坑洼、减速带——并在接近已知隐患前向您发出警告。其各个标签页涵盖检测、隐患地图、警告提示音以及盲区监测。打开主开关即可使用其中的任意功能。</string>
     <string name="onboarding_expert_blindspot_title">盲点</string>
     <string name="onboarding_expert_blindspot_body">在此选项卡中启用Blind Spot，当你发出转动信号时 侧相机视图自动出现在屏幕上——左向左，右向右——随后隐藏。 它只是在一个转动信号打开时才运行。</string>
     <string name="onboarding_expert_maps_title">Navigation</string>
-    <string name="onboarding_expert_maps_body">打开地图全转导航-搜索目的地、获取路由和实时指导。 路德森公司已经沿途登陆，加上附近的关注点和任何道路危险。 当你开始驾车时，你也可以将它自动投射到仪器集群上 — — 切换在路德森塞地图选项卡中的生命。</string>
+    <string name="onboarding_expert_maps_body">打开地图即可获得完整的逐向导航——搜索目的地、获取路线规划和实时引导，还能查看附近的兴趣点以及 RoadSense 沿途记录的所有路面隐患。当您开始驾驶时，还可以将其自动投影到仪表盘上——该开关位于 RoadSense 的地图标签页中。</string>
     <string name="onboarding_expert_integrations_title">集成</string>
     <string name="onboarding_expert_integrations_body">连接 Telegram 警示，一个更好的路由规划器，MQTT 或 BYD 云。 每张卡片都在应用程序内打开它的设置。当所有东西的链接时，上面的避孕药都会转向绿化。</string>
     <string name="onboarding_expert_bydcloud_title">BYD 云解锁远程控制</string>
@@ -486,7 +486,7 @@
     <string name="toast_updated_to">更新至%1$s</string>
     <string name="toast_update_install_failed">更新安装失败:%1$s</string>
     <string name="toast_checking_for_updates">检查是否有更新...</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">应用程序是最新版本(%1$s)</string>
     <string name="toast_update_check_failed">更新检查失败:%1$s</string>
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">可用更新</string>
@@ -681,7 +681,7 @@
     <string name="toast_batch_delete_partial">已删除%1$d,失败的%2$d</string>
     <string name="play_with_chooser">玩一下</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">已更新到 %1$s — 重新确认自动启动，每次安装时都会有BYD wipes</string>
     <string name="setup_overlay_already_granted">已授予</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">提示 &amp; 解决问题</string>
@@ -777,13 +777,13 @@
     <string name="settings_backup_pick_file">选择备份以恢复</string>
     <string name="settings_backup_no_files">未找到备份文件。先导出一个或复制一个备份.json到 %1$s，然后重试。</string>
     <string name="settings_backup_read_failed">无法读取文件</string>
-    <string name="settings_backup_invalid_file">该文件不是有效的Overdric 备份</string>
+    <string name="settings_backup_invalid_file">该文件不是有效的 Overdrive 备份</string>
     <string name="settings_backup_restoring">正在恢复…</string>
     <string name="settings_backup_restored">设置已恢复</string>
     <string name="settings_backup_restore_failed">还原失败</string>
     <string name="settings_backup_daemon_down">相机服务必须运行到备份或还原。从守护进程启动，然后重试。</string>
     <string name="settings_backup_restore_confirm_title">还原设置？</string>
-    <string name="settings_backup_restore_confirm_msg">这将用备份和重新加载服务取代您当前的超载驱动器设置。它只能在备份的同一个头部设备上工作。</string>
+    <string name="settings_backup_restore_confirm_msg">此操作将用备份替换您当前的 Overdrive 设置并重新加载服务。它仅适用于创建该备份时所用的同一台车机。</string>
     <string name="settings_backup_restore_confirm_btn">恢复</string>
     <string name="settings_backup_restart_hint">设置已恢复。重启相机守护进程 (Daemons = 相机-> 重启) 以确保每个恢复的设置都已应用。</string>
     <string name="settings_backup_trips_prompt">包括您的旅行历史记录(距离、能源、成本、分数、起始/结束位置？不包括每次旅行的详细遥测数据。 该文件将包含您的位置历史记录——保持其隐私。</string>
@@ -1302,9 +1302,9 @@
     <string name="cloudflared_token_storage_note">令牌安全地存储并在应用程序和守护进程之间共享。</string>
     <string name="cloudflared_token_hint">输入云端令牌</string>
     <string name="cloudflare_paid_version">Cloudflare已付费版本</string>
-    <string name="dialog_cloudflared_settings_title">:globe_with_meridians：云端设置</string>
-    <string name="dialog_cloudflared_settings_message">定义您是在使用付费云层还是自行车。如果您正在使用付费云层，请输入您的隧道令牌。</string>
+    <string name="dialog_cloudflared_settings_title">Cloudflared 设置</string>
+    <string name="dialog_cloudflared_settings_message">请指定您使用的是付费版 Cloudflare 还是 trycloudflare。如果使用付费版 Cloudflare，请输入您的隧道令牌。</string>
     <string name="toast_cloudflared_token_cannot_be_empty">如果您设置为付费版本，令牌不能为空</string>
     <string name="toast_cloudflared_token_invalid">无效的令牌：只使用字母、数字和 . _ - = 字符</string>
-    <string name="toast_cloudflared_saved_settings">已保存云端设置</string>
+    <string name="toast_cloudflared_saved_settings">Cloudflared 设置已保存</string>
 </resources>
