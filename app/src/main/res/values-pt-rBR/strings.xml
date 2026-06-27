@@ -198,7 +198,7 @@
     <string name="onboarding_exit">Sair do tour</string>
     <string name="onboarding_done_short">Eu tenho que</string>
     <!-- Step 0: authorize the daemon (system ADB popup) -->
-    <string name="onboarding_authorize_title">Acordar Sobrecarga</string>
+    <string name="onboarding_authorize_title">Ative o Overdrive</string>
     <string name="onboarding_authorize_body">O Overdrive executa suas câmeras através de um pequeno auxiliar no dispositivo. O Android pedirá uma vez para permitir a depuração USB. Toque em <b>Permitir</b> e verifique <b>Sempre permitir a partir deste dispositivo</b> para que ele permaneça após cada reinicialização.</string>
     <string name="onboarding_authorize_button">Permitir acesso</string>
     <string name="onboarding_authorize_waiting_title">Aguardando permissão…</string>
@@ -218,7 +218,7 @@
     <string name="onboarding_camera_dashcam_title">Agora encontre a câmera virada</string>
     <string name="onboarding_camera_dashcam_body">Passe através das câmeras com as setas e pare na que mostra o pára-brisa/vista para a frente. Observe seu número — você o escolherá em seguida.</string>
     <string name="onboarding_camera_pick_title">Escolha sua câmera 360</string>
-    <string name="onboarding_camera_pick_body">No cartão superior, escolha o número para o seu 360 / câmera normal. Não tem certeza? Deixá-lo em AUTO e Sobrescrever números.</string>
+    <string name="onboarding_camera_pick_body">No cartão superior, escolha o número da sua câmera 360 / normal. Não tem certeza? Deixe em AUTO e o Overdrive descobre sozinho.</string>
     <string name="onboarding_camera_pick_primary">Próximo</string>
     <string name="onboarding_camera_pick_dash_title">Pegar sua câmera do dashcam</string>
     <string name="onboarding_camera_pick_dash_body">Com este cartão, escolha o número que você encontrou antes — ou deixe-o no AUTO.</string>
@@ -264,7 +264,7 @@
     <string name="onboarding_expert_live_body">Abra daqui para assistir todas as câmeras em tempo real. Útil para verificar a visualização antes de uma unidade ou enquanto estiver estacionada por perto.</string>
     <string name="onboarding_expert_trips_title">Histórico de viagens</string>
     <string name="onboarding_expert_trips_body">As viagens registram cada unidade — rota, distância, duração e utilização de energia — para que você possa revisar onde o carro esteve.</string>
-    <string name="onboarding_expert_roadsense_title">Sentido</string>
+    <string name="onboarding_expert_roadsense_title">RoadSense</string>
     <string name="onboarding_expert_roadsense_body">RoadSense usa os sensores de movimento do carro e o GPS para detectar perigos de estradas — propulsões, potholes, disjuntores de velocidade — e te avisa antes dos conhecidos. Sua detecção de capas, o mapa de perigo, os chimes de aviso e o ponto vazio. Ative o interruptor principal para usar qualquer um.</string>
     <string name="onboarding_expert_blindspot_title">Ponto Cego</string>
     <string name="onboarding_expert_blindspot_body">Ative o Ponto Cego na aba aqui e, quando você sinalizar uma curva, uma vista lateral da câmera aparece na tela automaticamente — a esquerda para um sinal à esquerda, a direita para uma direita — e então se esconde logo depois. Só é executado enquanto um sinal de ativação está ativado.</string>
@@ -1312,7 +1312,7 @@
     <string name="cloudflared_token_storage_note">O token é armazenado de forma segura e compartilhado entre o aplicativo e os processos daemon.</string>
     <string name="cloudflared_token_hint">Digite o token cloudflared</string>
     <string name="cloudflare_paid_version">Versão paga do Cloudflare</string>
-    <string name="dialog_cloudflared_settings_title">🌐 Configurações Nuvens</string>
+    <string name="dialog_cloudflared_settings_title">Configurações do Cloudflared</string>
     <string name="dialog_cloudflared_settings_message">Defina se você está usando o Cloudflare pago ou o trycloudflare. Se você estiver usando o Cloudflare, insira o token do túnel.</string>
     <string name="toast_cloudflared_token_cannot_be_empty">Se você definir para versão paga o token não pode estar vazio</string>
     <string name="toast_cloudflared_token_invalid">Token inválido: use apenas letras, números e . _ - = caracteres</string>
