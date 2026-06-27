@@ -187,6 +187,107 @@
     <string name="setup_overlay_title">Erlauben Sie die Anzeige über andere Apps</string>
     <string name="setup_overlay_body">Aktivieren Sie dies, um einen schwimmenden Statusindikator für Aufzeichnung und Reiseverfolgung auf anderen Apps anzuzeigen.</string>
     <string name="setup_overlay_button">Öffnen Sie die Überlagerungseinstellungen</string>
+    <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
+         protected brand name — keep it verbatim. -->
+    <!-- Shared button labels -->
+    <string name="onboarding_next">Nächste</string>
+    <string name="onboarding_back">Zurück</string>
+    <string name="onboarding_skip">Überspringen</string>
+    <string name="onboarding_later">Später machen</string>
+    <string name="onboarding_dismiss">Verwerfen</string>
+    <string name="onboarding_exit">Tour beenden</string>
+    <string name="onboarding_done_short">Verstanden</string>
+    <!-- Step 0: authorize the daemon (system ADB popup) -->
+    <string name="onboarding_authorize_title">Overdrive aufwecken</string>
+    <string name="onboarding_authorize_body">Overdrive steuert Ihre Kameras mit einem kleinen Geräte-Helfer. Android wird einmal darum bitten, USB-Debugging zu erlauben — Tippen Sie auf <b>Erlauben</b> und wählen Sie <b>Immer von diesem Gerät</b> zulassen, so dass es nach jedem Neustart eingeschaltet bleibt.</string>
+    <string name="onboarding_authorize_button">Zugriff erlauben</string>
+    <string name="onboarding_authorize_waiting_title">Warte auf Berechtigung…</string>
+    <string name="onboarding_authorize_waiting_body">Akzeptieren Sie das Android-Popup. Wenn Sie es nicht sehen, kann es bereits gewährt werden — dies wird von sich aus fortgesetzt.</string>
+    <string name="onboarding_authorize_retry_title">Noch nicht verbunden</string>
+    <string name="onboarding_authorize_retry_body">Der Helfer wird noch nicht ausgeführt. Die Android-Berechtigung wurde möglicherweise entlassen. Versuchen Sie es erneut und überprüfen Sie bitte <b>Immer erlauben</b>.</string>
+    <string name="onboarding_authorize_retry_button">Erneut versuchen</string>
+    <!-- Camera mapping chapter -->
+    <string name="onboarding_camera_step_label">Kamera · Schritt %1$d von %2$d</string>
+    <string name="onboarding_camera_intro_title">Kameras einrichten</string>
+    <string name="onboarding_camera_intro_body">Sagen wir Overdrive welche Kamera deine 360 Ansicht ist und welche deine Dashcam ist. Das dauert ungefähr eine Minute, und du kannst sie später ändern.</string>
+    <string name="onboarding_camera_intro_primary">Start</string>
+    <string name="onboarding_camera_opening_title">Kamera Setup… wird geöffnet</string>
+    <string name="onboarding_camera_opening_body">Lade eine Live-Vorschau von deinen Kameras. Dies kann ein paar Sekunden dauern.</string>
+    <string name="onboarding_camera_pano_title">Dies ist deine 360 Ansicht</string>
+    <string name="onboarding_camera_pano_body">Benutzen Sie die Pfeile um das 4-up Bild zu finden. Lesen Sie es von der BOTTOM: unten links ist das REAR, unten rechts ist die LEFT Seite.</string>
+    <string name="onboarding_camera_dashcam_title">Finden Sie jetzt die Road-Aight-Kamera</string>
+    <string name="onboarding_camera_dashcam_body">Treten Sie durch die Kameras mit den Pfeilen und stoppen Sie auf dem Windschutzschild / Vorwärtsansicht. Beachten Sie die Nummer — Sie wählen sie als Nächstes aus.</string>
+    <string name="onboarding_camera_pick_title">Wähle deine 360 Kamera</string>
+    <string name="onboarding_camera_pick_body">In der oberen Karte wählen Sie die Nummer für Ihre 360 / normale Kamera. Nicht sicher? Lassen Sie sie auf AUTO und Overdrive Zahlen aus.</string>
+    <string name="onboarding_camera_pick_primary">Nächste</string>
+    <string name="onboarding_camera_pick_dash_title">Wähle deine Dashcam-Kamera</string>
+    <string name="onboarding_camera_pick_dash_body">Wählen Sie in dieser Karte die vorher gefundene Dashcam-Nummer aus — oder lassen Sie sie auf AUTO.</string>
+    <string name="onboarding_camera_save_primary">Speichern &amp; Neustart</string>
+    <string name="onboarding_camera_applying_title">Anwenden — Kameras neu starten</string>
+    <string name="onboarding_camera_applying_body">Der Feed wird dunkler und blinkt für etwa 10 Sekunden. Dies ist normal — eng hängen.</string>
+    <string name="onboarding_camera_verify_title">Schnellprüfung</string>
+    <string name="onboarding_camera_verify_body">Zeigt die 360 Ansicht das gestickte Bild und die Dashcam die Straße vor? Wenn ein Feed falsch aussieht, tippen Sie auf Wiederholung — nichts ist kaputt.</string>
+    <string name="onboarding_camera_verify_ok">Sieht rechts aus</string>
+    <string name="onboarding_camera_verify_repick">Neu auswählen</string>
+    <string name="onboarding_camera_windshield_title">Road-Away-Band bei Aufnahmen? (optional)</string>
+    <string name="onboarding_camera_windshield_body">Für das OEM-Dashcam-Layout – die Windschutzkamera als Streifen auf Ihrer Aufnahme – wähle Windshield im Rollenmenü, wählen Sie die Vorwärtskamera und Speichern. Die meisten Besitzer können dies überspringen.</string>
+    <string name="onboarding_camera_windshield_primary">Zeige mich</string>
+    <string name="onboarding_camera_windshield_skip">Nein danke</string>
+    <!-- Vehicle profile chapter -->
+    <string name="onboarding_vehicle_title">Übertreiben Sie Ihren Akku</string>
+    <string name="onboarding_vehicle_body">Wählen Sie Ihr Modell und wir füllen die kWh, oder geben Sie es selbst (15–120). Dies macht Reichweite und Berechnung genau. Sie können ihn überspringen und später einstellen.</string>
+    <string name="onboarding_vehicle_primary">Akku setzen</string>
+    <!-- Dashboard orientation chapter -->
+    <string name="onboarding_dash_tiles_title">Dein Cockpit auf einen Blick</string>
+    <string name="onboarding_dash_tiles_body">Diese Karten sind Buttons — tippen um Live-Kameras, Aufnahmen, Services oder Ihr Fahrzeug zu öffnen.</string>
+    <string name="onboarding_dash_chips_title">Diese zeigen nur Status</string>
+    <string name="onboarding_dash_chips_body">Die Chips zeigen Aufnahmen, Dienste und Ihren Remote-Link. Sie aktualisieren auf eigene Faust — sie sind keine Buttons.</string>
+    <string name="onboarding_dash_chips_body_land">Ihr Live-Status – Aufnahme, Dienste und Remote-Link – wird hier angezeigt. Er aktualisiert sich eigenständig.</string>
+    <!-- Completion -->
+    <string name="onboarding_done_title">Cockpit bereit</string>
+    <string name="onboarding_done_body">Kameras zugeordnet und Akku. Tippen Sie auf Live um Ihre Feeds zu beobachten — oder erkunden Sie die tieferen Einstellungen jederzeit.</string>
+    <string name="onboarding_done_primary">Fertig</string>
+    <string name="onboarding_done_secondary">Setup erkunden</string>
+    <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
+    <string name="onboarding_help_cd">Geführte Tour</string>
+    <string name="onboarding_reset_toast">Onboarding-Reset — Wiedergabe der Anleitung</string>
+    <string name="onboarding_expert_chapter_label">Kapitel %1$d von %2$d</string>
+    <string name="onboarding_expert_finish">Beenden</string>
+    <string name="onboarding_expert_menu_title">Geführte Tour</string>
+    <string name="onboarding_expert_menu_body">Ein kurzer Spaziergang durch das tiefere Setup – Ihr Fahrzeugprofil, Integration, Überwachung, Diagnostik, Service und Sicherheit.</string>
+    <string name="onboarding_expert_menu_start">Tour starten</string>
+    <string name="onboarding_expert_vehicle_title">Fahrzeugprofil</string>
+    <string name="onboarding_expert_vehicle_body">Tippe auf die Fahrzeugkachel, um deine Batteriegröße und dein Modell zu bestimmen – sie sorgt für genaue Reichweiten- und Gesundheitsschätzungen.</string>
+    <string name="onboarding_expert_recordings_title">Ihre Aufnahmen</string>
+    <string name="onboarding_expert_recordings_body">Wechseln Sie mit diesem Schalter zwischen Dashcam (kontinuierliche + Näherungsklippe) und Surveillance (geparkte Sentry-Ereignisse) – jeder behält seine eigene Bibliothek. Tippe auf einen Clip, um ihn zu spielen.</string>
+    <string name="onboarding_expert_live_title">Live-Kameras</string>
+    <string name="onboarding_expert_live_body">Öffnen Sie Live von hier aus, um alle Kameras in Echtzeit zu sehen.</string>
+    <string name="onboarding_expert_trips_title">Reiseverlauf</string>
+    <string name="onboarding_expert_trips_body">Reisen protokollieren jeden Antrieb – Route, Entfernung, Dauer und Energieverbrauch –, so dass Sie überprüfen können, wo das Auto war.</string>
+    <string name="onboarding_expert_roadsense_title">Straßensinn</string>
+    <string name="onboarding_expert_roadsense_body">RoadSense nutzt die Bewegungssensoren und GPS des Autos, um Straßenrisiken – Beulen, Schlaglöcher, Geschwindigkeitsschalter – zu erkennen und warnt Sie vor bekannten Gefahren. Seine Tabs decken Erkennung, die Gefahrenkarte, Warnschalen und Blind Spot ab. Schalten Sie den Master-Schalter ein, um ihn zu verwenden.</string>
+    <string name="onboarding_expert_blindspot_title">Blinder Spot</string>
+    <string name="onboarding_expert_blindspot_body">Aktiviere Blind Spot im Tab hier und wenn du einen Zug signalisierst eine seitliche Kameraansicht erscheint automatisch auf dem Bildschirm — links für ein linkes Signal, rechts für ein rechtes Signal — dann verbirgt sich kurz danach. Es läuft nur, wenn ein Drehsignal eingeschaltet ist.</string>
+    <string name="onboarding_expert_maps_title">Navigation</string>
+    <string name="onboarding_expert_maps_body">Öffne die Karte für die vollständige Turn-by-Turn-Navigation – suche ein Ziel, erhalte Routing und Live-Anleitung, und viele interessante Punkte in der Nähe und alle Straßenrisiken RoadSense hat sich auf dem Weg geloggt. Sie können es auch automatisch auf das Instrumentencluster projizieren, wenn Sie mit dem Fahren beginnen — dass in RoadSense\'s Map Reiter lebt.</string>
+    <string name="onboarding_expert_integrations_title">Integrationen</string>
+    <string name="onboarding_expert_integrations_body">Verbinden Sie Telegram-Warnungen, Ein besserer Routeplanner, MQTT oder BYD-Cloud. Jede Karte öffnet ihre Einrichtung innerhalb der App. Die Pille oben wird grün, wenn alles verbunden ist.</string>
+    <string name="onboarding_expert_bydcloud_title">BYD Cloud entsperrt die Fernbedienung</string>
+    <string name="onboarding_expert_bydcloud_body">Die Verknüpfung Ihres BYD-Kontos hier ermöglicht die Fernsperre, Blitz und Horn von Ihrem Telefon. Behandeln Sie das verknüpfte Konto und den Zugangscode als empfindlich.</string>
+    <string name="onboarding_expert_surveillance_title">Überwachung &amp; Aufnahme</string>
+    <string name="onboarding_expert_surveillance_body">Feintune Erkennung, Qualität und Speicherung hier. Diese öffnen als in-app Konfigurationsseiten von Ihrem Auto – ein leerer Bildschirm bedeutet nur, dass der Helfer immer noch beginnt.</string>
+    <string name="onboarding_expert_camprobe_title">Kamerasonde — Vorsicht</string>
+    <string name="onboarding_expert_camprobe_body">Damit wird die physikalische Kamera nachgerüstet und die Kamera neu gestartet. Ändern Sie es nur, wenn ein Feed falsch aussieht — Sie haben dies früher in der Anleitung eingestellt.</string>
+    <string name="onboarding_expert_traffic_title">Traffic-Monitor — erforderlich für Remote-Zugriff</string>
+    <string name="onboarding_expert_traffic_body">Der integrierte Traffic Monitor von BYD hindert andere Apps daran, die eingebaute SIM-Karte des Autos zu verwenden. Wenn Sie Ihr Auto aus der Ferne über die BYD SIM-Karte erreichen wollen, müssen Sie es hier deaktivieren. Die Kopfeinheit startet neu, um die Änderung anzuwenden.</string>
+    <string name="onboarding_expert_daemons_title">Services — mit Vorsicht behandeln</string>
+    <string name="onboarding_expert_daemons_body">Diese Schalter starten und stoppen Hintergrunddienste. Das Einschalten von AFF-Kamera, Überwachungsfunktion oder ACC Sentry stoppt die Aufnahme und hält sie bis zum Einschalten zurück – auch nach einem Neustart.</string>
+    <string name="onboarding_expert_security_title">Mit PIN sperren</string>
+    <string name="onboarding_expert_security_body">Legen Sie eine PIN fest, um die App für geteilte Fahrzeuge zu öffnen. Überwachung und Aufzeichnung während der Sperre der App laufen. Eine vergessene PIN kann nur von einem Computer über USB gelöscht werden.</string>
+    <string name="onboarding_expert_reset_title">Daten zurücksetzen — permanent</string>
+    <string name="onboarding_expert_reset_body">Dies löscht Aufnahmen, Ereignisse und Einstellungen und kann nicht rückgängig gemacht werden. Es ist hier, wenn du das Auto jemals verkauft hast — nicht Teil des normalen Gebrauchs.</string>
+    <string name="onboarding_expert_done_title">Das ist die Tour</string>
+    <string name="onboarding_expert_done_body">Du hast die tieferen Einstellungen gesehen. Öffne diese Anleitung jederzeit wieder über den Hilfe-Knopf.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Schließen</string>
     <string name="language_picker_title">Sprache</string>
@@ -621,7 +722,7 @@
          or only the keepalive survived an OOM respawn. -->
     <string name="daemon_keepalive_notif_title">Overdrive aktiv</string>
     <string name="daemon_keepalive_notif_text">Überwachung von Fahrzeugsystemen</string>
-    <string name="overdrive_status_summary_title">Übertreibung</string>
+    <string name="overdrive_status_summary_title">Overdrive</string>
     <string name="overdrive_status_summary_text">Hintergrunddienste laufen</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
@@ -632,6 +733,7 @@
     <string name="rail_recordings">Aufnahmen</string>
     <string name="rail_vehicle">Fahrzeug</string>
     <string name="rail_trips">Fahrten</string>
+    <string name="rail_charging">Aufladen</string>
     <string name="rail_integrations">Integrationen</string>
     <string name="rail_diagnostics">Diagnostik</string>
     <string name="rail_settings">Einstellungen</string>
@@ -1024,11 +1126,11 @@
     <!-- ============================================================
          RoadSense — road-hazard detection feature
          ============================================================ -->
-    <string name="rail_roadsense">Straßensinn</string>
+    <string name="rail_roadsense">RoadSense</string>
     <string name="rail_hazard_map">Karte</string>
-    <string name="roadsense_title">Straßensinn</string>
+    <string name="roadsense_title">RoadSense</string>
     <string name="roadsense_pill_scanning">Scannen</string>
-    <string name="roadsense_pill_idle">Straßensinn</string>
+    <string name="roadsense_pill_idle">RoadSense</string>
     <string name="roadsense_status_idle">Leerlauf</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
