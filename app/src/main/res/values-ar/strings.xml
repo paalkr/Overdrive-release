@@ -187,6 +187,107 @@
     <string name="setup_overlay_title">السماح بالعرض فوق التطبيقات الأخرى</string>
     <string name="setup_overlay_body">تمكين هذا لإظهار مؤشر حالة عائم للتسجيل وتتبع الرحلة على أعلى التطبيقات الأخرى.</string>
     <string name="setup_overlay_button">فتح إعدادات التراكب</string>
+    <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
+         protected brand name — keep it verbatim. -->
+    <!-- Shared button labels -->
+    <string name="onboarding_next">التالي</string>
+    <string name="onboarding_back">الرجوع</string>
+    <string name="onboarding_skip">تخطي</string>
+    <string name="onboarding_later">قم بهذا لاحقاً</string>
+    <string name="onboarding_dismiss">تجاهل</string>
+    <string name="onboarding_exit">الخروج من الجولة</string>
+    <string name="onboarding_done_short">فهمت ذلك</string>
+    <!-- Step 0: authorize the daemon (system ADB popup) -->
+    <string name="onboarding_authorize_title">ايقاظ فوق القرص</string>
+    <string name="onboarding_authorize_body">فوق القرص يدير الكاميرات الخاصة بك من خلال مساعد صغير على الجهاز. سيطلب أندرويد مرة واحدة للسماح بتصحيح أخطاء USB — انقر على <b>اسمح</b> وتحقق من <b>السماح دائمًا من هذا الجهاز</b> حتى يستمر بعد كل إعادة تشغيل.</string>
+    <string name="onboarding_authorize_button">السماح بالوصول</string>
+    <string name="onboarding_authorize_waiting_title">في انتظار الإذن…</string>
+    <string name="onboarding_authorize_waiting_body">اقبل منبثق اندرويد. اذا لم تراه، قد يتم منحه بالفعل – هذا سوف يستمر بنفسه.</string>
+    <string name="onboarding_authorize_retry_title">لا يزال غير متصل</string>
+    <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
+    <string name="onboarding_authorize_retry_button">حاول مرة أخرى</string>
+    <!-- Camera mapping chapter -->
+    <string name="onboarding_camera_step_label">الكاميرا · الخطوة %1$d من %2$d</string>
+    <string name="onboarding_camera_intro_title">إعداد الكاميرات الخاصة بك</string>
+    <string name="onboarding_camera_intro_body">دعونا نقول فوق القرص أي الكاميرا هي مشاهدة 360 و أي كاميرا تستغرق حوالي دقيقة ، ويمكنك تغييرها لاحقا.</string>
+    <string name="onboarding_camera_intro_primary">ابدأ</string>
+    <string name="onboarding_camera_opening_title">فتح إعداد الكاميرا…</string>
+    <string name="onboarding_camera_opening_body">تحميل معاينة حية من الكاميرات. قد يستغرق ذلك بضع ثوان.</string>
+    <string name="onboarding_camera_pano_title">هذا هو عرضك 360</string>
+    <string name="onboarding_camera_pano_body">استخدم الأسهم للعثور على صورة 4up. اقرأها من BOTTOM: أسفل اليسار هو REAR، أسفل اليمين هو جانب LEFT.</string>
+    <string name="onboarding_camera_dashcam_title">الآن ابحث عن الكاميرا القادمة</string>
+    <string name="onboarding_camera_dashcam_body">قم بخطوة عبر الكاميرات مع الأسهم وتوقف على الشاشة التي تظهر الزجاج / العرض إلى الأمام. لاحظ رقمه – سوف تختاره بعد ذلك.</string>
+    <string name="onboarding_camera_pick_title">اختر الكاميرا 360</string>
+    <string name="onboarding_camera_pick_body">في البطاقة العلوية، اختر رقم الكاميرا 360 / الكاميرا العادية. ليس متأكداً؟ تركها على أوتوتو (AUTO) ورقمها فوق.</string>
+    <string name="onboarding_camera_pick_primary">التالي</string>
+    <string name="onboarding_camera_pick_dash_title">اختر كاميرا داشكامك</string>
+    <string name="onboarding_camera_pick_dash_body">في هذه البطاقة، اختر رقم المخيم الذي وجدته في وقت سابق - أو اتركه على AUTO.</string>
+    <string name="onboarding_camera_save_primary">حفظ &amp; إعادة تشغيل</string>
+    <string name="onboarding_camera_applying_title">تطبيق — إعادة تشغيل الكاميرات</string>
+    <string name="onboarding_camera_applying_body">ستصبح التغذية مظلمة ومربوطة لحوالي 10 ثوان. وهذا أمر طبيعي - ضيق.</string>
+    <string name="onboarding_camera_verify_title">التحقق السريع</string>
+    <string name="onboarding_camera_verify_body">هل تظهر وجهة النظر 360 الصورة الخبيثة ويعرض كاميرا الطريق أمامها؟ إذا بدا موجز خاطئا، انقر على إعادة الاختيار - لا شيء مكسور.</string>
+    <string name="onboarding_camera_verify_ok">يبدو لليمين</string>
+    <string name="onboarding_camera_verify_repick">إعادة الاختيار</string>
+    <string name="onboarding_camera_windshield_title">الطريق إلى الأمام في التسجيلات؟ (اختياري)</string>
+    <string name="onboarding_camera_windshield_body">بالنسبة لتخطيط \"OEM Dashkam\" - كاميرا الدرع الرياضي كشريط فوق التسجيل الخاص بك - اختر ويندرويد في قائمة الأدوار، اختر الكاميرا الأمامية، و احفظ. معظم المالكين يمكنهم تخطي هذا.</string>
+    <string name="onboarding_camera_windshield_primary">أظهر لي</string>
+    <string name="onboarding_camera_windshield_skip">لا شكراً</string>
+    <!-- Vehicle profile chapter -->
+    <string name="onboarding_vehicle_title">أخبر البطارية فوق الذاكرة</string>
+    <string name="onboarding_vehicle_body">اختر الطراز الخاص بك ونملأ kw، أو اكتبه بنفسك (15-120). هذا يجعل المدى و تقديرات الشحن دقيقة. يمكنك تخطي و تعيينها لاحقا.</string>
+    <string name="onboarding_vehicle_primary">تعيين البطارية</string>
+    <!-- Dashboard orientation chapter -->
+    <string name="onboarding_dash_tiles_title">قطعتك في لمحة</string>
+    <string name="onboarding_dash_tiles_body">هذه البطاقات أزرار - انقر لفتح كاميرات حية أو تسجيلات أو خدمات أو سيارتك.</string>
+    <string name="onboarding_dash_chips_title">حالة عرض هذه فقط</string>
+    <string name="onboarding_dash_chips_body">الرقائق العلوية تظهر التسجيلات والخدمات ووصلتك البعيدة. يتم تحديثها من تلقاء نفسها - ليست أزرارا.</string>
+    <string name="onboarding_dash_chips_body_land">تظهر حالتك المباشرة - التسجيل، الخدمات والرابط البعيد - هنا. وتحديثها بنفسها.</string>
+    <!-- Completion -->
+    <string name="onboarding_done_title">الطائرة جاهزة</string>
+    <string name="onboarding_done_body">تم تعيين الكاميرا وتعيين البطارية. انقر فوق مباشرة لمشاهدة التغذية الخاصة بك - أو استكشف الإعدادات الأعمق في أي وقت.</string>
+    <string name="onboarding_done_primary">تم</string>
+    <string name="onboarding_done_secondary">استكشاف الإعداد</string>
+    <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
+    <string name="onboarding_help_cd">الجولة المصحوبة بمرشدين</string>
+    <string name="onboarding_reset_toast">إعادة تعيين أونبوارديند- إعادة تشغيل الدليل</string>
+    <string name="onboarding_expert_chapter_label">Chapter %1$d of %2$d</string>
+    <string name="onboarding_expert_finish">إنهاء</string>
+    <string name="onboarding_expert_menu_title">الجولة المصحوبة بمرشدين</string>
+    <string name="onboarding_expert_menu_body">المشي السريع خلال الإعداد الأعمق - الملف الشخصي لمركبتك، التكامل، المراقبة، التشخيص، الخدمات والأمن. يمكنك التوقف في أي وقت.</string>
+    <string name="onboarding_expert_menu_start">بدء الجولة</string>
+    <string name="onboarding_expert_vehicle_title">الملف الشخصي للسيارة</string>
+    <string name="onboarding_expert_vehicle_body">اضغط على مربع المدرعات لتعيين حجم البطارية ونموذجك - فهي تعمل على تمكين المدى الدقيق والتقديرات الصحية.</string>
+    <string name="onboarding_expert_recordings_title">التسجيلات الخاصة بك</string>
+    <string name="onboarding_expert_recordings_body">التبديل بين Dashcam (تابع+ القفزات القريبة ) و المراقبة (أحداث الحراسة الموقوفة) مع هذا التبديل - كل منها يحتفظ بمكتبته الخاصة. اضغط على مقطع للعب</string>
+    <string name="onboarding_expert_live_title">كاميرات حية</string>
+    <string name="onboarding_expert_live_body">افتح مباشرة من هنا لمشاهدة جميع الكاميرات في الوقت الحقيقي. سهلا للتحقق من العرض قبل محرك الأقراص أو أثناء وقوفه بالقرب منه.</string>
+    <string name="onboarding_expert_trips_title">سجل الرحلة</string>
+    <string name="onboarding_expert_trips_body">وتسجل الرحلات كل محرك - الطريق والمسافة والمدة واستخدام الطاقة - حتى تتمكن من مراجعة مكان السيارة.</string>
+    <string name="onboarding_expert_roadsense_title">حساس الطرق</string>
+    <string name="onboarding_expert_roadsense_body">ويستخدم جهاز استشعار الطرق أجهزة استشعار حركة السيارة والنظام العالمي لتحديد المواقع للكشف عن مخاطر الطرق - النوافذ والحدائق وكوابح السرعة - ويحذركم من قبل من المخاطر المعروفة. وتغطي علامات التبويب الكشف والخريطة الخطرة ومداخن التحذير وقعة المكفوفين. قم بتشغيل المفتاح الرئيسي لاستخدام أي منها.</string>
+    <string name="onboarding_expert_blindspot_title">بقعة مكفوفة</string>
+    <string name="onboarding_expert_blindspot_body">تمكين بقعة المكفوفين في علامة التبويب هنا، وعندما تشير إلى دورة، ويظهر عرض الكاميرا الجانبية تلقائيا على الشاشة - يساراً للإشارة اليسرى واليسرى لليمين - ثم يخفي بعد ذلك بفترة وجيزة. يتم تشغيله فقط أثناء تشغيل إشارة التشغيل.</string>
+    <string name="onboarding_expert_maps_title">Navigation</string>
+    <string name="onboarding_expert_maps_body">افتح الخريطة للتنقل الكامل بالمنعطف - البحث عن الوجهة، الحصول على المسار والتوجيه المباشر، بالإضافة إلى نقاط الاهتمام القريبة وأية مخاطر على الطرق قد سجلت على طول الطريق. يمكنك أيضًا أن تضعه تلقائيًا في مجموعة الأدوات عندما تبدأ القيادة - ذلك التبديل يعيش في علامة تبويب خريطة الطريق.</string>
+    <string name="onboarding_expert_integrations_title">التكاملات</string>
+    <string name="onboarding_expert_integrations_body">قم بتوصيل تنبيهات تيليجرام، مخطط مسار أفضل، MQTT أو سحابة BYD. تفتح كل بطاقة إعدادها داخل التطبيق. تتحول الحبوب العلوية إلى اللون الأخضر عند ارتباط كل شيء.</string>
+    <string name="onboarding_expert_bydcloud_title">BYD السحابي يفتح وحدة التحكم عن بعد</string>
+    <string name="onboarding_expert_bydcloud_body">ربط حساب BYD الخاص بك هنا يمكن قفل عن بعد و فلاش و قرن من هاتفك. تعامل مع الحساب المرتبط و كود الوصول باعتبارهما حساسة.</string>
+    <string name="onboarding_expert_surveillance_title">المراقبة &amp; التسجيل</string>
+    <string name="onboarding_expert_surveillance_body">الضبط الدقيق للكشف والجودة والتخزين هنا. هذه الصفحات مفتوحة كصفحات تهيئة داخل التطبيق خدمت من سيارتك - شاشة فارغة فقط تعني أن المساعد لا يزال يبدأ.</string>
+    <string name="onboarding_expert_camprobe_title">اختبار الكاميرا - حذر</string>
+    <string name="onboarding_expert_camprobe_body">إعادة رسم الخرائط التي تقوم الكاميرا الفيزيائية بتغذية كل دور وإعادة تشغيل الكاميرات. قم بتغييره فقط إذا كانت الخلاصة تبدو خاطئة - قمت بإعداد هذا في وقت سابق في الدليل.</string>
+    <string name="onboarding_expert_traffic_title">مراقبة حركة المرور - مطلوب للوصول عن بعد</string>
+    <string name="onboarding_expert_traffic_body">مراقب المرور المدمج في BYD يمنع التطبيقات الأخرى من استخدام SIM. إذا كنت ترغب في الوصول إلى سيارتك عن بعد عبر شريحة BYD ، فيجب عليك تعطيلها هنا. إعادة تشغيل وحدة الرأس لتطبيق التغيير.</string>
+    <string name="onboarding_expert_daemons_title">الخدمات - التعامل مع الرعاية</string>
+    <string name="onboarding_expert_daemons_body">وتبدأ هذه المفاتيح خدمات الخلفية وتوقفها. إيقاف تشغيل الكاميرا أو المراقبة أو حراسة ACC يتوقف عن التسجيل ويبقيها متوقفة حتى تقوم بتشغيلها مرة أخرى - حتى بعد إعادة تشغيلها.</string>
+    <string name="onboarding_expert_security_title">قفل باستخدام رمز PIN</string>
+    <string name="onboarding_expert_security_body">تعيين رمز PIN لبوابة التطبيق للمركبات المشتركة. يستمر تشغيل المراقبة والتسجيل أثناء قفل التطبيق. لا يمكن إزالة رمز PIN المنسي إلا من جهاز كمبيوتر عبر USB.</string>
+    <string name="onboarding_expert_reset_title">إعادة تعيين البيانات - دائم</string>
+    <string name="onboarding_expert_reset_body">هذا يمحو التسجيلات والأحداث والإعدادات ولا يمكن التراجع عنها. إنه هنا إذا قمت ببيع السيارة - وليس جزءا من الاستخدام العادي.</string>
+    <string name="onboarding_expert_done_title">هذه هي الجولة</string>
+    <string name="onboarding_expert_done_body">لقد رأيت الإعدادات الأعمق. افتح هذا الدليل مرة أخرى في أي وقت من زر المساعدة.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">أغلق</string>
     <string name="language_picker_title">اللغة</string>
@@ -644,6 +745,7 @@
     <string name="rail_recordings">التسجيلات</string>
     <string name="rail_vehicle">السيارة</string>
     <string name="rail_trips">رحلات</string>
+    <string name="rail_charging">الشحن</string>
     <string name="rail_integrations">التكاملات</string>
     <string name="rail_diagnostics">التشخيص</string>
     <string name="rail_settings">الإعدادات</string>
