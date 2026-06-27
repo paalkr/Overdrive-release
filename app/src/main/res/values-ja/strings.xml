@@ -198,7 +198,7 @@
     <string name="onboarding_exit">ツアーを終了</string>
     <string name="onboarding_done_short">了解</string>
     <!-- Step 0: authorize the daemon (system ADB popup) -->
-    <string name="onboarding_authorize_title">オーバードライブ起動</string>
+    <string name="onboarding_authorize_title">Overdrive を起動</string>
     <string name="onboarding_authorize_body">Overdrive runs your cameras through a small on-device helper. Android will ask once to allow USB debugging — tap <b>Allow</b> and check <b>Always allow from this device</b> so it stays on after every restart.</string>
     <string name="onboarding_authorize_button">アクセスを許可</string>
     <string name="onboarding_authorize_waiting_title">Waiting for permission…</string>
@@ -218,7 +218,7 @@
     <string name="onboarding_camera_dashcam_title">今すぐ道路を見つける-先行カメラ</string>
     <string name="onboarding_camera_dashcam_body">カメラを矢印でステップし、フロントガラス/前方ビューを表示するものを停止します。 番号に注意してください — 次に選択します。</string>
     <string name="onboarding_camera_pick_title">360度カメラを選ぶ</string>
-    <string name="onboarding_camera_pick_body">一番上のカードで、360度/通常のカメラの番号を選択してください。わかりませんか？AUTOのままにして、オーバドライブで確認してください。</string>
+    <string name="onboarding_camera_pick_body">上部のカードで、360 / 通常カメラの番号を選択してください。わからない場合は AUTO のままにすれば、Overdrive が自動で判別します。</string>
     <string name="onboarding_camera_pick_primary">次へ</string>
     <string name="onboarding_camera_pick_dash_title">ダッシュカムカメラを選択</string>
     <string name="onboarding_camera_pick_dash_body">このカードでは、以前に見つけたダッシュカム番号を選択するか、AUTOに残してください。</string>
@@ -234,7 +234,7 @@
     <string name="onboarding_camera_windshield_primary">表示</string>
     <string name="onboarding_camera_windshield_skip">いいえ結構です</string>
     <!-- Vehicle profile chapter -->
-    <string name="onboarding_vehicle_title">オーバードライブに通知する</string>
+    <string name="onboarding_vehicle_title">Overdrive にバッテリー情報を設定</string>
     <string name="onboarding_vehicle_body">モデルを選んで、kWhを入力するか、自分で入力してください(15-120)。 これにより、範囲と充電の見積もりが正確になります。スキップして後で設定できます。</string>
     <string name="onboarding_vehicle_primary">バッテリーを設定</string>
     <!-- Dashboard orientation chapter -->
@@ -486,7 +486,7 @@
     <string name="toast_updated_to">%1$s に更新されました</string>
     <string name="toast_update_install_failed">更新インストール失敗: %1$s</string>
     <string name="toast_checking_for_updates">更新をチェックする</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">アプリの最新バージョン（%1$s）</string>
     <string name="toast_update_check_failed">更新チェック失敗: %1$s</string>
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">アップデートがあります</string>
@@ -681,7 +681,7 @@
     <string name="toast_batch_delete_partial">%1$dは削除され,%2$dは失敗</string>
     <string name="play_with_chooser">遊びなさい</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">%1$s に更新 — 自動起動を再確認し、BYDはインストールごとに消去します。</string>
     <string name="setup_overlay_already_granted">すでに 認め られ て いる</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">提示 &amp; トラブルシューティング</string>
@@ -777,7 +777,7 @@
     <string name="settings_backup_pick_file">復元するバックアップを選択してください</string>
     <string name="settings_backup_no_files">バックアップファイルが見つかりませんでした。最初にエクスポートするか、バックアップ .json を %1$sにコピーしてから、もう一度やり直してください。</string>
     <string name="settings_backup_read_failed">ファイルを読み込めませんでした</string>
-    <string name="settings_backup_invalid_file">そのファイルは有効なオーバードライブバックアップではありません</string>
+    <string name="settings_backup_invalid_file">このファイルは有効な Overdrive バックアップではありません</string>
     <string name="settings_backup_restoring">Restoring…</string>
     <string name="settings_backup_restored">設定を復元しました</string>
     <string name="settings_backup_restore_failed">復元に失敗しました</string>
