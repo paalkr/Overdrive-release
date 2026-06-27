@@ -2185,7 +2185,7 @@
     "connectivity_updates": "Aktualisierungen der Konnektivität",
     "connectivity_updates_desc": "Wenn der Dämon anfängt, aufhört oder wieder anfängt, informieren Sie ihn.",
     "motion_text": "Bewegungsteks-Warnungen",
-    "motion_text_desc": "Send a motion alert (text, plus the snapshot photo when one is available) when surveillance detects motion. Video clips have their own toggle below.",
+    "motion_text_desc": "Sende eine Bewegungsmeldung (Text, plus das Snapshot-Foto, wenn einer verfügbar ist), wenn die Überwachung Bewegung erkennt. Videoclips haben einen eigenen Schalter unten.",
     "daemon_title": "Daemon",
     "auto_start_acc_off": "Autostart, wenn das Fahrzeug aus ist",
     "auto_start_acc_off_desc": "Starten Sie den Telegram-Bot-Daemon automatisch, wenn das Fahrzeug auf ACC OFF geht, so dass die Befehle während des Parken funktionieren.",
