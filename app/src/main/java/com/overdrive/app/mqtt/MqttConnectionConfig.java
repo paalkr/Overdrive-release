@@ -35,13 +35,6 @@ public class MqttConnectionConfig {
     public int maxIntervalSeconds;       // Heartbeat ceiling: always publish at least this often
     public boolean changeOnly;           // If true, only publish when a backing value changed
 
-    // High-rate tier: dense publishing of the dynamic drivetrain signals flagged
-    // highRate in TelemetryFieldCatalog (power, motor rpm, torque). 0 = disabled
-    // (default — existing behaviour, those fields ride the slow report-by-exception
-    // path). When > 0, those keys are read + published every highRateMs, bypassing
-    // the min-interval floor and per-field deadband. Only honoured for HA connections.
-    public int highRateMs;
-
     // Home Assistant discovery
     public boolean homeAssistantDiscovery; // If true: device-bundle discovery + per-field retained topics
     public String discoveryPrefix;         // HA discovery prefix (default "homeassistant")
@@ -60,7 +53,6 @@ public class MqttConnectionConfig {
     private static final int DEFAULT_MIN_INTERVAL = 5;
     private static final int DEFAULT_MAX_INTERVAL = 300;
     private static final boolean DEFAULT_CHANGE_ONLY = true;
-    private static final int DEFAULT_HIGH_RATE_MS = 0; // disabled
     private static final boolean DEFAULT_HA_DISCOVERY = false;
     private static final String DEFAULT_DISCOVERY_PREFIX = "homeassistant";
     private static final boolean DEFAULT_ALLOW_CONTROL = false;
@@ -86,7 +78,6 @@ public class MqttConnectionConfig {
         this.minIntervalSeconds = DEFAULT_MIN_INTERVAL;
         this.maxIntervalSeconds = DEFAULT_MAX_INTERVAL;
         this.changeOnly = DEFAULT_CHANGE_ONLY;
-        this.highRateMs = DEFAULT_HIGH_RATE_MS;
         this.homeAssistantDiscovery = DEFAULT_HA_DISCOVERY;
         this.discoveryPrefix = DEFAULT_DISCOVERY_PREFIX;
         this.allowControl = DEFAULT_ALLOW_CONTROL;
@@ -100,15 +91,6 @@ public class MqttConnectionConfig {
     /** True when this connection should publish HA discovery + per-field retained topics. */
     public boolean isHomeAssistant() {
         return homeAssistantDiscovery;
-    }
-
-    /**
-     * True when the high-rate drivetrain tier is active for this connection: a
-     * positive cadence on an HA connection. (Per-field retained topics are an HA-mode
-     * concept, so high-rate only applies there.)
-     */
-    public boolean isHighRateEnabled() {
-        return highRateMs > 0 && homeAssistantDiscovery;
     }
 
     /**
@@ -210,7 +192,6 @@ public class MqttConnectionConfig {
             json.put("minIntervalSeconds", minIntervalSeconds);
             json.put("maxIntervalSeconds", maxIntervalSeconds);
             json.put("changeOnly", changeOnly);
-            json.put("highRateMs", highRateMs);
             json.put("homeAssistantDiscovery", homeAssistantDiscovery);
             json.put("discoveryPrefix", discoveryPrefix);
             json.put("allowControl", allowControl);
@@ -254,8 +235,6 @@ public class MqttConnectionConfig {
                 json.optInt("publishIntervalSeconds", DEFAULT_MIN_INTERVAL));
         config.maxIntervalSeconds = json.optInt("maxIntervalSeconds", DEFAULT_MAX_INTERVAL);
         config.changeOnly = json.optBoolean("changeOnly", DEFAULT_CHANGE_ONLY);
-        config.highRateMs = json.optInt("highRateMs", DEFAULT_HIGH_RATE_MS);
-        if (config.highRateMs < 0) config.highRateMs = 0;
         config.homeAssistantDiscovery = json.optBoolean("homeAssistantDiscovery", DEFAULT_HA_DISCOVERY);
         config.discoveryPrefix = json.optString("discoveryPrefix", DEFAULT_DISCOVERY_PREFIX);
         config.allowControl = json.optBoolean("allowControl", DEFAULT_ALLOW_CONTROL);
@@ -276,7 +255,6 @@ public class MqttConnectionConfig {
                 ", enabled=" + enabled +
                 ", interval=[" + minIntervalSeconds + "-" + maxIntervalSeconds + "]s" +
                 ", changeOnly=" + changeOnly +
-                ", highRateMs=" + highRateMs +
                 ", ha=" + homeAssistantDiscovery +
                 ", ssl=" + isSsl() +
                 ", trustAllCerts=" + trustAllCerts +

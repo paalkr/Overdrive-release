@@ -44,18 +44,9 @@ public final class TelemetryFieldCatalog {
         public final String icon;          // mdi:... or null
         public final boolean diagnostic;   // entity_category = diagnostic
         public final double precision;     // deadband step; <=0 means exact / type-based
-        /**
-         * High-rate tier: when true, this key is published on the dedicated fast
-         * cadence ({@link MqttConnectionConfig#highRateMs}), bypassing the global
-         * min-interval floor and the per-field deadband, so it lands densely in Home
-         * Assistant. Currently only signed {@code power} (regen = negative) — the one
-         * dynamic drivetrain signal that is actually readable at high rate on this car.
-         * Off for everything else, so the slow report-by-exception path is unchanged.
-         */
-        public final boolean highRate;
 
         Field(String key, String name, String component, String deviceClass, String stateClass,
-              String unit, String icon, boolean diagnostic, double precision, boolean highRate) {
+              String unit, String icon, boolean diagnostic, double precision) {
             this.key = key;
             this.name = name;
             this.component = component;
@@ -65,7 +56,6 @@ public final class TelemetryFieldCatalog {
             this.icon = icon;
             this.diagnostic = diagnostic;
             this.precision = precision;
-            this.highRate = highRate;
         }
 
         public boolean isBinary() { return BINARY.equals(component); }
@@ -76,14 +66,7 @@ public final class TelemetryFieldCatalog {
 
     private static void add(String key, String name, String component, String deviceClass,
                             String stateClass, String unit, String icon, boolean diag, double precision) {
-        add(key, name, component, deviceClass, stateClass, unit, icon, diag, precision, false);
-    }
-
-    private static void add(String key, String name, String component, String deviceClass,
-                            String stateClass, String unit, String icon, boolean diag,
-                            double precision, boolean highRate) {
-        FIELDS.put(key, new Field(key, name, component, deviceClass, stateClass, unit, icon,
-                diag, precision, highRate));
+        FIELDS.put(key, new Field(key, name, component, deviceClass, stateClass, unit, icon, diag, precision));
     }
 
     static {
@@ -92,7 +75,7 @@ public final class TelemetryFieldCatalog {
 
         // ---------- Core driving / energy ----------
         add("soc",        "State of Charge", SENSOR, "battery",     MEAS, "%",    "mdi:battery",            false, 0.1);
-        add("power",      "Power",           SENSOR, "power",       MEAS, "kW",   "mdi:flash",              false, 0.1, true);
+        add("power",      "Power",           SENSOR, "power",       MEAS, "kW",   "mdi:flash",              false, 0.1);
         add("speed",      "Speed",           SENSOR, "speed",       MEAS, "km/h", "mdi:speedometer",        false, 0.1);
         add("lat",        "Latitude",        SENSOR, null,          MEAS, "°",    "mdi:latitude",           true,  0.00001);
         add("lon",        "Longitude",       SENSOR, null,          MEAS, "°",    "mdi:longitude",          true,  0.00001);
@@ -164,11 +147,6 @@ public final class TelemetryFieldCatalog {
         add("batt_12v_level",  "12V Level (body)",  SENSOR, "enum",    null, null,"mdi:car-battery", true,  0);
 
         // ---------- Drivetrain ----------
-        // Motor rpm / torque are NOT high-rate: on this car the BYD HAL returns sentinels
-        // for every callGet motor-speed id (OverDrive's and the real per-car ids), parked
-        // and driving, across every device. The only working source is the BYD
-        // event-subscription channel (separate effort). They stay on the normal slow path
-        // so they still surface if/when that listener ever delivers them.
         add("motor_front_rpm",   "Front Motor RPM",  SENSOR, null, MEAS, "rpm", "mdi:engine",        true, 1);
         add("motor_rear_rpm",    "Rear Motor RPM",   SENSOR, null, MEAS, "rpm", "mdi:engine",        true, 1);
         add("motor_front_torque","Front Motor Torque",SENSOR,null, MEAS, "Nm",  "mdi:engine",        true, 1);
@@ -257,32 +235,13 @@ public final class TelemetryFieldCatalog {
     public static Field get(String key) {
         Field f = FIELDS.get(key);
         if (f != null) return f;
-        return new Field(key, prettify(key), SENSOR, null, null, null, null, true, 0, false);
+        return new Field(key, prettify(key), SENSOR, null, null, null, null, true, 0);
     }
 
     /** Deadband step for change detection; <=0 means type-based / exact. */
     public static double precisionFor(String key) {
         Field f = FIELDS.get(key);
         return f != null ? f.precision : 0;
-    }
-
-    /**
-     * True if this key belongs to the high-rate tier (dynamic drivetrain signals).
-     * The fast publish path uses this to select its subset; unknown keys are never
-     * high-rate, so the slow path keeps owning everything else.
-     */
-    public static boolean isHighRate(String key) {
-        Field f = FIELDS.get(key);
-        return f != null && f.highRate;
-    }
-
-    /** All registered high-rate keys (discovery seeding for the fast tier). */
-    public static Set<String> highRateKeys() {
-        Set<String> keys = new HashSet<>();
-        for (Field f : FIELDS.values()) {
-            if (f.highRate) keys.add(f.key);
-        }
-        return Collections.unmodifiableSet(keys);
     }
 
     /** True if this key should produce a read-only HA sensor (registered, mappable, non-time). */
