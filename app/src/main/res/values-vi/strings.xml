@@ -190,104 +190,104 @@
     <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
          protected brand name — keep it verbatim. -->
     <!-- Shared button labels -->
-    <string name="onboarding_next">Next</string>
-    <string name="onboarding_back">Back</string>
-    <string name="onboarding_skip">Skip</string>
-    <string name="onboarding_later">Do this later</string>
-    <string name="onboarding_dismiss">Dismiss</string>
-    <string name="onboarding_exit">Exit tour</string>
-    <string name="onboarding_done_short">Got it</string>
+    <string name="onboarding_next">Tiếp</string>
+    <string name="onboarding_back">Quay lại</string>
+    <string name="onboarding_skip">Bỏ qua</string>
+    <string name="onboarding_later">Để sau</string>
+    <string name="onboarding_dismiss">Đóng</string>
+    <string name="onboarding_exit">Thoát hướng dẫn</string>
+    <string name="onboarding_done_short">Đã hiểu</string>
     <!-- Step 0: authorize the daemon (system ADB popup) -->
-    <string name="onboarding_authorize_title">Wake up Overdrive</string>
-    <string name="onboarding_authorize_body">Overdrive runs your cameras through a small on-device helper. Android will ask once to allow USB debugging — tap <b>Allow</b> and check <b>Always allow from this device</b> so it stays on after every restart.</string>
-    <string name="onboarding_authorize_button">Allow access</string>
-    <string name="onboarding_authorize_waiting_title">Waiting for permission…</string>
-    <string name="onboarding_authorize_waiting_body">Accept the Android popup. If you don\'t see it, it may already be granted — this will continue on its own.</string>
-    <string name="onboarding_authorize_retry_title">Still not connected</string>
-    <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
-    <string name="onboarding_authorize_retry_button">Try again</string>
+    <string name="onboarding_authorize_title">Đánh thức Overdrive</string>
+    <string name="onboarding_authorize_body">Overdrive vận hành camera của bạn qua một trợ lý nhỏ trên thiết bị. Android sẽ hỏi một lần để cho phép gỡ lỗi USB — hãy nhấn <b>Cho phép</b> và đánh dấu <b>Luôn cho phép từ thiết bị này</b> để nó vẫn bật sau mỗi lần khởi động lại.</string>
+    <string name="onboarding_authorize_button">Cho phép truy cập</string>
+    <string name="onboarding_authorize_waiting_title">Đang chờ cấp quyền…</string>
+    <string name="onboarding_authorize_waiting_body">Hãy chấp nhận cửa sổ bật lên của Android. Nếu bạn không thấy nó, có thể quyền đã được cấp — quá trình này sẽ tự tiếp tục.</string>
+    <string name="onboarding_authorize_retry_title">Vẫn chưa kết nối</string>
+    <string name="onboarding_authorize_retry_body">Trợ lý chưa chạy. Quyền của Android có thể đã bị đóng. Hãy thử lại và nhớ đánh dấu <b>Luôn cho phép</b>.</string>
+    <string name="onboarding_authorize_retry_button">Thử lại</string>
     <!-- Camera mapping chapter -->
-    <string name="onboarding_camera_step_label">Camera · step %1$d of %2$d</string>
-    <string name="onboarding_camera_intro_title">Set up your cameras</string>
-    <string name="onboarding_camera_intro_body">Let\'s tell Overdrive which camera is your 360 view and which is your dashcam. It takes about a minute, and you can change it later.</string>
-    <string name="onboarding_camera_intro_primary">Start</string>
-    <string name="onboarding_camera_opening_title">Opening camera setup…</string>
-    <string name="onboarding_camera_opening_body">Loading a live preview from your cameras. This can take a few seconds.</string>
-    <string name="onboarding_camera_pano_title">This is your 360 view</string>
-    <string name="onboarding_camera_pano_body">Use the arrows to find the stitched 4-up image. Read it from the BOTTOM: bottom-left is the REAR, bottom-right is the LEFT side.</string>
-    <string name="onboarding_camera_dashcam_title">Now find the road-ahead camera</string>
-    <string name="onboarding_camera_dashcam_body">Step through the cameras with the arrows and stop on the one showing the windshield / forward view. Note its number — you\'ll pick it next.</string>
-    <string name="onboarding_camera_pick_title">Pick your 360 camera</string>
-    <string name="onboarding_camera_pick_body">In the top card, choose the number for your 360 / normal camera. Not sure? Leave it on AUTO and Overdrive figures it out.</string>
-    <string name="onboarding_camera_pick_primary">Next</string>
-    <string name="onboarding_camera_pick_dash_title">Pick your dashcam camera</string>
-    <string name="onboarding_camera_pick_dash_body">In this card, choose the dashcam number you found earlier — or leave it on AUTO.</string>
-    <string name="onboarding_camera_save_primary">Save &amp; restart</string>
-    <string name="onboarding_camera_applying_title">Applying — restarting cameras</string>
-    <string name="onboarding_camera_applying_body">The feed will go dark and blink for about 10 seconds. This is normal — hang tight.</string>
-    <string name="onboarding_camera_verify_title">Quick check</string>
-    <string name="onboarding_camera_verify_body">Does the 360 view show the stitched image and the dashcam show the road ahead? If a feed looks wrong, tap Re-pick — nothing is broken.</string>
-    <string name="onboarding_camera_verify_ok">Looks right</string>
-    <string name="onboarding_camera_verify_repick">Re-pick</string>
-    <string name="onboarding_camera_windshield_title">Road-ahead band on recordings? (optional)</string>
-    <string name="onboarding_camera_windshield_body">For the OEM dashcam layout — the windshield camera as a strip on top of your recording — pick Windshield in the role menu, choose the forward camera, and Save. Most owners can skip this.</string>
-    <string name="onboarding_camera_windshield_primary">Show me</string>
-    <string name="onboarding_camera_windshield_skip">No thanks</string>
+    <string name="onboarding_camera_step_label">Camera · bước %1$d trên %2$d</string>
+    <string name="onboarding_camera_intro_title">Thiết lập camera của bạn</string>
+    <string name="onboarding_camera_intro_body">Hãy cho Overdrive biết camera nào là góc nhìn 360 và camera nào là dashcam. Việc này mất khoảng một phút và bạn có thể thay đổi sau.</string>
+    <string name="onboarding_camera_intro_primary">Bắt đầu</string>
+    <string name="onboarding_camera_opening_title">Đang mở thiết lập camera…</string>
+    <string name="onboarding_camera_opening_body">Đang tải bản xem trực tiếp từ camera của bạn. Việc này có thể mất vài giây.</string>
+    <string name="onboarding_camera_pano_title">Đây là góc nhìn 360 của bạn</string>
+    <string name="onboarding_camera_pano_body">Dùng các mũi tên để tìm hình ghép 4 khung. Đọc từ phía DƯỚI: dưới-trái là PHÍA SAU, dưới-phải là phía BÊN TRÁI.</string>
+    <string name="onboarding_camera_dashcam_title">Bây giờ tìm camera nhìn ra đường</string>
+    <string name="onboarding_camera_dashcam_body">Lướt qua các camera bằng mũi tên và dừng lại ở camera hiển thị kính chắn gió / góc nhìn phía trước. Ghi nhớ số của nó — bạn sẽ chọn nó ở bước tiếp theo.</string>
+    <string name="onboarding_camera_pick_title">Chọn camera 360 của bạn</string>
+    <string name="onboarding_camera_pick_body">Trong thẻ trên cùng, chọn số cho camera 360 / camera thường của bạn. Không chắc? Để ở chế độ AUTO và Overdrive sẽ tự xác định.</string>
+    <string name="onboarding_camera_pick_primary">Tiếp</string>
+    <string name="onboarding_camera_pick_dash_title">Chọn camera dashcam của bạn</string>
+    <string name="onboarding_camera_pick_dash_body">Trong thẻ này, chọn số dashcam bạn đã tìm thấy trước đó — hoặc để ở chế độ AUTO.</string>
+    <string name="onboarding_camera_save_primary">Lưu &amp;amp; khởi động lại</string>
+    <string name="onboarding_camera_applying_title">Đang áp dụng — khởi động lại camera</string>
+    <string name="onboarding_camera_applying_body">Khung hình sẽ tối đi và nhấp nháy khoảng 10 giây. Điều này là bình thường — hãy đợi một chút.</string>
+    <string name="onboarding_camera_verify_title">Kiểm tra nhanh</string>
+    <string name="onboarding_camera_verify_body">Góc nhìn 360 có hiển thị hình ghép và dashcam có hiển thị đường phía trước không? Nếu một khung hình trông sai, hãy nhấn Chọn lại — không có gì hỏng cả.</string>
+    <string name="onboarding_camera_verify_ok">Trông đúng rồi</string>
+    <string name="onboarding_camera_verify_repick">Chọn lại</string>
+    <string name="onboarding_camera_windshield_title">Dải đường phía trước trên bản ghi? (tùy chọn)</string>
+    <string name="onboarding_camera_windshield_body">Đối với bố cục dashcam OEM — camera kính chắn gió dạng dải nằm trên đầu bản ghi của bạn — chọn Kính chắn gió trong menu vai trò, chọn camera phía trước, và Lưu. Hầu hết chủ xe có thể bỏ qua bước này.</string>
+    <string name="onboarding_camera_windshield_primary">Cho tôi xem</string>
+    <string name="onboarding_camera_windshield_skip">Không, cảm ơn</string>
     <!-- Vehicle profile chapter -->
-    <string name="onboarding_vehicle_title">Tell Overdrive your battery</string>
-    <string name="onboarding_vehicle_body">Pick your model and we fill in the kWh, or type it yourself (15–120). This makes range and charging estimates accurate. You can skip and set it later.</string>
-    <string name="onboarding_vehicle_primary">Set battery</string>
+    <string name="onboarding_vehicle_title">Cho Overdrive biết pin của bạn</string>
+    <string name="onboarding_vehicle_body">Chọn model của bạn và chúng tôi sẽ điền kWh, hoặc tự nhập (15–120). Điều này giúp ước tính quãng đường và sạc chính xác. Bạn có thể bỏ qua và đặt sau.</string>
+    <string name="onboarding_vehicle_primary">Đặt dung lượng pin</string>
     <!-- Dashboard orientation chapter -->
-    <string name="onboarding_dash_tiles_title">Your cockpit at a glance</string>
-    <string name="onboarding_dash_tiles_body">These cards are buttons — tap to open Live cameras, Recordings, Services or your Vehicle.</string>
-    <string name="onboarding_dash_chips_title">These just show status</string>
-    <string name="onboarding_dash_chips_body">The chips up top show recording, services and your remote link. They update on their own — they\'re not buttons.</string>
-    <string name="onboarding_dash_chips_body_land">Your live status — recording, services and remote link — shows up here. It updates on its own.</string>
+    <string name="onboarding_dash_tiles_title">Tổng quan buồng lái của bạn</string>
+    <string name="onboarding_dash_tiles_body">Các thẻ này là nút bấm — nhấn để mở Camera trực tiếp, Bản ghi, Dịch vụ hoặc Xe của bạn.</string>
+    <string name="onboarding_dash_chips_title">Những thứ này chỉ hiển thị trạng thái</string>
+    <string name="onboarding_dash_chips_body">Các chip ở trên cùng hiển thị việc ghi hình, dịch vụ và liên kết từ xa của bạn. Chúng tự cập nhật — chúng không phải là nút bấm.</string>
+    <string name="onboarding_dash_chips_body_land">Trạng thái trực tiếp của bạn — ghi hình, dịch vụ và liên kết từ xa — hiển thị ở đây. Nó tự cập nhật.</string>
     <!-- Completion -->
-    <string name="onboarding_done_title">Cockpit ready</string>
-    <string name="onboarding_done_body">Cameras mapped and battery set. Tap Live to watch your feeds — or explore the deeper settings any time.</string>
-    <string name="onboarding_done_primary">Done</string>
-    <string name="onboarding_done_secondary">Explore Setup</string>
+    <string name="onboarding_done_title">Buồng lái đã sẵn sàng</string>
+    <string name="onboarding_done_body">Camera đã được ánh xạ và pin đã được đặt. Nhấn Trực tiếp để xem các khung hình của bạn — hoặc khám phá các cài đặt sâu hơn bất cứ lúc nào.</string>
+    <string name="onboarding_done_primary">Xong</string>
+    <string name="onboarding_done_secondary">Khám phá thiết lập</string>
     <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
-    <string name="onboarding_help_cd">Guided tour</string>
-    <string name="onboarding_reset_toast">Onboarding reset — replaying the guide</string>
-    <string name="onboarding_expert_chapter_label">Chapter %1$d of %2$d</string>
-    <string name="onboarding_expert_finish">Finish</string>
-    <string name="onboarding_expert_menu_title">Guided tour</string>
-    <string name="onboarding_expert_menu_body">A quick walk through the deeper setup — your vehicle profile, integrations, surveillance, diagnostics, services and security. You can stop any time.</string>
-    <string name="onboarding_expert_menu_start">Start tour</string>
-    <string name="onboarding_expert_vehicle_title">Vehicle profile</string>
-    <string name="onboarding_expert_vehicle_body">Tap the Vehicle tile to set your battery size and model — it powers accurate range and health estimates.</string>
-    <string name="onboarding_expert_recordings_title">Your recordings</string>
-    <string name="onboarding_expert_recordings_body">Switch between Dashcam (continuous + proximity clips) and Surveillance (parked sentry events) with this toggle — each keeps its own library. Tap a clip to play it.</string>
-    <string name="onboarding_expert_live_title">Live cameras</string>
-    <string name="onboarding_expert_live_body">Open Live from here to watch all cameras in real time. Handy for checking the view before a drive or while parked nearby.</string>
-    <string name="onboarding_expert_trips_title">Trip history</string>
-    <string name="onboarding_expert_trips_body">Trips logs every drive — route, distance, duration and energy use — so you can review where the car has been.</string>
+    <string name="onboarding_help_cd">Hướng dẫn có dẫn dắt</string>
+    <string name="onboarding_reset_toast">Đã đặt lại onboarding — đang phát lại hướng dẫn</string>
+    <string name="onboarding_expert_chapter_label">Chương %1$d trên %2$d</string>
+    <string name="onboarding_expert_finish">Hoàn tất</string>
+    <string name="onboarding_expert_menu_title">Hướng dẫn có dẫn dắt</string>
+    <string name="onboarding_expert_menu_body">Một lượt đi nhanh qua phần thiết lập sâu hơn — hồ sơ xe, tích hợp, giám sát, chẩn đoán, dịch vụ và bảo mật. Bạn có thể dừng bất cứ lúc nào.</string>
+    <string name="onboarding_expert_menu_start">Bắt đầu hướng dẫn</string>
+    <string name="onboarding_expert_vehicle_title">Hồ sơ xe</string>
+    <string name="onboarding_expert_vehicle_body">Nhấn vào thẻ Xe để đặt dung lượng pin và model của bạn — nó hỗ trợ ước tính quãng đường và sức khỏe pin chính xác.</string>
+    <string name="onboarding_expert_recordings_title">Bản ghi của bạn</string>
+    <string name="onboarding_expert_recordings_body">Chuyển giữa Dashcam (clip liên tục + clip tiếp cận) và Giám sát (sự kiện canh gác khi đỗ) bằng công tắc này — mỗi loại có thư viện riêng. Nhấn vào một clip để phát.</string>
+    <string name="onboarding_expert_live_title">Camera trực tiếp</string>
+    <string name="onboarding_expert_live_body">Mở Trực tiếp từ đây để xem tất cả camera theo thời gian thực. Tiện lợi để kiểm tra góc nhìn trước khi lái hoặc khi đỗ xe gần đó.</string>
+    <string name="onboarding_expert_trips_title">Lịch sử hành trình</string>
+    <string name="onboarding_expert_trips_body">Hành trình ghi lại mọi lần lái — lộ trình, quãng đường, thời lượng và mức tiêu thụ năng lượng — để bạn có thể xem lại xe đã đi đâu.</string>
     <string name="onboarding_expert_roadsense_title">RoadSense</string>
-    <string name="onboarding_expert_roadsense_body">RoadSense uses the car\'s motion sensors and GPS to detect road hazards — bumps, potholes, speed breakers — and warns you before known ones. Its tabs cover detection, the hazard map, warning chimes, and Blind Spot. Turn on the master switch to use any of it.</string>
-    <string name="onboarding_expert_blindspot_title">Blind Spot</string>
-    <string name="onboarding_expert_blindspot_body">Enable Blind Spot in the tab here and, when you signal a turn, a side-camera view appears on screen automatically — left for a left signal, right for a right one — then hides shortly after. It only runs while a turn signal is on.</string>
-    <string name="onboarding_expert_maps_title">Navigation</string>
-    <string name="onboarding_expert_maps_body">Open the Map for full turn-by-turn navigation — search a destination, get routing and live guidance, plus nearby points of interest and any road hazards RoadSense has logged along the way. You can also auto-project it onto the instrument cluster when you start driving — that toggle lives in RoadSense\'s Map tab.</string>
-    <string name="onboarding_expert_integrations_title">Integrations</string>
-    <string name="onboarding_expert_integrations_body">Connect Telegram alerts, A Better Routeplanner, MQTT or BYD Cloud. Each card opens its setup inside the app. The pill up top turns green when everything\'s linked.</string>
-    <string name="onboarding_expert_bydcloud_title">BYD Cloud unlocks remote control</string>
-    <string name="onboarding_expert_bydcloud_body">Linking your BYD account here enables remote lock, flash and horn from your phone. Treat the linked account and access code as sensitive.</string>
-    <string name="onboarding_expert_surveillance_title">Surveillance &amp; recording</string>
-    <string name="onboarding_expert_surveillance_body">Fine-tune detection, quality and storage here. These open as in-app config pages served from your car — a blank screen just means the helper is still starting.</string>
-    <string name="onboarding_expert_camprobe_title">Camera probe — careful</string>
-    <string name="onboarding_expert_camprobe_body">This re-maps which physical camera feeds each role and restarts the cameras. Only change it if a feed looks wrong — you set this up earlier in the guide.</string>
-    <string name="onboarding_expert_traffic_title">Traffic monitor — required for remote access</string>
-    <string name="onboarding_expert_traffic_body">BYD\'s built-in Traffic Monitor blocks other apps from using the car\'s built-in SIM. If you want to reach your car remotely over the BYD SIM, you must disable it here. The head unit reboots to apply the change.</string>
-    <string name="onboarding_expert_daemons_title">Services — handle with care</string>
-    <string name="onboarding_expert_daemons_body">These switches start and stop background services. Turning OFF Camera, Surveillance or ACC Sentry stops recording and keeps them off until you turn them back on — even after a restart.</string>
-    <string name="onboarding_expert_security_title">Lock with a PIN</string>
-    <string name="onboarding_expert_security_body">Set a PIN to gate the app for shared vehicles. Surveillance and recording keep running while the app is locked. A forgotten PIN can only be cleared from a computer over USB.</string>
-    <string name="onboarding_expert_reset_title">Reset data — permanent</string>
-    <string name="onboarding_expert_reset_body">This erases recordings, events and settings and can\'t be undone. It\'s here if you ever sell the car — not part of normal use.</string>
-    <string name="onboarding_expert_done_title">That\'s the tour</string>
-    <string name="onboarding_expert_done_body">You\'ve seen the deeper settings. Open this guide again any time from the help button.</string>
+    <string name="onboarding_expert_roadsense_body">RoadSense sử dụng cảm biến chuyển động và GPS của xe để phát hiện các mối nguy trên đường — gờ giảm tốc, ổ gà, gờ chống tốc độ — và cảnh báo bạn trước những mối nguy đã biết. Các tab của nó bao gồm phát hiện, bản đồ mối nguy, chuông cảnh báo và Điểm mù. Bật công tắc chính để sử dụng bất kỳ tính năng nào.</string>
+    <string name="onboarding_expert_blindspot_title">Điểm mù</string>
+    <string name="onboarding_expert_blindspot_body">Bật Điểm mù trong tab tại đây và, khi bạn xi-nhan rẽ, khung hình camera bên hông sẽ tự động xuất hiện trên màn hình — bên trái khi xi-nhan trái, bên phải khi xi-nhan phải — rồi ẩn đi ngay sau đó. Nó chỉ chạy khi đèn xi-nhan đang bật.</string>
+    <string name="onboarding_expert_maps_title">Điều hướng</string>
+    <string name="onboarding_expert_maps_body">Mở Bản đồ để có chỉ đường từng chặng đầy đủ — tìm điểm đến, nhận định tuyến và dẫn đường trực tiếp, cùng các điểm tham quan lân cận và bất kỳ mối nguy trên đường nào mà RoadSense đã ghi lại dọc đường. Bạn cũng có thể tự động chiếu nó lên cụm đồng hồ khi bắt đầu lái — công tắc đó nằm trong tab Bản đồ của RoadSense.</string>
+    <string name="onboarding_expert_integrations_title">Tích hợp</string>
+    <string name="onboarding_expert_integrations_body">Kết nối cảnh báo Telegram, A Better Routeplanner, MQTT hoặc BYD Cloud. Mỗi thẻ mở phần thiết lập của nó bên trong ứng dụng. Viên thuốc ở trên cùng chuyển sang màu xanh lá khi mọi thứ đã được liên kết.</string>
+    <string name="onboarding_expert_bydcloud_title">BYD Cloud mở khóa điều khiển từ xa</string>
+    <string name="onboarding_expert_bydcloud_body">Liên kết tài khoản BYD của bạn tại đây để bật khóa, nháy đèn và còi từ xa qua điện thoại. Hãy coi tài khoản đã liên kết và mã truy cập là thông tin nhạy cảm.</string>
+    <string name="onboarding_expert_surveillance_title">Giám sát &amp;amp; ghi hình</string>
+    <string name="onboarding_expert_surveillance_body">Tinh chỉnh phát hiện, chất lượng và bộ nhớ tại đây. Những mục này mở dưới dạng trang cấu hình trong ứng dụng được phục vụ từ xe của bạn — màn hình trống chỉ có nghĩa là trợ lý vẫn đang khởi động.</string>
+    <string name="onboarding_expert_camprobe_title">Dò camera — cẩn thận</string>
+    <string name="onboarding_expert_camprobe_body">Mục này ánh xạ lại camera vật lý nào cấp khung hình cho mỗi vai trò và khởi động lại camera. Chỉ thay đổi nếu một khung hình trông sai — bạn đã thiết lập điều này trước đó trong hướng dẫn.</string>
+    <string name="onboarding_expert_traffic_title">Giám sát giao thông — cần thiết cho truy cập từ xa</string>
+    <string name="onboarding_expert_traffic_body">Trình giám sát giao thông tích hợp sẵn của BYD chặn các ứng dụng khác sử dụng SIM tích hợp sẵn của xe. Nếu bạn muốn truy cập xe từ xa qua SIM BYD, bạn phải tắt nó tại đây. Head-unit sẽ khởi động lại để áp dụng thay đổi.</string>
+    <string name="onboarding_expert_daemons_title">Dịch vụ — xử lý cẩn thận</string>
+    <string name="onboarding_expert_daemons_body">Các công tắc này khởi động và dừng các dịch vụ nền. Tắt Camera, Giám sát hoặc ACC Sentry sẽ dừng ghi hình và giữ chúng tắt cho đến khi bạn bật lại — kể cả sau khi khởi động lại.</string>
+    <string name="onboarding_expert_security_title">Khóa bằng mã PIN</string>
+    <string name="onboarding_expert_security_body">Đặt mã PIN để khóa ứng dụng đối với xe dùng chung. Giám sát và ghi hình vẫn tiếp tục chạy khi ứng dụng bị khóa. Mã PIN bị quên chỉ có thể được xóa từ máy tính qua USB.</string>
+    <string name="onboarding_expert_reset_title">Đặt lại dữ liệu — vĩnh viễn</string>
+    <string name="onboarding_expert_reset_body">Thao tác này xóa các bản ghi, sự kiện và cài đặt và không thể hoàn tác. Nó ở đây phòng khi bạn bán xe — không phải là một phần của việc sử dụng thông thường.</string>
+    <string name="onboarding_expert_done_title">Đó là toàn bộ hướng dẫn</string>
+    <string name="onboarding_expert_done_body">Bạn đã xem qua các cài đặt sâu hơn. Mở lại hướng dẫn này bất cứ lúc nào từ nút trợ giúp.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Đóng</string>
     <string name="language_picker_title">Ngôn ngữ</string>
@@ -363,11 +363,11 @@
     <string name="recording_lib_filter_section_severity">Độ nghiêm trọng</string>
     <string name="recording_lib_filter_section_type">Loại</string>
     <string name="recording_lib_filter_section_place">Địa điểm</string>
-    <string name="recording_lib_filter_section_storage">Storage</string>
+    <string name="recording_lib_filter_section_storage">Bộ nhớ</string>
     <!-- Storage filter chip labels (full words; the tile badge uses the short
          SD/USB/INT forms above). -->
-    <string name="recording_lib_storage_filter_internal">Internal</string>
-    <string name="recording_lib_storage_filter_sd">SD card</string>
+    <string name="recording_lib_storage_filter_internal">Bộ nhớ trong</string>
+    <string name="recording_lib_storage_filter_sd">Thẻ SD</string>
     <string name="recording_lib_storage_filter_usb">USB</string>
     <string name="recording_lib_place_search_hint">Search places…</string>
     <string name="recording_lib_chip_type_normal">Nhóm chứng chuẩn</string>
@@ -413,7 +413,7 @@
          silent SD→internal fallback (SD bridged behind the USB power rail). -->
     <string name="recording_lib_storage_sd">SD</string>
     <string name="recording_lib_storage_usb">USB</string>
-    <string name="recording_lib_storage_internal">INT</string>
+    <string name="recording_lib_storage_internal">TRONG</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
     <string name="toast_share_recordings">Sharing %1$d recordings</string>
     <!-- fragment_sentry_config -->
@@ -730,7 +730,7 @@
     <string name="rail_recordings">Bản ghi</string>
     <string name="rail_vehicle">Chiếc xe</string>
     <string name="rail_trips">Chuyến đi</string>
-    <string name="rail_charging">Charging</string>
+    <string name="rail_charging">Sạc</string>
     <string name="rail_integrations">Kết hợp</string>
     <string name="rail_diagnostics">Chẩn đoán</string>
     <string name="rail_settings">Cài đặt</string>
@@ -764,31 +764,31 @@
     <string name="settings_about_check_update_value">Kiểm tra bản phát hành GitHub mới nhất và cài đặt nếu mới hơn.</string>
     <!-- Backup & Restore (same-device). The backup file contains credentials +
          the device key, so the copy warns the user to keep it private. -->
-    <string name="settings_backup_export_title">Export settings</string>
-    <string name="settings_backup_export_value">Save a backup file of your current settings. Keep it private — it holds your credentials.</string>
-    <string name="settings_backup_import_title">Restore settings</string>
-    <string name="settings_backup_import_value">Load a backup file made on this same head unit.</string>
+    <string name="settings_backup_export_title">Xuất cài đặt</string>
+    <string name="settings_backup_export_value">Lưu tệp sao lưu cài đặt hiện tại của bạn. Hãy giữ kín — nó chứa thông tin đăng nhập của bạn.</string>
+    <string name="settings_backup_import_title">Khôi phục cài đặt</string>
+    <string name="settings_backup_import_value">Tải tệp sao lưu được tạo trên chính head-unit này.</string>
     <string name="settings_backup_default_filename">overdrive-backup.json</string>
-    <string name="settings_backup_exporting">Building backup…</string>
-    <string name="settings_backup_export_failed">Backup export failed</string>
-    <string name="settings_backup_saved">Backup saved</string>
-    <string name="settings_backup_saved_to">Backup saved to %1$s</string>
-    <string name="settings_backup_save_failed">Could not save the backup file</string>
-    <string name="settings_backup_pick_file">Pick a backup to restore</string>
-    <string name="settings_backup_no_files">No backup files found. Export one first, or copy a backup .json into %1$s, then try again.</string>
-    <string name="settings_backup_read_failed">Could not read the file</string>
-    <string name="settings_backup_invalid_file">That file is not a valid Overdrive backup</string>
-    <string name="settings_backup_restoring">Restoring…</string>
-    <string name="settings_backup_restored">Settings restored</string>
-    <string name="settings_backup_restore_failed">Restore failed</string>
-    <string name="settings_backup_daemon_down">The camera service must be running to back up or restore. Start it from Daemons, then try again.</string>
-    <string name="settings_backup_restore_confirm_title">Restore settings?</string>
-    <string name="settings_backup_restore_confirm_msg">This replaces your current Overdrive settings with the backup and reloads services. It only works on the same head unit the backup was made on.</string>
-    <string name="settings_backup_restore_confirm_btn">Restore</string>
-    <string name="settings_backup_restart_hint">Settings restored. Restart the camera daemon (Daemons → Camera → Restart) to make sure every restored setting is applied.</string>
-    <string name="settings_backup_trips_prompt">Include your trip history (distance, energy, cost, scores, start/end locations)? Detailed per-trip telemetry is not included. The file will contain your location history — keep it private.</string>
-    <string name="settings_backup_settings_only">Settings only</string>
-    <string name="settings_backup_with_trips">Include trips</string>
+    <string name="settings_backup_exporting">Đang tạo bản sao lưu…</string>
+    <string name="settings_backup_export_failed">Xuất bản sao lưu thất bại</string>
+    <string name="settings_backup_saved">Đã lưu bản sao lưu</string>
+    <string name="settings_backup_saved_to">Đã lưu bản sao lưu vào %1$s</string>
+    <string name="settings_backup_save_failed">Không thể lưu tệp sao lưu</string>
+    <string name="settings_backup_pick_file">Chọn bản sao lưu để khôi phục</string>
+    <string name="settings_backup_no_files">Không tìm thấy tệp sao lưu nào. Hãy xuất một tệp trước, hoặc sao chép một tệp .json sao lưu vào %1$s, rồi thử lại.</string>
+    <string name="settings_backup_read_failed">Không thể đọc tệp</string>
+    <string name="settings_backup_invalid_file">Tệp đó không phải bản sao lưu Overdrive hợp lệ</string>
+    <string name="settings_backup_restoring">Đang khôi phục…</string>
+    <string name="settings_backup_restored">Đã khôi phục cài đặt</string>
+    <string name="settings_backup_restore_failed">Khôi phục thất bại</string>
+    <string name="settings_backup_daemon_down">Dịch vụ camera phải đang chạy để sao lưu hoặc khôi phục. Hãy khởi động nó từ Daemon, rồi thử lại.</string>
+    <string name="settings_backup_restore_confirm_title">Khôi phục cài đặt?</string>
+    <string name="settings_backup_restore_confirm_msg">Thao tác này thay thế cài đặt Overdrive hiện tại của bạn bằng bản sao lưu và tải lại các dịch vụ. Nó chỉ hoạt động trên cùng head-unit nơi bản sao lưu được tạo.</string>
+    <string name="settings_backup_restore_confirm_btn">Khôi phục</string>
+    <string name="settings_backup_restart_hint">Đã khôi phục cài đặt. Khởi động lại daemon camera (Daemon → Camera → Khởi động lại) để đảm bảo mọi cài đặt được khôi phục đều được áp dụng.</string>
+    <string name="settings_backup_trips_prompt">Bao gồm lịch sử hành trình của bạn (quãng đường, năng lượng, chi phí, điểm số, vị trí bắt đầu/kết thúc)? Telemetry chi tiết theo từng hành trình không được bao gồm. Tệp sẽ chứa lịch sử vị trí của bạn — hãy giữ kín.</string>
+    <string name="settings_backup_settings_only">Chỉ cài đặt</string>
+    <string name="settings_backup_with_trips">Bao gồm hành trình</string>
     <!-- Support-development section: tiered options, low-cost first.
          star → spread → coffee, in that visual order. Copy aims for
          personality without being corny — short, warm, specific. -->
@@ -1202,9 +1202,9 @@
     <string name="roadsense_map_routing">Finding route…</string>
     <string name="roadsense_map_route_failed">Could not find a route. Try again.</string>
     <string name="roadsense_map_need_key">Add a routing key in RoadSense settings to navigate.</string>
-    <string name="roadsense_map_route_key_rejected">Routing key rejected. Check your key in RoadSense settings.</string>
-    <string name="roadsense_map_route_network">Network too slow to find a route. Check your connection and try again.</string>
-    <string name="roadsense_map_route_http">Routing service error (%1$d). Try again shortly.</string>
+    <string name="roadsense_map_route_key_rejected">Khóa định tuyến bị từ chối. Kiểm tra khóa của bạn trong cài đặt RoadSense.</string>
+    <string name="roadsense_map_route_network">Mạng quá chậm để tìm tuyến đường. Kiểm tra kết nối của bạn và thử lại.</string>
+    <string name="roadsense_map_route_http">Lỗi dịch vụ định tuyến (%1$d). Hãy thử lại trong giây lát.</string>
     <string name="roadsense_map_rerouting">Off route — recalculating…</string>
     <string name="roadsense_map_arrived">You have arrived.</string>
     <string name="roadsense_map_nav_started">Navigating to %1$s</string>
@@ -1299,12 +1299,12 @@
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
     <string name="roadsense_map_trip_restored">Chuyến đi đã khôi phục</string>
     <!-- Cloudflared paid-tunnel settings -->
-    <string name="cloudflared_token_storage_note">Token is stored encrypted and shared between the app and daemon processes.</string>
-    <string name="cloudflared_token_hint">Enter cloudflared token</string>
-    <string name="cloudflare_paid_version">Cloudflare Paid Version</string>
-    <string name="dialog_cloudflared_settings_title">Cloudflared Settings</string>
-    <string name="dialog_cloudflared_settings_message">Define whether you are using paid Cloudflare or trycloudflare. If you are using paid Cloudflare, enter your tunnel token.</string>
-    <string name="toast_cloudflared_token_cannot_be_empty">If you set the paid version the token cannot be empty</string>
-    <string name="toast_cloudflared_token_invalid">Invalid token: use only letters, numbers and . _ - = characters</string>
-    <string name="toast_cloudflared_saved_settings">Cloudflared settings saved</string>
+    <string name="cloudflared_token_storage_note">Token được lưu trữ ở dạng mã hóa và được chia sẻ giữa ứng dụng và tiến trình daemon.</string>
+    <string name="cloudflared_token_hint">Nhập token cloudflared</string>
+    <string name="cloudflare_paid_version">Phiên bản trả phí Cloudflare</string>
+    <string name="dialog_cloudflared_settings_title">Cài đặt Cloudflared</string>
+    <string name="dialog_cloudflared_settings_message">Xác định xem bạn đang dùng Cloudflare trả phí hay trycloudflare. Nếu bạn dùng Cloudflare trả phí, hãy nhập token đường hầm của bạn.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Nếu bạn đặt phiên bản trả phí thì token không được để trống</string>
+    <string name="toast_cloudflared_token_invalid">Token không hợp lệ: chỉ dùng chữ cái, chữ số và các ký tự . _ - =</string>
+    <string name="toast_cloudflared_saved_settings">Đã lưu cài đặt Cloudflared</string>
 </resources>
