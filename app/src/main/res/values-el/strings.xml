@@ -187,6 +187,107 @@
     <string name="setup_overlay_title">Να Επιτρέπεται Η Προβολή Σε Άλλες Εφαρμογές</string>
     <string name="setup_overlay_body">Ενεργοποιήστε αυτήν την επιλογή για την εμφάνιση μιας κυμαινόμενης ένδειξης κατάστασης για την καταγραφή και την παρακολούθηση διαδρομής πάνω από άλλες εφαρμογές.</string>
     <string name="setup_overlay_button">Άνοιγμα Ρυθμίσεων Επικάλυψης</string>
+    <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
+         protected brand name — keep it verbatim. -->
+    <!-- Shared button labels -->
+    <string name="onboarding_next">Επόμενο</string>
+    <string name="onboarding_back">Πίσω</string>
+    <string name="onboarding_skip">Παράλειψη</string>
+    <string name="onboarding_later">Κάντε αυτό αργότερα</string>
+    <string name="onboarding_dismiss">Απόρριψη</string>
+    <string name="onboarding_exit">Έξοδος περιοδείας</string>
+    <string name="onboarding_done_short">Το κατάλαβα</string>
+    <!-- Step 0: authorize the daemon (system ADB popup) -->
+    <string name="onboarding_authorize_title">Ξύπνημα Overdrive</string>
+    <string name="onboarding_authorize_body">Overdrive runs your cameras through a small on-device helper. Android will ask once to allow USB debugging — tap <b>Allow</b> and check <b>Always allow from this device</b> so it stays on after every restart.</string>
+    <string name="onboarding_authorize_button">Να επιτρέπεται η πρόσβαση</string>
+    <string name="onboarding_authorize_waiting_title">Waiting for permission…</string>
+    <string name="onboarding_authorize_waiting_body">Αποδοχή του αναδυόμενου παράθυρου Android. Αν δεν το δείτε, μπορεί ήδη να χορηγηθεί - αυτό θα συνεχιστεί από μόνο του.</string>
+    <string name="onboarding_authorize_retry_title">Ακόμα μη συνδεδεμένο</string>
+    <string name="onboarding_authorize_retry_body">Ο βοηθός δεν εκτελείται ακόμα. Η άδεια Android μπορεί να έχει απορριφθεί. Δοκιμάστε ξανά και θυμηθείτε να ελέγξετε <b>Να επιτρέπεται πάντα</b>.</string>
+    <string name="onboarding_authorize_retry_button">Προσπαθήστε ξανά</string>
+    <!-- Camera mapping chapter -->
+    <string name="onboarding_camera_step_label">Κάμερα · βήμα %1$d %2$d</string>
+    <string name="onboarding_camera_intro_title">Ορίστε τις κάμερες σας</string>
+    <string name="onboarding_camera_intro_body">Ας πούμε Overdrive ποια φωτογραφική μηχανή είναι η προβολή σας 360 και ποια είναι η dashcam. Χρειάζεται περίπου ένα λεπτό και μπορείτε να την αλλάξετε αργότερα.</string>
+    <string name="onboarding_camera_intro_primary">Έναρξη</string>
+    <string name="onboarding_camera_opening_title">Άνοιγμα ρύθμισης κάμερας…</string>
+    <string name="onboarding_camera_opening_body">Φόρτωση ζωντανής προεπισκόπησης από τις κάμερες. Αυτό μπορεί να διαρκέσει μερικά δευτερόλεπτα.</string>
+    <string name="onboarding_camera_pano_title">Αυτή είναι η 360 προβολή σας</string>
+    <string name="onboarding_camera_pano_body">Χρησιμοποιήστε τα βέλη για να βρείτε το ραμμένο 4-επάνω εικόνα. Διαβάστε το από το BOTTOM: κάτω αριστερά είναι το REAR, κάτω δεξιά είναι η αριστερή πλευρά.</string>
+    <string name="onboarding_camera_dashcam_title">Τώρα βρείτε την μπροστινή κάμερα</string>
+    <string name="onboarding_camera_dashcam_body">Βήμα μέσα από τις κάμερες με τα βέλη και να σταματήσει σε αυτό που δείχνει το παρμπρίζ / προς τα εμπρός προβολή. Σημειώστε τον αριθμό του - θα τον διαλέξετε στη συνέχεια.</string>
+    <string name="onboarding_camera_pick_title">Διαλέξτε 360 φωτογραφική μηχανή</string>
+    <string name="onboarding_camera_pick_body">Στην επάνω κάρτα, επιλέξτε τον αριθμό για 360 / κανονική κάμερα. Δεν είστε σίγουρος? Αφήστε τον σε ΑΥΤΟΜΑΤΗ και Overdrive αριθμούς έξω.</string>
+    <string name="onboarding_camera_pick_primary">Επόμενο</string>
+    <string name="onboarding_camera_pick_dash_title">Διαλέξτε κάμερα dashcam σας</string>
+    <string name="onboarding_camera_pick_dash_body">Σε αυτή την κάρτα, επιλέξτε τον αριθμό dashcam που βρήκατε νωρίτερα — ή αφήστε τον στην AUTO.</string>
+    <string name="onboarding_camera_save_primary">Αποθήκευση &amp; επανεκκίνηση</string>
+    <string name="onboarding_camera_applying_title">Εφαρμογή — επανεκκίνηση φωτογραφικών μηχανών</string>
+    <string name="onboarding_camera_applying_body">Η τροφή θα πάει σκοτεινή και αναβοσβήνει για περίπου 10 δευτερόλεπτα. Αυτό είναι φυσιολογικό - κρεμάστε σφιχτά.</string>
+    <string name="onboarding_camera_verify_title">Γρήγορος έλεγχος</string>
+    <string name="onboarding_camera_verify_body">Μήπως η άποψη 360 δείχνει την ραμμένη εικόνα και η dashcam δείχνουν το δρόμο μπροστά? Αν μια ροή φαίνεται λάθος, πατήστε Επανεπιλογή - τίποτα δεν είναι σπασμένο.</string>
+    <string name="onboarding_camera_verify_ok">Φαίνεται δεξιά</string>
+    <string name="onboarding_camera_verify_repick">Επανεπιλογή</string>
+    <string name="onboarding_camera_windshield_title">Ζώνη πορείας στις ηχογραφήσεις? (προαιρετικό)</string>
+    <string name="onboarding_camera_windshield_body">Για τη διάταξη cOEM dashcam — η κάμερα παρμπρίζ ως μια ταινία στην κορυφή της εγγραφής σας — επιλέξτε παρμπρίζ στο μενού ρόλου, επιλέξτε την μπροστινή κάμερα, και Save. Οι περισσότεροι ιδιοκτήτες μπορούν να το παραλείψουν.</string>
+    <string name="onboarding_camera_windshield_primary">Δείξε μου</string>
+    <string name="onboarding_camera_windshield_skip">Όχι, ευχαριστώ</string>
+    <!-- Vehicle profile chapter -->
+    <string name="onboarding_vehicle_title">Ενημερώστε Overdrive την μπαταρία σας</string>
+    <string name="onboarding_vehicle_body">Διαλέξτε το μοντέλο σας και γεμίζουμε το kWh, ή πληκτρολογήστε το εσείς (15–120). Αυτό καθιστά ακριβείς τις εκτιμήσεις της εμβέλειας και της φόρτισης. Μπορείτε να τις παρακάμψετε και να τις ρυθμίσετε αργότερα.</string>
+    <string name="onboarding_vehicle_primary">Ορισμός μπαταρίας</string>
+    <!-- Dashboard orientation chapter -->
+    <string name="onboarding_dash_tiles_title">Το πιλοτήριο σας με μια ματιά</string>
+    <string name="onboarding_dash_tiles_body">Αυτές οι κάρτες είναι κουμπιά — πατήστε για να ανοίξετε ζωντανές κάμερες, Εγγραφές, Υπηρεσίες ή το όχημά σας.</string>
+    <string name="onboarding_dash_chips_title">Αυτά ακριβώς δείχνουν την κατάσταση</string>
+    <string name="onboarding_dash_chips_body">Οι μάρκες δείχνουν την εγγραφή, τις υπηρεσίες και τον απομακρυσμένο σας σύνδεσμο. Ενημερώνουν μόνοι τους — δεν είναι κουμπιά.</string>
+    <string name="onboarding_dash_chips_body_land">Η κατάσταση της ζωής σας — καταγραφή, υπηρεσίες και απομακρυσμένος σύνδεσμος — εμφανίζεται εδώ. Ενημερώνει μόνη της.</string>
+    <!-- Completion -->
+    <string name="onboarding_done_title">Έτοιμο Cockpit</string>
+    <string name="onboarding_done_body">Αντιστοιχισμένες κάμερες και σετ μπαταρίας. Πατήστε Live για να παρακολουθήσετε τις ροές σας ή να εξερευνήσετε τις βαθύτερες ρυθμίσεις ανά πάσα στιγμή.</string>
+    <string name="onboarding_done_primary">Ολοκληρώθηκε</string>
+    <string name="onboarding_done_secondary">Εξερεύνηση Εγκατάστασης</string>
+    <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
+    <string name="onboarding_help_cd">Περιήγηση με οδηγό</string>
+    <string name="onboarding_reset_toast">Επαναφορά στην επιβίβαση - επανάληψη του οδηγού</string>
+    <string name="onboarding_expert_chapter_label">Κεφάλαιο %1$d του %2$d</string>
+    <string name="onboarding_expert_finish">Ολοκλήρωση</string>
+    <string name="onboarding_expert_menu_title">Περιήγηση με οδηγό</string>
+    <string name="onboarding_expert_menu_body">Μια γρήγορη βόλτα μέσω της βαθύτερης εγκατάστασης - προφίλ του οχήματός σας, ενσωματώσεις, επιτήρηση, διαγνωστικά, υπηρεσίες και ασφάλεια.</string>
+    <string name="onboarding_expert_menu_start">Ξεκινήστε την περιήγηση</string>
+    <string name="onboarding_expert_vehicle_title">Προφίλ οχήματος</string>
+    <string name="onboarding_expert_vehicle_body">Πατήστε το πλακίδιο του Οχήματος για να ρυθμίσετε το μέγεθος και το μοντέλο της μπαταρίας σας - εξουσιοδοτεί την ακριβή σειρά και τις εκτιμήσεις υγείας.</string>
+    <string name="onboarding_expert_recordings_title">Οι ηχογραφήσεις σας</string>
+    <string name="onboarding_expert_recordings_body">Εναλλαγή μεταξύ Dashcam (συνεχή + clips εγγύτητας) και επιτήρησης (σταθμευμένα συμβάντα γερουσίας) με αυτό το διακόπτη — το καθένα διατηρεί τη δική του βιβλιοθήκη. Πατήστε ένα κλιπ για να το παίξετε.</string>
+    <string name="onboarding_expert_live_title">Ζωντανές κάμερες</string>
+    <string name="onboarding_expert_live_body">Ανοίξτε το Live από εδώ για να παρακολουθήσετε όλες τις κάμερες σε πραγματικό χρόνο. Εύχρηστο για να ελέγξετε τη θέα πριν από ένα δίσκο ή ενώ σταθμεύσετε σε κοντινή απόσταση.</string>
+    <string name="onboarding_expert_trips_title">Ιστορικό διαδρομών</string>
+    <string name="onboarding_expert_trips_body">Τα ταξίδια καταγράφουν κάθε κίνηση – διαδρομή, απόσταση, διάρκεια και χρήση ενέργειας – ώστε να μπορείτε να ελέγχετε πού βρισκόταν το αυτοκίνητο.</string>
+    <string name="onboarding_expert_roadsense_title">Οδική Αίσθηση</string>
+    <string name="onboarding_expert_roadsense_body">Το RoadSense χρησιμοποιεί αισθητήρες κίνησης του αυτοκινήτου και GPS για την ανίχνευση οδικών κινδύνων — χτυπήματα, λακκούβες, διακόπτες ταχύτητας — και σας προειδοποιεί πριν από τους γνωστούς κινδύνους. Οι καρτέλες καλύπτουν την ανίχνευση, το χάρτη κινδύνου, την προειδοποίηση χτυπήματα και την κάμερα τυφλών. Ενεργοποιήστε τον κύριο διακόπτη για να χρησιμοποιήσετε οποιοδήποτε από αυτό.</string>
+    <string name="onboarding_expert_blindspot_title">Τυφλή Σημεία</string>
+    <string name="onboarding_expert_blindspot_body">Ενεργοποίηση Τυφλού Σημείου στην καρτέλα εδώ και, όταν σηματοδοτήσετε μια στροφή, αυτόματη προβολή πλευρικής κάμερας στην οθόνη — αριστερά για αριστερό σήμα, δεξιά για δεξί — και μετά κρύβεται λίγο μετά. Τρέχει μόνο ενώ ένα σήμα ενεργοποίησης είναι ενεργοποιημένο.</string>
+    <string name="onboarding_expert_maps_title">Navigation</string>
+    <string name="onboarding_expert_maps_body">Ανοίξτε το χάρτη για πλήρη πλοήγηση με στροφή — αναζητήστε έναν προορισμό, πάρτε δρομολόγηση και ζωντανή καθοδήγηση, συν κοντινά σημεία ενδιαφέροντος και τυχόν οδικούς κινδύνους RoadSense έχει καταγραφεί κατά μήκος του τρόπου. Μπορείτε επίσης να το κάνετε auto-project στο σύμπλεγμα οργάνων όταν αρχίζετε να οδηγείτε - αυτό το διακόπτη ζει στην καρτέλα Χάρτης του RoadSense.</string>
+    <string name="onboarding_expert_integrations_title">Ενσωματώσεις</string>
+    <string name="onboarding_expert_integrations_body">Συνδέστε ειδοποιήσεις Telegram, έναν καλύτερο σχεδιαστή δρομολογίου, MQTT ή BYD Cloud. Κάθε φύλλο ανοίγει την τοποθέτησή του μέσα στην εφαρμογή. Το πάνω φύλλο γίνεται πράσινο όταν όλα συνδεθούν.</string>
+    <string name="onboarding_expert_bydcloud_title">Το BYD Cloud ξεκλειδώνει το τηλεχειριστήριο</string>
+    <string name="onboarding_expert_bydcloud_body">Συνδέοντας τον λογαριασμό BYD σας εδώ ενεργοποιεί το απομακρυσμένο κλείδωμα, το φλας και το κέρατο από το τηλέφωνό σας. Αντιμετωπίστε τον συνδεδεμένο λογαριασμό και τον κωδικό πρόσβασης ως ευαίσθητο.</string>
+    <string name="onboarding_expert_surveillance_title">Surveillance &amp; recording</string>
+    <string name="onboarding_expert_surveillance_body">Ανίχνευση λεπτομερειών, ποιότητα και αποθήκευση εδώ. Αυτά ανοίγουν ως σελίδες ρυθμίσεων εντός της εφαρμογής που σερβίρονται από το αυτοκίνητό σας - μια κενή οθόνη σημαίνει απλά ότι ο βοηθός εξακολουθεί να ξεκινά.</string>
+    <string name="onboarding_expert_camprobe_title">Πυρήνας κάμερας — προσεκτικός</string>
+    <string name="onboarding_expert_camprobe_body">Αυτή η εκ νέου χαρτογραφεί την φυσική κάμερα τροφοδοτεί κάθε ρόλο και επανεκκινεί τις φωτογραφικές μηχανές. Μόνο να το αλλάξετε αν μια ροή φαίνεται λάθος - το ρυθμίσατε νωρίτερα στον οδηγό.</string>
+    <string name="onboarding_expert_traffic_title">Παρακολούθηση της κυκλοφορίας — απαιτείται για την απομακρυσμένη πρόσβαση</string>
+    <string name="onboarding_expert_traffic_body">Η ενσωματωμένη οθόνη κυκλοφορίας BYD αποκλείει άλλες εφαρμογές από τη χρήση της ενσωματωμένης SIM του αυτοκινήτου. Αν θέλετε να φτάσετε το αυτοκίνητό σας εξ αποστάσεως πάνω από την BYD SIM, θα πρέπει να το απενεργοποιήσετε εδώ.</string>
+    <string name="onboarding_expert_daemons_title">Υπηρεσίες — Χειρισμός με φροντίδα</string>
+    <string name="onboarding_expert_daemons_body">Αυτοί οι διακόπτες ξεκινούν και σταματούν τις υπηρεσίες παρασκηνίου. Η ενεργοποίηση κάμερας, επιτήρησης ή ACC Sentry σταματά την εγγραφή και τις κρατάει κλειστές μέχρι να τις ενεργοποιήσετε ξανά — ακόμα και μετά από επανεκκίνηση.</string>
+    <string name="onboarding_expert_security_title">Κλείδωμα με PIN</string>
+    <string name="onboarding_expert_security_body">Ορίστε ένα PIN για την πύλη της εφαρμογής για κοινόχρηστα οχήματα. Η παρακολούθηση και η καταγραφή συνεχίζουν να εκτελούνται ενώ η εφαρμογή είναι κλειδωμένη. Ένα ξεχασμένο PIN μπορεί να εκκαθαριστεί μόνο από έναν υπολογιστή μέσω USB.</string>
+    <string name="onboarding_expert_reset_title">Επαναφορά δεδομένων — μόνιμα</string>
+    <string name="onboarding_expert_reset_body">Αυτό διαγράφει τις ηχογραφήσεις, τα γεγονότα και τις ρυθμίσεις και δεν μπορεί να αναιρεθεί. Είναι εδώ αν πουλήσετε ποτέ το αυτοκίνητο - όχι μέρος της κανονικής χρήσης.</string>
+    <string name="onboarding_expert_done_title">Αυτή είναι η περιοδεία</string>
+    <string name="onboarding_expert_done_body">Έχετε δει τις βαθύτερες ρυθμίσεις. Ανοίξτε αυτόν τον οδηγό ξανά οποιαδήποτε στιγμή από το κουμπί βοήθειας.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Κλείσιμο</string>
     <string name="language_picker_title">Γλώσσα</string>
@@ -632,6 +733,7 @@
     <string name="rail_recordings">Εγγραφές</string>
     <string name="rail_vehicle">Όχημα</string>
     <string name="rail_trips">Δρομολόγια</string>
+    <string name="rail_charging">Φόρτιση</string>
     <string name="rail_integrations">Ενσωματώσεις</string>
     <string name="rail_diagnostics">Διαγνωστικά</string>
     <string name="rail_settings">Ρυθμίσεις</string>
