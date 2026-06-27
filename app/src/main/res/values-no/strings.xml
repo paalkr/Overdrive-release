@@ -489,7 +489,7 @@
     <string name="toast_updated_to">Oppdatert til %1$s</string>
     <string name="toast_update_install_failed">Oppdatering feilet: %1$s</string>
     <string name="toast_checking_for_updates">Sjekker etter oppdateringer…</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">Appen er oppdatert (%1$s)</string>
     <string name="toast_update_check_failed">Oppdateringskontroll mislyktes: %1$s</string>
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">Oppdatering tilgjengelig</string>
@@ -684,7 +684,7 @@
     <string name="toast_batch_delete_partial">%1$d slettet, %2$d mislyktes</string>
     <string name="play_with_chooser">Spill med</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">Oppdatert til %1$s — bekreft autostarten, BYD slettet den på nytt</string>
     <string name="setup_overlay_already_granted">Allerede innvilget</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">Tips &amp; feilsøking</string>
