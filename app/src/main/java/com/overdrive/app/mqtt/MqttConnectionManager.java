@@ -454,13 +454,18 @@ public class MqttConnectionManager {
             // utc
             payload.put("utc", now / 1000);
 
-            // soc
+            // soc — prefer the decimal monitor source. BatterySocMonitor reads
+            // getElecPercentageValue() as a Double + the onElecPercentageChanged(double)
+            // event, so it carries 1-decimal precision (same source the trip chart uses).
+            // vd.socPercent comes from the STATISTIC poll, which is integer-valued on this
+            // trim, so it's only a fallback. Rounded to 1 decimal to match the 0.1 deadband.
             double soc = -1;
-            if (vd != null && !Double.isNaN(vd.socPercent)) {
+            BatterySocData socData = vehicleDataMonitor.getBatterySoc();
+            if (socData != null && !Double.isNaN(socData.socPercent)
+                    && socData.socPercent >= 0 && socData.socPercent <= 100) {
+                soc = Math.round(socData.socPercent * 10.0) / 10.0;
+            } else if (vd != null && !Double.isNaN(vd.socPercent)) {
                 soc = vd.socPercent;
-            } else {
-                BatterySocData socData = vehicleDataMonitor.getBatterySoc();
-                if (socData != null) soc = socData.socPercent;
             }
             if (soc >= 0) payload.put("soc", soc);
 
