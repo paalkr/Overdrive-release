@@ -187,6 +187,107 @@
     <string name="setup_overlay_title">Allow Display Over Other Apps</string>
     <string name="setup_overlay_body">Enable this to show a floating status indicator for recording and trip tracking on top of other apps.</string>
     <string name="setup_overlay_button">Open Overlay Settings</string>
+    <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
+         protected brand name — keep it verbatim. -->
+    <!-- Shared button labels -->
+    <string name="onboarding_next">Next</string>
+    <string name="onboarding_back">Back</string>
+    <string name="onboarding_skip">Skip</string>
+    <string name="onboarding_later">Do this later</string>
+    <string name="onboarding_dismiss">Dismiss</string>
+    <string name="onboarding_exit">Exit tour</string>
+    <string name="onboarding_done_short">Got it</string>
+    <!-- Step 0: authorize the daemon (system ADB popup) -->
+    <string name="onboarding_authorize_title">Wake up Overdrive</string>
+    <string name="onboarding_authorize_body">Overdrive runs your cameras through a small on-device helper. Android will ask once to allow USB debugging — tap <b>Allow</b> and check <b>Always allow from this device</b> so it stays on after every restart.</string>
+    <string name="onboarding_authorize_button">Allow access</string>
+    <string name="onboarding_authorize_waiting_title">Waiting for permission…</string>
+    <string name="onboarding_authorize_waiting_body">Accept the Android popup. If you don\'t see it, it may already be granted — this will continue on its own.</string>
+    <string name="onboarding_authorize_retry_title">Still not connected</string>
+    <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
+    <string name="onboarding_authorize_retry_button">Try again</string>
+    <!-- Camera mapping chapter -->
+    <string name="onboarding_camera_step_label">Camera · step %1$d of %2$d</string>
+    <string name="onboarding_camera_intro_title">Set up your cameras</string>
+    <string name="onboarding_camera_intro_body">Let\'s tell Overdrive which camera is your 360 view and which is your dashcam. It takes about a minute, and you can change it later.</string>
+    <string name="onboarding_camera_intro_primary">Start</string>
+    <string name="onboarding_camera_opening_title">Opening camera setup…</string>
+    <string name="onboarding_camera_opening_body">Loading a live preview from your cameras. This can take a few seconds.</string>
+    <string name="onboarding_camera_pano_title">This is your 360 view</string>
+    <string name="onboarding_camera_pano_body">Use the arrows to find the stitched 4-up image. Read it from the BOTTOM: bottom-left is the REAR, bottom-right is the LEFT side.</string>
+    <string name="onboarding_camera_dashcam_title">Now find the road-ahead camera</string>
+    <string name="onboarding_camera_dashcam_body">Step through the cameras with the arrows and stop on the one showing the windshield / forward view. Note its number — you\'ll pick it next.</string>
+    <string name="onboarding_camera_pick_title">Pick your 360 camera</string>
+    <string name="onboarding_camera_pick_body">In the top card, choose the number for your 360 / normal camera. Not sure? Leave it on AUTO and Overdrive figures it out.</string>
+    <string name="onboarding_camera_pick_primary">Next</string>
+    <string name="onboarding_camera_pick_dash_title">Pick your dashcam camera</string>
+    <string name="onboarding_camera_pick_dash_body">In this card, choose the dashcam number you found earlier — or leave it on AUTO.</string>
+    <string name="onboarding_camera_save_primary">Save &amp; restart</string>
+    <string name="onboarding_camera_applying_title">Applying — restarting cameras</string>
+    <string name="onboarding_camera_applying_body">The feed will go dark and blink for about 10 seconds. This is normal — hang tight.</string>
+    <string name="onboarding_camera_verify_title">Quick check</string>
+    <string name="onboarding_camera_verify_body">Does the 360 view show the stitched image and the dashcam show the road ahead? If a feed looks wrong, tap Re-pick — nothing is broken.</string>
+    <string name="onboarding_camera_verify_ok">Looks right</string>
+    <string name="onboarding_camera_verify_repick">Re-pick</string>
+    <string name="onboarding_camera_windshield_title">Road-ahead band on recordings? (optional)</string>
+    <string name="onboarding_camera_windshield_body">For the OEM dashcam layout — the windshield camera as a strip on top of your recording — pick Windshield in the role menu, choose the forward camera, and Save. Most owners can skip this.</string>
+    <string name="onboarding_camera_windshield_primary">Show me</string>
+    <string name="onboarding_camera_windshield_skip">No thanks</string>
+    <!-- Vehicle profile chapter -->
+    <string name="onboarding_vehicle_title">Tell Overdrive your battery</string>
+    <string name="onboarding_vehicle_body">Pick your model and we fill in the kWh, or type it yourself (15–120). This makes range and charging estimates accurate. You can skip and set it later.</string>
+    <string name="onboarding_vehicle_primary">Set battery</string>
+    <!-- Dashboard orientation chapter -->
+    <string name="onboarding_dash_tiles_title">Your cockpit at a glance</string>
+    <string name="onboarding_dash_tiles_body">These cards are buttons — tap to open Live cameras, Recordings, Services or your Vehicle.</string>
+    <string name="onboarding_dash_chips_title">These just show status</string>
+    <string name="onboarding_dash_chips_body">The chips up top show recording, services and your remote link. They update on their own — they\'re not buttons.</string>
+    <string name="onboarding_dash_chips_body_land">Your live status — recording, services and remote link — shows up here. It updates on its own.</string>
+    <!-- Completion -->
+    <string name="onboarding_done_title">Cockpit ready</string>
+    <string name="onboarding_done_body">Cameras mapped and battery set. Tap Live to watch your feeds — or explore the deeper settings any time.</string>
+    <string name="onboarding_done_primary">Done</string>
+    <string name="onboarding_done_secondary">Explore Setup</string>
+    <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
+    <string name="onboarding_help_cd">Guided tour</string>
+    <string name="onboarding_reset_toast">Onboarding reset — replaying the guide</string>
+    <string name="onboarding_expert_chapter_label">Chapter %1$d of %2$d</string>
+    <string name="onboarding_expert_finish">Finish</string>
+    <string name="onboarding_expert_menu_title">Guided tour</string>
+    <string name="onboarding_expert_menu_body">A quick walk through the deeper setup — your vehicle profile, integrations, surveillance, diagnostics, services and security. You can stop any time.</string>
+    <string name="onboarding_expert_menu_start">Start tour</string>
+    <string name="onboarding_expert_vehicle_title">Vehicle profile</string>
+    <string name="onboarding_expert_vehicle_body">Tap the Vehicle tile to set your battery size and model — it powers accurate range and health estimates.</string>
+    <string name="onboarding_expert_recordings_title">Your recordings</string>
+    <string name="onboarding_expert_recordings_body">Switch between Dashcam (continuous + proximity clips) and Surveillance (parked sentry events) with this toggle — each keeps its own library. Tap a clip to play it.</string>
+    <string name="onboarding_expert_live_title">Live cameras</string>
+    <string name="onboarding_expert_live_body">Open Live from here to watch all cameras in real time. Handy for checking the view before a drive or while parked nearby.</string>
+    <string name="onboarding_expert_trips_title">Trip history</string>
+    <string name="onboarding_expert_trips_body">Trips logs every drive — route, distance, duration and energy use — so you can review where the car has been.</string>
+    <string name="onboarding_expert_roadsense_title">RoadSense</string>
+    <string name="onboarding_expert_roadsense_body">RoadSense uses the car\'s motion sensors and GPS to detect road hazards — bumps, potholes, speed breakers — and warns you before known ones. Its tabs cover detection, the hazard map, warning chimes, and Blind Spot. Turn on the master switch to use any of it.</string>
+    <string name="onboarding_expert_blindspot_title">Blind Spot</string>
+    <string name="onboarding_expert_blindspot_body">Enable Blind Spot in the tab here and, when you signal a turn, a side-camera view appears on screen automatically — left for a left signal, right for a right one — then hides shortly after. It only runs while a turn signal is on.</string>
+    <string name="onboarding_expert_maps_title">Navigation</string>
+    <string name="onboarding_expert_maps_body">Open the Map for full turn-by-turn navigation — search a destination, get routing and live guidance, plus nearby points of interest and any road hazards RoadSense has logged along the way. You can also auto-project it onto the instrument cluster when you start driving — that toggle lives in RoadSense\'s Map tab.</string>
+    <string name="onboarding_expert_integrations_title">Integrations</string>
+    <string name="onboarding_expert_integrations_body">Connect Telegram alerts, A Better Routeplanner, MQTT or BYD Cloud. Each card opens its setup inside the app. The pill up top turns green when everything\'s linked.</string>
+    <string name="onboarding_expert_bydcloud_title">BYD Cloud unlocks remote control</string>
+    <string name="onboarding_expert_bydcloud_body">Linking your BYD account here enables remote lock, flash and horn from your phone. Treat the linked account and access code as sensitive.</string>
+    <string name="onboarding_expert_surveillance_title">Surveillance &amp; recording</string>
+    <string name="onboarding_expert_surveillance_body">Fine-tune detection, quality and storage here. These open as in-app config pages served from your car — a blank screen just means the helper is still starting.</string>
+    <string name="onboarding_expert_camprobe_title">Camera probe — careful</string>
+    <string name="onboarding_expert_camprobe_body">This re-maps which physical camera feeds each role and restarts the cameras. Only change it if a feed looks wrong — you set this up earlier in the guide.</string>
+    <string name="onboarding_expert_traffic_title">Traffic monitor — required for remote access</string>
+    <string name="onboarding_expert_traffic_body">BYD\'s built-in Traffic Monitor blocks other apps from using the car\'s built-in SIM. If you want to reach your car remotely over the BYD SIM, you must disable it here. The head unit reboots to apply the change.</string>
+    <string name="onboarding_expert_daemons_title">Services — handle with care</string>
+    <string name="onboarding_expert_daemons_body">These switches start and stop background services. Turning OFF Camera, Surveillance or ACC Sentry stops recording and keeps them off until you turn them back on — even after a restart.</string>
+    <string name="onboarding_expert_security_title">Lock with a PIN</string>
+    <string name="onboarding_expert_security_body">Set a PIN to gate the app for shared vehicles. Surveillance and recording keep running while the app is locked. A forgotten PIN can only be cleared from a computer over USB.</string>
+    <string name="onboarding_expert_reset_title">Reset data — permanent</string>
+    <string name="onboarding_expert_reset_body">This erases recordings, events and settings and can\'t be undone. It\'s here if you ever sell the car — not part of normal use.</string>
+    <string name="onboarding_expert_done_title">That\'s the tour</string>
+    <string name="onboarding_expert_done_body">You\'ve seen the deeper settings. Open this guide again any time from the help button.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Close</string>
     <string name="language_picker_title">Language</string>
@@ -638,6 +739,7 @@
     <string name="rail_recordings">Recordings</string>
     <string name="rail_vehicle">Vehicle</string>
     <string name="rail_trips">Trips</string>
+    <string name="rail_charging">Charging</string>
     <string name="rail_integrations">Integrations</string>
     <string name="rail_diagnostics">Diagnostics</string>
     <string name="rail_settings">Settings</string>
