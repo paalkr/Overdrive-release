@@ -234,7 +234,7 @@
     <string name="onboarding_camera_windshield_primary">Zeige mich</string>
     <string name="onboarding_camera_windshield_skip">Nein danke</string>
     <!-- Vehicle profile chapter -->
-    <string name="onboarding_vehicle_title">Übertreiben Sie Ihren Akku</string>
+    <string name="onboarding_vehicle_title">Teile Overdrive deine Batterie mit</string>
     <string name="onboarding_vehicle_body">Wählen Sie Ihr Modell und wir füllen die kWh, oder geben Sie es selbst (15–120). Dies macht Reichweite und Berechnung genau. Sie können ihn überspringen und später einstellen.</string>
     <string name="onboarding_vehicle_primary">Akku setzen</string>
     <!-- Dashboard orientation chapter -->
@@ -264,7 +264,7 @@
     <string name="onboarding_expert_live_body">Öffnen Sie Live von hier aus, um alle Kameras in Echtzeit zu sehen.</string>
     <string name="onboarding_expert_trips_title">Reiseverlauf</string>
     <string name="onboarding_expert_trips_body">Reisen protokollieren jeden Antrieb – Route, Entfernung, Dauer und Energieverbrauch –, so dass Sie überprüfen können, wo das Auto war.</string>
-    <string name="onboarding_expert_roadsense_title">Straßensinn</string>
+    <string name="onboarding_expert_roadsense_title">RoadSense</string>
     <string name="onboarding_expert_roadsense_body">RoadSense nutzt die Bewegungssensoren und GPS des Autos, um Straßenrisiken – Beulen, Schlaglöcher, Geschwindigkeitsschalter – zu erkennen und warnt Sie vor bekannten Gefahren. Seine Tabs decken Erkennung, die Gefahrenkarte, Warnschalen und Blind Spot ab. Schalten Sie den Master-Schalter ein, um ihn zu verwenden.</string>
     <string name="onboarding_expert_blindspot_title">Blinder Spot</string>
     <string name="onboarding_expert_blindspot_body">Aktiviere Blind Spot im Tab hier und wenn du einen Zug signalisierst eine seitliche Kameraansicht erscheint automatisch auf dem Bildschirm — links für ein linkes Signal, rechts für ein rechtes Signal — dann verbirgt sich kurz danach. Es läuft nur, wenn ein Drehsignal eingeschaltet ist.</string>
@@ -489,7 +489,7 @@
     <string name="toast_updated_to">Aktualisiert auf %1$s</string>
     <string name="toast_update_install_failed">Installation fehlgeschlagen: %1$s</string>
     <string name="toast_checking_for_updates">Überprüfen Sie nach Updates...</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">App ist aktuell (%1$s)</string>
     <string name="toast_update_check_failed">Aktualisierungsprüfung fehlgeschlagen: %1$s</string>
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">Update verfügbar</string>
@@ -684,7 +684,7 @@
     <string name="toast_batch_delete_partial">%1$d gelöscht, %2$d fehlgeschlagen</string>
     <string name="play_with_chooser">Spielen Sie mit</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">Auf %1$s aktualisiert — Bestätigen Sie den Autostart, BYD löscht ihn bei jeder Installation erneut</string>
     <string name="setup_overlay_already_granted">Bereits gewährt</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">Tipps und Fehlerbehebung</string>
