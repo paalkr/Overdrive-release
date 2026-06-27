@@ -2185,7 +2185,7 @@
     "connectivity_updates": "Aggiornamenti connettività",
     "connectivity_updates_desc": "Avvisa quando il daemon si avvia, si ferma o si riavvia. Utile per la diagnostica.",
     "motion_text": "Avvisi movimento testuali",
-    "motion_text_desc": "Send a motion alert (text, plus the snapshot photo when one is available) when surveillance detects motion. Video clips have their own toggle below.",
+    "motion_text_desc": "Invia un avviso di movimento (testo, più la foto istantanea quando uno è disponibile) quando la sorveglianza rileva il movimento. I clip video hanno la loro commutazione qui sotto.",
     "daemon_title": "Daemon",
     "auto_start_acc_off": "Avvia automaticamente a veicolo spento",
     "auto_start_acc_off_desc": "Avvia il daemon del bot Telegram quando il veicolo passa ad ACC OFF, così i comandi funzionano durante la sosta. Il daemon si ferma quando il veicolo si riaccende.",
