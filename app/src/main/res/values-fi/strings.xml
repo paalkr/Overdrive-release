@@ -187,6 +187,107 @@
     <string name="setup_overlay_title">Salli Muiden Sovellusten Näyttö</string>
     <string name="setup_overlay_body">Ota tämä käyttöön, jos haluat näyttää kelluvan tilaindikaattorin muiden sovellusten päälle tapahtuvaan tallennukseen ja matkanseurantaan.</string>
     <string name="setup_overlay_button">Avaa Peittokuvan Asetukset</string>
+    <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
+         protected brand name — keep it verbatim. -->
+    <!-- Shared button labels -->
+    <string name="onboarding_next">Seuraava</string>
+    <string name="onboarding_back">Takaisin</string>
+    <string name="onboarding_skip">Ohita</string>
+    <string name="onboarding_later">Tee tämä myöhemmin</string>
+    <string name="onboarding_dismiss">Hylkää</string>
+    <string name="onboarding_exit">Poistu kierroksesta</string>
+    <string name="onboarding_done_short">Asia ymmärretty</string>
+    <!-- Step 0: authorize the daemon (system ADB popup) -->
+    <string name="onboarding_authorize_title">Herätä Overdrive</string>
+    <string name="onboarding_authorize_body">Overdrive ajaa kamerat läpi pienen laitteen auttaja. Android pyytää kerran sallimaan USB-virheenkorjauksen — napauta <b>Salli</b> ja tarkista <b>Salli aina tästä laitteesta</b> joten se pysyy päällä jokaisen uudelleenkäynnistyksen jälkeen.</string>
+    <string name="onboarding_authorize_button">Salli pääsy</string>
+    <string name="onboarding_authorize_waiting_title">Odotetaan lupaa…</string>
+    <string name="onboarding_authorize_waiting_body">Hyväksy Android ponnahdusikkuna. Jos et näe sitä, se voidaan jo myöntää - tämä jatkuu yksin.</string>
+    <string name="onboarding_authorize_retry_title">Yhteyttä ei ole vielä yhdistetty</string>
+    <string name="onboarding_authorize_retry_body">Auttaja ei ole vielä käynnissä. Android-oikeudet on ehkä hylätty. Yritä uudelleen ja muista tarkistaa <b>Salli</b>.</string>
+    <string name="onboarding_authorize_retry_button">Yritä uudelleen</string>
+    <!-- Camera mapping chapter -->
+    <string name="onboarding_camera_step_label">Kamera · vaihe %1$d / %2$d</string>
+    <string name="onboarding_camera_intro_title">Määritä kamerat</string>
+    <string name="onboarding_camera_intro_body">Kerrotaan Overdrive mikä kamera on 360 näkymä ja mikä on Dashcam. Se kestää noin minuutin ja voit muuttaa sitä myöhemmin.</string>
+    <string name="onboarding_camera_intro_primary">Aloita</string>
+    <string name="onboarding_camera_opening_title">Opening camera setup…</string>
+    <string name="onboarding_camera_opening_body">Ladataan reaaliaikaista esikatselua kameroistasi. Tämä voi kestää muutaman sekunnin.</string>
+    <string name="onboarding_camera_pano_title">Tämä on 360 näkymäsi</string>
+    <string name="onboarding_camera_pano_body">Käytä nuolia löytää ommeltu 4-ylös kuva. Lue se BOTTOM: Ala-vasen on REAR, ala-oikea on vasen puoli.</string>
+    <string name="onboarding_camera_dashcam_title">Nyt etsi tien etukamera</string>
+    <string name="onboarding_camera_dashcam_body">Astu kameroiden läpi nuolilla ja pysäytä se, joka näyttää tuulilasin / eteenpäin näkymän. Huomaa sen numero – valitset sen seuraavaksi.</string>
+    <string name="onboarding_camera_pick_title">Valitse 360 kamera</string>
+    <string name="onboarding_camera_pick_body">Valitse yläkortissa 360 / normaali kamera. Etkö ole varma? Jätä se AUTO ja Overdrive luvut ulos.</string>
+    <string name="onboarding_camera_pick_primary">Seuraava</string>
+    <string name="onboarding_camera_pick_dash_title">Valitse Dashcam kamera</string>
+    <string name="onboarding_camera_pick_dash_body">Valitse tässä kortissa aiemmin löytänyt dashcam numero — tai jätä se AUTOon.</string>
+    <string name="onboarding_camera_save_primary">Tallenna &amp; uudelleenkäynnistys</string>
+    <string name="onboarding_camera_applying_title">Sovelletaan – kameroiden uudelleenkäynnistys</string>
+    <string name="onboarding_camera_applying_body">Syöte muuttuu pimeäksi ja vilkkuvaksi noin 10 sekuntia. Tämä on normaalia — roikkua tiukasti.</string>
+    <string name="onboarding_camera_verify_title">Nopea tarkistus</string>
+    <string name="onboarding_camera_verify_body">Näyttääkö 360 näkymä ommeltu kuva ja dashcam näyttää tien eteenpäin? Jos syöte näyttää väärältä, napauta Re-pick — mikään ei ole rikki.</string>
+    <string name="onboarding_camera_verify_ok">Näyttää oikealta</string>
+    <string name="onboarding_camera_verify_repick">Poimi Uudelleen</string>
+    <string name="onboarding_camera_windshield_title">Edessä oleva taajuusalue tallenteissa? (valinnainen)</string>
+    <string name="onboarding_camera_windshield_body">OEM Dashcam layout – tuulilasinkamera nauhoituksen päälle – valitse Windshield in roolipelistä, valitse eteen kamera ja Tallenna. Useimmat omistajat voivat ohittaa tämän.</string>
+    <string name="onboarding_camera_windshield_primary">Näytä minulle</string>
+    <string name="onboarding_camera_windshield_skip">Ei kiitos</string>
+    <!-- Vehicle profile chapter -->
+    <string name="onboarding_vehicle_title">Kerro Akun yliveto</string>
+    <string name="onboarding_vehicle_body">Valitse mallisi ja täytämme kWh, tai kirjoita se itse (15–120). Tämä tekee alueen ja latauksen arvioista tarkkoja. Voit ohittaa ja asettaa sen myöhemmin.</string>
+    <string name="onboarding_vehicle_primary">Aseta akku</string>
+    <!-- Dashboard orientation chapter -->
+    <string name="onboarding_dash_tiles_title">Sinun ohjaamosi yhdellä silmäyksellä</string>
+    <string name="onboarding_dash_tiles_body">Nämä kortit ovat painikkeita — napauta avataksesi Live kamerat, Tallenteet, Palvelut tai Ajoneuvosi.</string>
+    <string name="onboarding_dash_chips_title">Nämä vain näytä tila</string>
+    <string name="onboarding_dash_chips_body">Sirut ylhäältä näyttävät nauhoituksen, palvelut ja kaukosäätimen. He päivittävät omia — he eivät ole nappeja.</string>
+    <string name="onboarding_dash_chips_body_land">Live-tilasi — tallennus, palvelut ja etälinkki — näkyy täällä. Se päivittää omaa tilaansa.</string>
+    <!-- Completion -->
+    <string name="onboarding_done_title">Ohjaamo valmis</string>
+    <string name="onboarding_done_body">Kamerat on kartoitettu ja akku asetettu. Napauta Live katsoaksesi syötteesi — tai tutki syvempiä asetuksia milloin tahansa.</string>
+    <string name="onboarding_done_primary">Valmis</string>
+    <string name="onboarding_done_secondary">Tutki Asennusta</string>
+    <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
+    <string name="onboarding_help_cd">Opastettu kierros</string>
+    <string name="onboarding_reset_toast">Perehdytyksen nollaus — oppaan toisto</string>
+    <string name="onboarding_expert_chapter_label">Chapter %1$d / %2$d</string>
+    <string name="onboarding_expert_finish">Valmis</string>
+    <string name="onboarding_expert_menu_title">Opastettu kierros</string>
+    <string name="onboarding_expert_menu_body">Nopea kävely läpi syvemmän asennuksen — ajoneuvon profiili, integraatiot, valvonta, diagnostiikka, palvelut ja turvallisuus. Voit pysäyttää milloin tahansa.</string>
+    <string name="onboarding_expert_menu_start">Aloita kierros</string>
+    <string name="onboarding_expert_vehicle_title">Ajoneuvon profiili</string>
+    <string name="onboarding_expert_vehicle_body">Napauta Ajoneuvon laattaa asettaaksesi akun koon ja mallin — se mahdollistaa tarkan alueen ja terveysarvion.</string>
+    <string name="onboarding_expert_recordings_title">Sinun nauhoituksesi</string>
+    <string name="onboarding_expert_recordings_body">Vaihda Dashcam (jatkuva + etäisyysleikkeet) ja Surveillance (pysäköity aistitapahtumat) välillä tällä vaihtamalla – kukin pitää oman kirjastonsa. Napauta klippiä toistaaksesi sen.</string>
+    <string name="onboarding_expert_live_title">Elävät kamerat</string>
+    <string name="onboarding_expert_live_body">Avaa Live täältä katsoaksesi kaikkia kameroita reaaliajassa. Kätevä tarkistaa näkymä ennen asemaa tai pysäköitynä lähistöllä.</string>
+    <string name="onboarding_expert_trips_title">Matkan historia</string>
+    <string name="onboarding_expert_trips_body">Matkat lokit jokainen ajaa — reitti, matka, kesto ja energiankäyttö — joten voit tarkistaa, missä auto on ollut.</string>
+    <string name="onboarding_expert_roadsense_title">RoadSense</string>
+    <string name="onboarding_expert_roadsense_body">RoadSense käyttää auton liike-antureita ja GPS:ää tienvarsivaarojen – kuoppien, kuoppien, nopeudenkatkaisijoiden – havaitsemiseen ja varoittaa sinua ennen tunnettuja vaaroja. Sen välilehdet kattavat havainnon, vaarallisuuskartan, varoituspilkut ja sokeat pisteet. Ota pääkytkin käyttöön, jos haluat käyttää sitä.</string>
+    <string name="onboarding_expert_blindspot_title">Sokea Spotti</string>
+    <string name="onboarding_expert_blindspot_body">Ota Blind Spot käyttöön välilehdessä tässä ja kun signaloit käännöksen. sivukameran näkymä näkyy näytössä automaattisesti — vasemmalle vasemmalle ja oikealle — ja piilottaa sen pian sen jälkeen. Se toimii vain kun kääntymissignaali on päällä.</string>
+    <string name="onboarding_expert_maps_title">Navigation</string>
+    <string name="onboarding_expert_maps_body">Avaa kartta käänteenpäin -navigointia varten – etsi määränpäätä, hanki reititys ja opasta live-ohjausta, sekä lähistöllä olevia kiinnostavia kohteita ja mahdollisia liikennevaaroja RoadSense on kirjautunut matkan varrella. Voit myös suunnitella sen automaattisesti instrumenttiryhmään, kun aloitat ajamisen — se vaihtaa asuu RoadSensen kartta-välilehdessä.</string>
+    <string name="onboarding_expert_integrations_title">Integraatiot</string>
+    <string name="onboarding_expert_integrations_body">Yhdistä Telegram hälytykset, Parempi Routeplanner, MQTT tai BYD Cloud. Jokainen kortti avaa asetuksensa sovelluksessa. Pill up up muuttuu vihreäksi, kun kaikki on kytketty.</string>
+    <string name="onboarding_expert_bydcloud_title">BYD Cloud avaa kaukosäätimen</string>
+    <string name="onboarding_expert_bydcloud_body">Yhdistämällä BYD-tilisi tähän mahdollistaa etälukituksen, salaman ja sarvin puhelimestasi. Käsittele linkitettyä tiliä ja käytä koodia herkkä.</string>
+    <string name="onboarding_expert_surveillance_title">Valvonta &amp; nauhoitus</string>
+    <string name="onboarding_expert_surveillance_body">Hienosäätö havaitseminen, laatu ja varastointi täällä. Nämä aukeavat sovelluksensisäisinä config sivuina, jotka tarjoillaan autostasi — tyhjä näyttö tarkoittaa vain sitä, että auttaja on yhä aloittamassa.</string>
+    <string name="onboarding_expert_camprobe_title">Kameranturi – varovainen</string>
+    <string name="onboarding_expert_camprobe_body">Tämä uudelleenkartoittaa fyysisen kameran jokaisen roolin ja käynnistää kamerat uudelleen. Muuta sitä vain, jos syöte näyttää väärältä — asetat tämän aiemmin oppaassa.</string>
+    <string name="onboarding_expert_traffic_title">Liikenteen monitori – vaaditaan etäkäyttöä varten</string>
+    <string name="onboarding_expert_traffic_body">BYD:n sisäänrakennettu Liikenteen valvonta estää muita sovelluksia käyttämästä auton sisäänrakennettua SIM-korttia. Jos haluat päästä autoon etänä yli BYD SIM, sinun täytyy poistaa se käytöstä täällä. Pää yksikkö uudelleenkäynnistykset soveltaa muutosta.</string>
+    <string name="onboarding_expert_daemons_title">Palvelut – käsitellä huolella</string>
+    <string name="onboarding_expert_daemons_body">Nämä kytkimet käynnistävät ja pysäyttävät taustapalvelut. OFF Camera, Surveillance tai ACC Sentry pysähtyy tallennuksen ja pitää ne pois päältä, kunnes kytket ne takaisin päälle, jopa uudelleenkäynnistyksen jälkeen.</string>
+    <string name="onboarding_expert_security_title">Lukitse PIN-koodilla</string>
+    <string name="onboarding_expert_security_body">Aseta PIN-koodi, jolla voit porata jaettujen ajoneuvojen sovelluksen. Valvonta ja tallennus jatkuu, kun sovellus on lukittu. Unohtunut PIN-koodi voidaan poistaa vain USB:n yläpuolella olevasta tietokoneesta.</string>
+    <string name="onboarding_expert_reset_title">Nollaa tiedot – pysyvä</string>
+    <string name="onboarding_expert_reset_body">Tämä poistaa nauhoitukset, tapahtumat ja asetukset ja ei voi peruuttaa. Se on täällä, jos koskaan myydä autoa - ei osa normaalia käyttöä.</string>
+    <string name="onboarding_expert_done_title">Tuo on kiertue</string>
+    <string name="onboarding_expert_done_body">Olet nähnyt syvemmät asetukset. Avaa tämä opas uudelleen milloin tahansa ohjeen painikkeesta.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Sulje</string>
     <string name="language_picker_title">Kieli</string>
@@ -632,6 +733,7 @@
     <string name="rail_recordings">Tallenteet</string>
     <string name="rail_vehicle">Ajoneuvo</string>
     <string name="rail_trips">Kyydit</string>
+    <string name="rail_charging">Ladataan</string>
     <string name="rail_integrations">Integraatiot</string>
     <string name="rail_diagnostics">Diagnostiikka</string>
     <string name="rail_settings">Asetukset</string>
