@@ -187,6 +187,107 @@
     <string name="setup_overlay_title">Povolit zobrazení přes ostatní aplikace</string>
     <string name="setup_overlay_body">Povolením zobrazíte plovoucí indikátor stavu pro nahrávání a sledování jízdy nad jinými aplikacemi.</string>
     <string name="setup_overlay_button">Otevřít nastavení potahů</string>
+    <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
+         protected brand name — keep it verbatim. -->
+    <!-- Shared button labels -->
+    <string name="onboarding_next">Další</string>
+    <string name="onboarding_back">Zpět</string>
+    <string name="onboarding_skip">Přeskočit</string>
+    <string name="onboarding_later">Udělejte to později</string>
+    <string name="onboarding_dismiss">Odmítnout</string>
+    <string name="onboarding_exit">Ukončit prohlídku</string>
+    <string name="onboarding_done_short">Rozumím</string>
+    <!-- Step 0: authorize the daemon (system ADB popup) -->
+    <string name="onboarding_authorize_title">Probudit Overdrive</string>
+    <string name="onboarding_authorize_body">Přepínač spustí vaše kamery malým pomocníkem na zařízení. Android se jednou zeptá na povolení ladění USB — klepněte na tlačítko <b>Povolit</b> a zkontrolujte <b>Vždy povolit z tohoto zařízení</b> , aby zůstala zapnuta po každém restartu.</string>
+    <string name="onboarding_authorize_button">Povolit přístup</string>
+    <string name="onboarding_authorize_waiting_title">Čekání na oprávnění…</string>
+    <string name="onboarding_authorize_waiting_body">Přijmout vyskakovací okno Android. Pokud ho nevidíte, může být již uděleno - bude to pokračovat samo.</string>
+    <string name="onboarding_authorize_retry_title">Stále není připojeno</string>
+    <string name="onboarding_authorize_retry_body">Pomocník ještě neběží. Oprávnění Android bylo zamítnuto. Zkuste to znovu a nezapomeňte zkontrolovat <b>Vždy povolit</b>.</string>
+    <string name="onboarding_authorize_retry_button">Zkuste to znovu</string>
+    <!-- Camera mapping chapter -->
+    <string name="onboarding_camera_step_label">Kamera · krok %1$d z %2$d</string>
+    <string name="onboarding_camera_intro_title">Nastavit fotoaparáty</string>
+    <string name="onboarding_camera_intro_body">Řekněme OverDrive, který kamera je váš 360 pohled a který je tvoje dashcam. Trvá to asi minutu a později ji můžete změnit.</string>
+    <string name="onboarding_camera_intro_primary">Začít</string>
+    <string name="onboarding_camera_opening_title">Otevírání nastavení fotoaparátu…</string>
+    <string name="onboarding_camera_opening_body">Načítání živého náhledu z vašich kamer. Může to trvat několik sekund.</string>
+    <string name="onboarding_camera_pano_title">Toto je vaše 360 zobrazení</string>
+    <string name="onboarding_camera_pano_body">Pomocí šipek najděte vsazený 4-nahoru obrázek. Přečtěte si jej z BOTTOM: vlevo dole je REAR, vpravo dole je strana LEFT.</string>
+    <string name="onboarding_camera_dashcam_title">Nyní najdi silniční kameru</string>
+    <string name="onboarding_camera_dashcam_body">Přejděte kamery se šipkami a zastavte na obrazovce zobrazující čelní štítek / dopředu. Všimněte si svého čísla — budete si ho vybrat dále.</string>
+    <string name="onboarding_camera_pick_title">Vyberte si 360 fotoaparát</string>
+    <string name="onboarding_camera_pick_body">Na horní kartě vyberte číslo pro vaši 360 / normální fotoaparát. Nejste si jisti? Ponechte ji na AUTO a čísla přetížena.</string>
+    <string name="onboarding_camera_pick_primary">Další</string>
+    <string name="onboarding_camera_pick_dash_title">Vyberte si fotoaparát dashcam</string>
+    <string name="onboarding_camera_pick_dash_body">Na této kartě si zvolte číslo pomlčky, které jste nalezli dříve - nebo jej nechte na AUTO.</string>
+    <string name="onboarding_camera_save_primary">Uložit &amp; restartovat</string>
+    <string name="onboarding_camera_applying_title">Použití – kamery pro opětovné spuštění</string>
+    <string name="onboarding_camera_applying_body">Kanál bude tmavý a blikat po dobu asi 10 sekund. To je normální, závěs napjatý.</string>
+    <string name="onboarding_camera_verify_title">Rychlá kontrola</string>
+    <string name="onboarding_camera_verify_body">Zobrazí 360 zobrazený vsazený obrázek a dashcam ukazuje cestu vpřed? Pokud se zdá kanál špatně, klepněte na tlačítko Znovu vybrat — nic není narušeno.</string>
+    <string name="onboarding_camera_verify_ok">Vzhled vpravo</string>
+    <string name="onboarding_camera_verify_repick">Znovu vybrat</string>
+    <string name="onboarding_camera_windshield_title">Silniční pásmo pro nahrávání? (nepovinné)</string>
+    <string name="onboarding_camera_windshield_body">Pro OEM dashcam rozložení – fotoaparát čelního skla jako pásku nad vaším záznamem – vyberte Windshield v nabídce úlohy, vyberte vpřed kameru a uložte ji. Většina vlastníků to může přeskočit.</string>
+    <string name="onboarding_camera_windshield_primary">Ukaž mi</string>
+    <string name="onboarding_camera_windshield_skip">Ne, děkuji</string>
+    <!-- Vehicle profile chapter -->
+    <string name="onboarding_vehicle_title">Řekněte Přepsat baterii</string>
+    <string name="onboarding_vehicle_body">Vyberte si model a my naplníme kWh, nebo jej napište sami (15–120). Tím je přesný rozsah a odhad nabití. Můžete jej přeskočit a nastavit později.</string>
+    <string name="onboarding_vehicle_primary">Nastavit baterii</string>
+    <!-- Dashboard orientation chapter -->
+    <string name="onboarding_dash_tiles_title">Tvůj koktejl na pohled</string>
+    <string name="onboarding_dash_tiles_body">Tyto karty jsou tlačítka — klepnutím otevřete živé kamery, nahrávky, Služby nebo vaše vozidlo.</string>
+    <string name="onboarding_dash_chips_title">Toto jen zobrazit stav</string>
+    <string name="onboarding_dash_chips_body">Čipy nahoře zobrazit záznamy, služby a vzdálený odkaz. Aktualizují samy o sobě - nejsou to tlačítka.</string>
+    <string name="onboarding_dash_chips_body_land">Váš živý stav – nahrávání, služby a vzdálený odkaz – zobrazí se zde. Aktualizuje se sám.</string>
+    <!-- Completion -->
+    <string name="onboarding_done_title">Příprava koktejlu</string>
+    <string name="onboarding_done_body">Mapované kamery a baterie jsou nastaveny. Klepnutím na Live zobrazíte své kanály - nebo kdykoliv prozkoumejte hlubší nastavení.</string>
+    <string name="onboarding_done_primary">Hotovo</string>
+    <string name="onboarding_done_secondary">Prozkoumat nastavení</string>
+    <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
+    <string name="onboarding_help_cd">Prohlídka s průvodcem</string>
+    <string name="onboarding_reset_toast">Obnovení zapojení – přehrávání návodu</string>
+    <string name="onboarding_expert_chapter_label">Kapitola %1$d z %2$d</string>
+    <string name="onboarding_expert_finish">Dokončit</string>
+    <string name="onboarding_expert_menu_title">Prohlídka s průvodcem</string>
+    <string name="onboarding_expert_menu_body">Rychle procházet hlubším nastavením — profil vozidla, integrace, dohled, diagnostika, služby a bezpečnost. Kdykoli můžete zastavit.</string>
+    <string name="onboarding_expert_menu_start">Zahájit prohlídku</string>
+    <string name="onboarding_expert_vehicle_title">Profil vozidla</string>
+    <string name="onboarding_expert_vehicle_body">Klepnutím na dlaždici vozidla nastavíte velikost baterie a model - aktivuje přesné odhady rozsahu a zdraví.</string>
+    <string name="onboarding_expert_recordings_title">Vaše nahrávky</string>
+    <string name="onboarding_expert_recordings_body">Přepínání mezi Dashcam (kontinuální + blízkopohledové spoje) a přehledem (zaparkované sentry událostí) s tímto přepínačem – každý si udržuje vlastní knihovnu. Klepnutím na klip jej přehrajete.</string>
+    <string name="onboarding_expert_live_title">S obsahem válců nepřesahujícím 2500 cm3</string>
+    <string name="onboarding_expert_live_body">Otevírejte odsud živě a sledujte všechny kamery v reálném čase. Rušte pro kontrolu pohledu před řízením nebo při zaparkování v blízkosti.</string>
+    <string name="onboarding_expert_trips_title">Historie objednávek</string>
+    <string name="onboarding_expert_trips_body">Jízdy zaznamenávají každou jízdu — trasu, vzdálenost, trvání a spotřebu energie — takže můžete zkontrolovat, kde auto bylo.</string>
+    <string name="onboarding_expert_roadsense_title">Silnice</string>
+    <string name="onboarding_expert_roadsense_body">RoadSense používá snímače pohybu auta a GPS k detekci nebezpečí na silnicích – výhybky, jedy, vypínače rychlosti – a varuje vás před známými. Jeho panely pokrývají detekci nebezpečí, mapu nebezpečí, výstražné manžety a černé skvrny. Zapněte hlavní přepínač pro použití některého.</string>
+    <string name="onboarding_expert_blindspot_title">Slepý bod</string>
+    <string name="onboarding_expert_blindspot_body">Povolte Slepý bod na kartě a když signalizujete otočení, na obrazovce se automaticky zobrazí boční kamera — vlevo pro levý signál, vpravo po pravé straně — a krátce poté skryje. Probíhá pouze při zapnutí signálu.</string>
+    <string name="onboarding_expert_maps_title">Navigation</string>
+    <string name="onboarding_expert_maps_body">Otevřete mapu pro plnou navigaci po otočení – vyhledejte destinaci, získejte směrování a live guidance, plus blízké body zájmu a jakákoli nebezpečí na silnicích se zalogovala podél cesty. Můžete jej také automaticky promítnout do clusteru instrumentů, když začnete jezdit — který přepíná životy na kartě Mapy RoadSense.</string>
+    <string name="onboarding_expert_integrations_title">Integrace</string>
+    <string name="onboarding_expert_integrations_body">Připojte upozornění Telegramu, Lepší plánovač, MQTT nebo BYD Cloud. Každá karta otevírá své nastavení v aplikaci. Vytáčení nahoru svítí zeleně, když je vše propojeno.</string>
+    <string name="onboarding_expert_bydcloud_title">BYD Cloud odemkne dálkové ovládání</string>
+    <string name="onboarding_expert_bydcloud_body">Propojení vašeho BYD účtu zde umožňuje vzdálené uzamknutí, flash a houkačky z telefonu. Prohlížejte propojený účet a přístupový kód jako citlivý.</string>
+    <string name="onboarding_expert_surveillance_title">Dohled &amp; záznam</string>
+    <string name="onboarding_expert_surveillance_body">Zdejší detekce, kvalita a skladování jemného doladění. Tyto otevřené jako stránky s konfiguračními stránkami v aplikaci - prázdná obrazovka znamená, že pomocník stále běží.</string>
+    <string name="onboarding_expert_camprobe_title">Sonda kamery – opatrná</string>
+    <string name="onboarding_expert_camprobe_body">Tato remapování, která fyzicky slouží ke zachycení každé role a restartuje kamery. Změňte pouze v případě, že se zdá kanál špatný — nastavíte jej dříve v průvodci.</string>
+    <string name="onboarding_expert_traffic_title">Dopravní monitor – vyžadován pro vzdálený přístup</string>
+    <string name="onboarding_expert_traffic_body">BYD vestavěný Traffic Monitor blokuje jiné aplikace v používání zabudovaného auta SIM. Pokud chcete telefon dálkově oslovit přes BYD SIM, musíte ho zde vypnout. Pro aplikaci změny je nutné restartuj hlavičkovou jednotku.</string>
+    <string name="onboarding_expert_daemons_title">Služby – manipulace s péčí</string>
+    <string name="onboarding_expert_daemons_body">Tyto přepínače startují a zastavují služby na pozadí. Vypnutí kamery, sledování nebo ACC Sentry zastaví nahrávání a udržuje je, dokud je nevypnete - i po restartu.</string>
+    <string name="onboarding_expert_security_title">Zamknout pomocí kódu PIN</string>
+    <string name="onboarding_expert_security_body">Nastavte PIN pro bránu aplikace pro sdílená vozidla. Sledujte a nahrávejte běží, když je aplikace uzamčena. Zapomenutý PIN kód lze vymazat pouze z počítače přes USB.</string>
+    <string name="onboarding_expert_reset_title">Resetovat data – trvalé</string>
+    <string name="onboarding_expert_reset_body">Vymaže nahrávky, události a nastavení a nelze je vrátit zpět. Je to zde, pokud někdy prodáváte auto — není součástí běžného používání.</string>
+    <string name="onboarding_expert_done_title">To je prohlídka</string>
+    <string name="onboarding_expert_done_body">Viděli jste hlubší nastavení. Znovu otevřete tento návod z tlačítka nápovědy.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Zavřít</string>
     <string name="language_picker_title">Jazyk</string>
@@ -638,6 +739,7 @@
     <string name="rail_recordings">Nahrávky</string>
     <string name="rail_vehicle">Vozidlo</string>
     <string name="rail_trips">Jízda</string>
+    <string name="rail_charging">Nabíjení</string>
     <string name="rail_integrations">Integrace</string>
     <string name="rail_diagnostics">Diagnostika</string>
     <string name="rail_settings">Nastavení</string>
