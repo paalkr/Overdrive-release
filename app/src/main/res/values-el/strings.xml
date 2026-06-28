@@ -1208,6 +1208,7 @@
     <string name="roadsense_map_search_action">Αναζήτηση</string>
     <string name="roadsense_map_searching">Αναζήτηση…</string>
     <string name="roadsense_map_no_results">Δεν βρέθηκαν μέρη</string>
+    <string name="roadsense_map_search_network">Δεν ήταν δυνατή η πρόσβαση στην υπηρεσία αναζήτησης. Ελέγξτε τη σύνδεσή σας ή το διακομιστή μεσολάβησης και προσπαθήστε ξανά.</string>
     <string name="roadsense_map_pick_destination">Επιλέξτε προορισμό</string>
     <string name="roadsense_map_routing">Finding route…</string>
     <string name="roadsense_map_route_failed">Αδυναμία εύρεσης διαδρομής. Δοκιμάστε ξανά.</string>
