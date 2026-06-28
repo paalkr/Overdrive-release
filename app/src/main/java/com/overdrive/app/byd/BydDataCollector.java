@@ -1789,8 +1789,31 @@ public class BydDataCollector {
             collectStatTemp(b, BydFeatureIds.STAT_AVERAGE_BATTERY_TEMP, "avg");
 
             // Cell voltages via get() — intValue / 1000.0 = V
-            collectStatVoltage(b, BydFeatureIds.STAT_HIGHEST_BATTERY_VOLTAGE, "high");
-            collectStatVoltage(b, BydFeatureIds.STAT_LOWEST_BATTERY_VOLTAGE, "low");
+            double cellHi = collectStatVoltage(b, BydFeatureIds.STAT_HIGHEST_BATTERY_VOLTAGE, "high");
+            double cellLo = collectStatVoltage(b, BydFeatureIds.STAT_LOWEST_BATTERY_VOLTAGE, "low");
+
+            // HV pack voltage, derived from the (accurate) per-cell voltage × series cell count.
+            // The statistic-device event 1151336480 (formerly read as pack voltage in decivolts)
+            // under-reports on some trims — e.g. on the Seal 82.5 kWh it tracks only ~149 cells'
+            // worth (~494 V) while the true pack is ~570 V (verified vs an OBD2 reading of 567 V at
+            // 3.294 V/cell). The per-cell voltages read correctly, so pack = avg_cell × N, where N
+            // is the pack's series cell count from its nominal capacity (cellCountForCapacity, e.g.
+            // 82.5 kWh → 172s) — so this stays correct across BYD models. If capacity isn't known
+            // yet (cellCount == 0) we skip the override rather than publish a wrong value.
+            if (!Double.isNaN(cellHi) && !Double.isNaN(cellLo)) {
+                int cellCount = 0;
+                try {
+                    com.overdrive.app.abrp.SohEstimator soh =
+                        com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
+                    if (soh != null) {
+                        cellCount = com.overdrive.app.abrp.SohEstimator
+                            .cellCountForCapacity(soh.getNominalCapacityKwh());
+                    }
+                } catch (Throwable ignored) {}
+                if (cellCount > 0) {
+                    b.hvPackVoltage(((cellHi + cellLo) / 2.0) * cellCount);
+                }
+            }
         } catch (Exception e) {
             logger.debug("collectStatistic error: " + e.getMessage());
         }
@@ -1812,19 +1835,21 @@ public class BydDataCollector {
         }
     }
 
-    private void collectStatVoltage(BydVehicleData.Builder b, int featureId, String which) {
+    /** @return the cell voltage in V, or NaN if unavailable/out-of-range. */
+    private double collectStatVoltage(BydVehicleData.Builder b, int featureId, String which) {
         Object val = BydDeviceHelper.callGet(statisticDevice, featureId, Integer.TYPE);
         if (val == null) val = BydDeviceHelper.callGet(statisticDevice, featureId, Integer.class);
-        if (val == null) return;
+        if (val == null) return Double.NaN;
         int raw = BydDeviceHelper.getIntValue(val);
         if (raw == BydFeatureIds.BMS_UNAVAILABLE || raw == BydFeatureIds.INVALID_VALUE
-            || raw == BydFeatureIds.INVALID_VALUE_2 || raw == Integer.MIN_VALUE || raw <= 0) return;
+            || raw == BydFeatureIds.INVALID_VALUE_2 || raw == Integer.MIN_VALUE || raw <= 0) return Double.NaN;
         double volts = raw / 1000.0;
-        if (volts < 1.0 || volts > 5.0) return;
+        if (volts < 1.0 || volts > 5.0) return Double.NaN;
         switch (which) {
             case "high": b.highCellVoltage(volts); break;
             case "low": b.lowCellVoltage(volts); break;
         }
+        return volts;
     }
 
     private void collectCharging(BydVehicleData.Builder b) {
@@ -3886,42 +3911,10 @@ public class BydDataCollector {
             return;
         }
 
-        // Capture HV pack voltage from statistic device event.
-        // BYD CAN bus fires StatisticDevice events at ~10Hz — throttle to 1Hz max.
-        if ("onDataEventChanged".equals(method) && args != null && args.length >= 2) {
-            long now = System.currentTimeMillis();
-            if (now - lastGenericCallbackTime < 1000) return;
-            lastGenericCallbackTime = now;
-
-            try {
-                int eventId = ((Number) args[0]).intValue();
-                Object eventValue = args[1];
-                int iVal = BydDeviceHelper.getIntValue(eventValue);
-                
-                // Event 1151336480: HV pack voltage in decivolts (e.g., 4955 = 495.5V)
-                if (eventId == 1151336480 && iVal > 2000 && iVal < 9000) {
-                    BydVehicleData current = snapshot.get();
-                    if (current != null) {
-                        double volts = iVal / 10.0;
-                        boolean isFirst = Double.isNaN(current.hvPackVoltage);
-                        if (isFirst || Math.abs(current.hvPackVoltage - volts) > 0.5) {
-                            snapshot.set(current.toBuilder().hvPackVoltage(volts).build());
-                            
-                            if (isFirst) {
-                                logger.info("HV pack voltage: " + String.format("%.1f", volts) + "V");
-                                try {
-                                    com.overdrive.app.abrp.SohEstimator soh = 
-                                        com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
-                                    if (soh != null) {
-                                        soh.autoDetectFromPackVoltage(volts, current);
-                                    }
-                                } catch (Exception ignored) {}
-                            }
-                        }
-                    }
-                }
-            } catch (Exception ignored) {}
-        }
+        // HV pack voltage is NOT read from the onDataEventChanged stream anymore.
+        // Event 1151336480 (formerly parsed as pack voltage in decivolts) under-reports on the
+        // Seal 82.5 kWh trim — it tracks only ~149 cells' worth (~494 V vs the true ~570 V).
+        // Pack voltage is now derived from per-cell voltage × series count in collectStatistic().
     }
 
     /**
