@@ -1208,6 +1208,7 @@
     <string name="roadsense_map_search_action">Søg</string>
     <string name="roadsense_map_searching">Søger…</string>
     <string name="roadsense_map_no_results">Ingen steder fundet</string>
+    <string name="roadsense_map_search_network">Kunne ikke nå søgetjenesten. Tjek din forbindelse eller proxy og prøv igen.</string>
     <string name="roadsense_map_pick_destination">Vælg destination</string>
     <string name="roadsense_map_routing">Find rute…</string>
     <string name="roadsense_map_route_failed">Kunne ikke finde en rute. Prøv igen.</string>
