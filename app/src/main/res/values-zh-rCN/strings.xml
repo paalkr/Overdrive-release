@@ -1198,6 +1198,7 @@
     <string name="roadsense_map_search_action">搜索</string>
     <string name="roadsense_map_searching">正在搜索…</string>
     <string name="roadsense_map_no_results">未找到地点</string>
+    <string name="roadsense_map_search_network">无法到达搜索服务。请检查您的连接或代理，然后重试。</string>
     <string name="roadsense_map_pick_destination">选择目标</string>
     <string name="roadsense_map_routing">Finding route…</string>
     <string name="roadsense_map_route_failed">找不到路由。再试一次。</string>
