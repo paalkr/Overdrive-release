@@ -1,9 +1,17 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
 
 val openh264Version = "2.6.0"
+
+// Build-time stamp for the custom debug build's version string. Evaluated at
+// gradle configuration time, so every assembleDebug self-identifies when it was
+// built (e.g. custom-v28.3-20260628-2015). Local-only — never on an upstream branch.
+val customBuildStamp: String = SimpleDateFormat("yyyyMMdd-HHmm").format(Date())
 
 // Auto-download OpenH264 from Cisco's official binary releases
 tasks.register("downloadOpenH264") {
@@ -209,7 +217,7 @@ android {
         minSdk = 25
         targetSdk = 25
         versionCode = 1
-        versionName = "1.0"
+        versionName = "28.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
         // Note: abiFilters removed - using splits.abi instead for size optimization
@@ -276,9 +284,17 @@ android {
         }
         debug {
             isMinifyEnabled = false
-            
-            // Debug builds also check alpha channel for updates
-            buildConfigField("String", "UPDATE_CHANNEL", "\"alpha\"")
+
+            // Custom local build: timestamped versionName so BuildConfig.VERSION_NAME
+            // (and getInstalledVersion = channel + "-v" + VERSION_NAME) reads
+            // custom-v28.3-<ts>. Release stays on the plain "28.3".
+            versionNameSuffix = "-$customBuildStamp"
+
+            // Channel "custom": (1) the staleness guard in getDisplayVersion rejects the
+            // old persisted "alpha-v27.2" label (channel prefix != "custom") so the UI
+            // shows the BuildConfig identity, and (2) the self-updater checks a nonexistent
+            // "custom" GitHub channel, so it never offers official alpha over our changes.
+            buildConfigField("String", "UPDATE_CHANNEL", "\"custom\"")
             buildConfigField("boolean", "LOG_CAPTURE", "true")
             buildConfigField("String", "LOG_UPLOAD_URL", "\"\"")
         }
