@@ -1228,6 +1228,7 @@
     <string name="roadsense_map_search_action">Hledat</string>
     <string name="roadsense_map_searching">Vyhledávání…</string>
     <string name="roadsense_map_no_results">Nebyla nalezena žádná místa</string>
+    <string name="roadsense_map_search_network">Vyhledávací služba se nezdařila. Zkontrolujte připojení nebo proxy a zkuste to znovu.</string>
     <string name="roadsense_map_pick_destination">Vyberte cíl</string>
     <string name="roadsense_map_routing">Hledání trasy…</string>
     <string name="roadsense_map_route_failed">Nelze najít trasu. Zkuste to znovu.</string>
