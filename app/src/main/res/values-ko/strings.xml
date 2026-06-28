@@ -1198,6 +1198,7 @@
     <string name="roadsense_map_search_action">검색</string>
     <string name="roadsense_map_searching">검색 중…</string>
     <string name="roadsense_map_no_results">장소를 찾을 수 없습니다</string>
+    <string name="roadsense_map_search_network">Couldn\'t reach the search service. Check your connection or proxy and try again.</string>
     <string name="roadsense_map_pick_destination">목적지 선택</string>
     <string name="roadsense_map_routing">경로 찾는 중…</string>
     <string name="roadsense_map_route_failed">경로를 찾을 수 없습니다. 다시 시도하세요.</string>
