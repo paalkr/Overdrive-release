@@ -1208,6 +1208,7 @@
     <string name="roadsense_map_search_action">Etsi</string>
     <string name="roadsense_map_searching">Etsitään…</string>
     <string name="roadsense_map_no_results">Paikkoja ei löytynyt</string>
+    <string name="roadsense_map_search_network">Hakupalveluun ei päästy. Tarkista yhteytesi tai välityspalvelin ja yritä uudelleen.</string>
     <string name="roadsense_map_pick_destination">Valitse kohde</string>
     <string name="roadsense_map_routing">Finding route…</string>
     <string name="roadsense_map_route_failed">Reittiä ei löytynyt. Yritä uudelleen.</string>
