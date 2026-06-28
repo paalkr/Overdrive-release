@@ -1208,7 +1208,7 @@
     <string name="roadsense_map_search_action">Zoeken</string>
     <string name="roadsense_map_searching">Searching…</string>
     <string name="roadsense_map_no_results">Geen plaatsen gevonden</string>
-    <string name="roadsense_map_search_network">Kan de zoekservice niet bereiken. Controleer je verbinding of proxy en probeer het opnieuw.</string>
+    <string name="roadsense_map_search_network">Kan de zoekdienst niet bereiken. Controleer je verbinding of proxy en probeer het opnieuw.</string>
     <string name="roadsense_map_pick_destination">Kies bestemming</string>
     <string name="roadsense_map_routing">Route vinden…</string>
     <string name="roadsense_map_route_failed">Kon geen route vinden. Probeer het opnieuw.</string>
