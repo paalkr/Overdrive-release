@@ -143,28 +143,47 @@ public class MqttPublisherService implements MqttCallback {
 
             // --- Pin-to-cellular (per-connection, default off) ---
             // Bind this broker connection's egress to a dedicated cellular Network so it
-            // survives WiFi<->cellular handover. WebSocket transport can't be pinned this way
-            // (Paho's WebSocket module bypasses the SocketFactory). If the cellular Network
-            // isn't up yet, fall through to the default for this attempt and retry on reconnect.
+            // survives WiFi<->cellular handover. A pinned connection must NEVER use WiFi —
+            // if cellular isn't available we ABORT (return false) and let the publish-cycle
+            // backoff retry, rather than falling back to WiFi. WebSocket can't be pinned
+            // (Paho's WS module bypasses the SocketFactory), so it's also refused.
             boolean cellularRouted = false;
             if (config.pinToCellular) {
+                if (isWebSocket) {
+                    lastError = "pinToCellular: WebSocket transport can't be pinned — refusing WiFi";
+                    logger.warn(lastError);
+                    consecutiveFailures++;
+                    try { newClient.close(); } catch (Exception ignored) {}
+                    return false;
+                }
                 com.overdrive.app.monitor.NetworkMonitor.ensureCellularNetworkRequested();
                 android.net.Network cell = com.overdrive.app.monitor.NetworkMonitor.getCellularNetwork();
-                if (cell == null) {
-                    logger.warn("pinToCellular set but no cellular Network yet — using default network this attempt; will retry on reconnect");
-                } else if (isWebSocket) {
-                    logger.warn("pinToCellular not supported for WebSocket transport — using default network");
-                } else {
-                    System.clearProperty("socksProxyHost");
-                    System.clearProperty("socksProxyPort");
-                    if (isSsl) {
-                        options.setSocketFactory(ProxyHelper.getCellularSslSocketFactory(cell, config.trustAllCerts));
-                    } else {
-                        options.setSocketFactory(ProxyHelper.getCellularSocketFactory(cell));
-                    }
-                    cellularRouted = true;
-                    logger.info("MQTT pinned to cellular Network: " + cell);
+                // Brief bounded wait: requestNetwork()'s callback is async and usually lands
+                // within ~1s when the cellular radio is up, so the first attempt can bind
+                // cleanly without a failed cycle. ~3s ceiling so a genuinely cellular-less
+                // moment (no signal/SIM) just defers to the backoff retry below.
+                for (int i = 0; i < 15 && cell == null; i++) {
+                    try { Thread.sleep(200); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    cell = com.overdrive.app.monitor.NetworkMonitor.getCellularNetwork();
                 }
+                if (cell == null) {
+                    // No cellular network. Do NOT fall back to WiFi — abort; the publish-cycle
+                    // backoff re-invokes connect() and it'll bind once cellular returns.
+                    lastError = "pinToCellular: no cellular network available — refusing WiFi; will retry";
+                    logger.warn(lastError);
+                    consecutiveFailures++;
+                    try { newClient.close(); } catch (Exception ignored) {}
+                    return false;
+                }
+                System.clearProperty("socksProxyHost");
+                System.clearProperty("socksProxyPort");
+                if (isSsl) {
+                    options.setSocketFactory(ProxyHelper.getCellularSslSocketFactory(cell, config.trustAllCerts));
+                } else {
+                    options.setSocketFactory(ProxyHelper.getCellularSocketFactory(cell));
+                }
+                cellularRouted = true;
+                logger.info("MQTT pinned to cellular Network: " + cell);
             }
 
             if (!cellularRouted && ProxyHelper.isProxyAvailable()) {
