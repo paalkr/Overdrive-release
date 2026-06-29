@@ -203,6 +203,7 @@ const MQTT = {
         var fs0 = document.getElementById('formFlushOnStateChange'); if (fs0) fs0.checked = true;
         document.getElementById('formAllowControl').checked = false;
         document.getElementById('formRetain').checked = false;
+        document.getElementById('formPinCellular').checked = false;
         document.getElementById('formEnabled').checked = true;
         this.onSlider();
         this.onHaToggle();
@@ -236,6 +237,7 @@ const MQTT = {
         var fsE = document.getElementById('formFlushOnStateChange'); if (fsE) fsE.checked = conn.flushOnStateChange !== false;
         document.getElementById('formAllowControl').checked = conn.allowControl || false;
         document.getElementById('formRetain').checked = conn.retainMessages || false;
+        document.getElementById('formPinCellular').checked = conn.pinToCellular || false;
         document.getElementById('formEnabled').checked = conn.enabled || false;
         this.onSlider();
         this.onHaToggle();
@@ -302,6 +304,7 @@ const MQTT = {
             flushOnStateChange: (function(){ var e=document.getElementById('formFlushOnStateChange'); return e ? e.checked : true; })(),
             allowControl: document.getElementById('formAllowControl').checked,
             retainMessages: document.getElementById('formRetain').checked,
+            pinToCellular: document.getElementById('formPinCellular').checked,
             enabled: document.getElementById('formEnabled').checked
         };
         // Keep the window coherent: max must be >= min.

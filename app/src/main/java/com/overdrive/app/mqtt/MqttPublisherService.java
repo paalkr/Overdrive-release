@@ -141,7 +141,33 @@ public class MqttPublisherService implements MqttCallback {
             boolean isSsl = config.isSsl();
             boolean isWebSocket = brokerUri.startsWith("ws://") || brokerUri.startsWith("wss://");
 
-            if (ProxyHelper.isProxyAvailable()) {
+            // --- Pin-to-cellular (per-connection, default off) ---
+            // Bind this broker connection's egress to a dedicated cellular Network so it
+            // survives WiFi<->cellular handover. WebSocket transport can't be pinned this way
+            // (Paho's WebSocket module bypasses the SocketFactory). If the cellular Network
+            // isn't up yet, fall through to the default for this attempt and retry on reconnect.
+            boolean cellularRouted = false;
+            if (config.pinToCellular) {
+                com.overdrive.app.monitor.NetworkMonitor.ensureCellularNetworkRequested();
+                android.net.Network cell = com.overdrive.app.monitor.NetworkMonitor.getCellularNetwork();
+                if (cell == null) {
+                    logger.warn("pinToCellular set but no cellular Network yet — using default network this attempt; will retry on reconnect");
+                } else if (isWebSocket) {
+                    logger.warn("pinToCellular not supported for WebSocket transport — using default network");
+                } else {
+                    System.clearProperty("socksProxyHost");
+                    System.clearProperty("socksProxyPort");
+                    if (isSsl) {
+                        options.setSocketFactory(ProxyHelper.getCellularSslSocketFactory(cell, config.trustAllCerts));
+                    } else {
+                        options.setSocketFactory(ProxyHelper.getCellularSocketFactory(cell));
+                    }
+                    cellularRouted = true;
+                    logger.info("MQTT pinned to cellular Network: " + cell);
+                }
+            }
+
+            if (!cellularRouted && ProxyHelper.isProxyAvailable()) {
                 if (isWebSocket && isSsl) {
                     // WSS + Proxy: Paho 1.2.0+ has a bug (eclipse/paho.mqtt.java#573) where
                     // WebSocketSecureNetworkModule bypasses the SocketFactory and calls
@@ -171,7 +197,7 @@ public class MqttPublisherService implements MqttCallback {
                     // Plain TCP + Proxy: ProxiedSocketFactory works fine.
                     options.setSocketFactory(ProxyHelper.getMqttSocketFactory());
                 }
-            } else {
+            } else if (!cellularRouted) {
                 // No proxy — clear any leftover system SOCKS properties from a previous
                 // connection attempt where the proxy was active.
                 System.clearProperty("socksProxyHost");
