@@ -543,12 +543,19 @@ public class MqttConnectionManager {
                 if (vd.chargingGunState == 4) payload.put("is_charging", 0); // V2L
             }
 
-            // is_parked
+            // is_parked — gear==P, OR the car is powered off. When ACC is off the gear signal
+            // isn't actively polled and carries forward its last value (e.g. R after backing into
+            // a spot), so gear alone would wrongly report not-parked while the car sits switched
+            // off. A powered-off car is always parked.
             boolean isParked = false;
             if (vd != null && vd.gearMode != BydVehicleData.UNAVAILABLE) {
                 isParked = vd.gearMode == GearMonitor.GEAR_P;
             } else {
                 isParked = gearMonitor.getCurrentGear() == GearMonitor.GEAR_P;
+            }
+            if (!isParked) {
+                try { if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) isParked = true; }
+                catch (Throwable ignored) {}
             }
             payload.put("is_parked", isParked ? 1 : 0);
 
