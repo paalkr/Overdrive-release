@@ -62,6 +62,10 @@ public class MqttPublisherService implements MqttCallback {
     private final TelemetryDiffer differ = new TelemetryDiffer();
     private volatile boolean forceFullResend = false;
     private volatile boolean discoveryAnnounced = false;
+    // Discoverable keys already covered by the announced bundle. Grows as fields appear so a
+    // late-populating field (e.g. hv_pack_v, which needs cells + pack capacity, so it shows up
+    // after the first publish) triggers a re-announce instead of never getting a component.
+    private final java.util.Set<String> announcedKeys = new java.util.HashSet<>();
     private volatile MqttCommandRouter commandRouter;
     private volatile String haVin = null;
     private volatile String haModel = null;
@@ -361,6 +365,11 @@ public class MqttPublisherService implements MqttCallback {
 
         if (config.isHomeAssistant()) {
             if (!ensureConnected()) return false;
+            // Re-announce if a discoverable field has appeared that the last bundle didn't cover
+            // (fields populate at different times; the first publish doesn't have them all yet).
+            if (discoveryAnnounced && !announcedKeys.containsAll(discoverableKeys(snapshot))) {
+                discoveryAnnounced = false;
+            }
             if (!discoveryAnnounced) announceDiscovery(snapshot);
 
             boolean sendAll = first || heartbeat || !config.changeOnly;
@@ -501,7 +510,9 @@ public class MqttPublisherService implements MqttCallback {
                     config.topic, snapshot, config.isControlEnabled());
             if (publishString(topic, bundle, true, 1)) {
                 discoveryAnnounced = true;
-                logger.info("Published HA discovery bundle to " + topic);
+                announcedKeys.addAll(discoverableKeys(snapshot));
+                logger.info("Published HA discovery bundle to " + topic
+                        + " (" + announcedKeys.size() + " keys)");
             }
         } catch (Exception e) {
             logger.warn("HA discovery announce failed: " + e.getMessage());
