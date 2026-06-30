@@ -549,8 +549,11 @@ public class MqttPublisherService implements MqttCallback {
     private void announceDiscovery(JSONObject snapshot) {
         try {
             String topic = HomeAssistantDiscovery.deviceConfigTopic(config.discoveryPrefix, deviceId);
+            // Pass announcedKeys as sticky so a field that's momentarily absent from this snapshot
+            // (e.g. the derived hv_pack_v) isn't dropped from the bundle on a re-announce — that
+            // drop is what left fields Unavailable in HA after a restart.
             String bundle = HomeAssistantDiscovery.buildBundle(deviceId, haVin, haModel, haSwVersion,
-                    config.topic, snapshot, config.isControlEnabled());
+                    config.topic, snapshot, announcedKeys, config.isControlEnabled());
             if (publishString(topic, bundle, true, 1)) {
                 discoveryAnnounced = true;
                 announcedKeys.addAll(discoverableKeys(snapshot));
