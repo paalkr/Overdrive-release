@@ -486,8 +486,16 @@ public class MqttConnectionManager {
                 payload.put("power", 0);
             }
 
-            // speed
-            if (vd != null && !Double.isNaN(vd.speedKmh)) {
+            // speed — the bus speed signal freezes at its last sample when ACC is off
+            // (BydDataCollector drops to a 90s poll and the speed listener stops firing), so a
+            // stale non-zero value would keep publishing after parking and HA would think the car
+            // is still moving. The car is parked when ACC is off, so force 0 — same handling as
+            // power above. GPS stays a driving-only fallback for a momentary NaN bus speed.
+            boolean accOnSpeed = false;
+            try { accOnSpeed = com.overdrive.app.monitor.AccMonitor.isAccOn(); } catch (Throwable ignored) {}
+            if (!accOnSpeed) {
+                payload.put("speed", 0);
+            } else if (vd != null && !Double.isNaN(vd.speedKmh)) {
                 payload.put("speed", vd.speedKmh);
             } else if (gpsMonitor.hasLocation()) {
                 payload.put("speed", gpsMonitor.getSpeed() * 3.6);
