@@ -59,7 +59,8 @@ public final class HomeAssistantDiscovery {
      *                 so PHEV-only / model-specific fields don't create dead entities.
      */
     public static String buildBundle(String deviceId, String vin, String model, String swVersion,
-                                     String baseTopic, JSONObject snapshot, boolean includeControls) {
+                                     String baseTopic, JSONObject snapshot,
+                                     java.util.Set<String> stickyKeys, boolean includeControls) {
         String node = nodeId(deviceId);
         String availabilityTopic = baseTopic + "/availability";
 
@@ -105,6 +106,24 @@ public final class HomeAssistantDiscovery {
                 if (!TelemetryFieldCatalog.isDiscoverable(key)) continue;
                 if (snapshot.opt(key) instanceof JSONArray) continue; // arrays aren't single entities
                 cmps.put(key, component(node, baseTopic, TelemetryFieldCatalog.get(key)));
+            }
+
+            // Sticky keys: a discoverable field that populates intermittently (e.g. hv_pack_v,
+            // derived from cell data + pack capacity) can be ABSENT from this particular snapshot.
+            // The caller's announcedKeys set is monotonic, so once a field has been announced we
+            // keep its component here even when it's momentarily missing. Otherwise a re-announce
+            // fired while it's absent would drop it from the bundle, and the re-announce trigger
+            // (which only fires for keys NOT yet announced) would never re-add it — leaving the
+            // entity orphaned/Unavailable in HA until a full reset (notably after an HA restart).
+            // The component is built from the static catalog (no live value needed), and the
+            // field's retained state already lives on its own state_topic, so HA rebinds it on the
+            // next connect/restart.
+            if (stickyKeys != null) {
+                for (String key : stickyKeys) {
+                    if (cmps.has(key)) continue;
+                    if (!TelemetryFieldCatalog.isDiscoverable(key)) continue;
+                    cmps.put(key, component(node, baseTopic, TelemetryFieldCatalog.get(key)));
+                }
             }
 
             // device_tracker for GPS (attributes carry lat/lon; map dot in HA)
