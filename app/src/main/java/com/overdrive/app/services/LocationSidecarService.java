@@ -59,6 +59,15 @@ public class LocationSidecarService extends Service implements LocationListener 
     private Location lastProcessedLocation = null;
     private long lastProcessedTime = 0;
 
+    // Instrumentation: settle whether the provider's onLocationChanged actually
+    // fires (background-looper delivery has been suspect — GpsMonitor was only
+    // advancing every 4s, the old poll interval) or whether the periodic
+    // getLastKnownLocation poll is the sole feeder. Counts are logged every ~30s
+    // so a single drive shows the real callback rate vs the poll rate.
+    private volatile int providerFixCount = 0;   // real LocationListener callbacks
+    private volatile int pollFixCount = 0;        // fixes injected by the periodic poll
+    private long lastRateLogTime = 0;
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -155,9 +164,13 @@ public class LocationSidecarService extends Service implements LocationListener 
             @Override
             public void run() {
                 sendGpsViaTcp();
-                
-                // If no fresh GPS fix in 30 seconds, request one explicitly
-                // This handles cases where the provider stopped sending updates
+
+                // Poll the provider's last-known fix and process it. Our own 1s
+                // GPS request (requestLocationUpdates GPS_PROVIDER, 1000ms) keeps
+                // the provider PRODUCING fixes at ~1Hz, so its last-known cache is
+                // fresh at ~1Hz even if the onLocationChanged callback isn't
+                // delivering on this background looper — this poll then picks up a
+                // fresh distinct fix each tick.
                 if (permissionGranted && locationManager != null) {
                     try {
                         Location lastGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
@@ -165,7 +178,8 @@ public class LocationSidecarService extends Service implements LocationListener 
                             long fixAge = System.currentTimeMillis() - lastGps.getTime();
                             if (fixAge < 10000) {
                                 // Fresh fix available that we might have missed
-                                onLocationChanged(lastGps);
+                                pollFixCount++;
+                                processFix(lastGps);
                             }
                         }
                     } catch (SecurityException e) {
@@ -174,13 +188,32 @@ public class LocationSidecarService extends Service implements LocationListener 
                         // Ignore
                     }
                 }
-                
-                // Periodic keep-alive / daemon-restart recovery. Kept at 4s
-                // (down from the original 2s for CPU/IPC savings, but well
-                // under RoadSense's 5s fix-staleness cutoff) so that when the
-                // car is truly stationary and the provider emits no callbacks,
-                // GpsMonitor.lastUpdate never ages past the consumer threshold.
-                handler.postDelayed(this, 4000);
+
+                // Log provider-callback vs poll delivery rate every ~30s so one
+                // drive settles which path feeds GpsMonitor.
+                long nowLog = System.currentTimeMillis();
+                if (nowLog - lastRateLogTime >= 30000) {
+                    if (lastRateLogTime != 0) {
+                        long dt = nowLog - lastRateLogTime;
+                        Log.i(TAG, String.format(
+                            "GPS rate over %.0fs: provider callbacks=%d (%.2f Hz), poll fixes=%d (%.2f Hz)",
+                            dt / 1000.0,
+                            providerFixCount, providerFixCount * 1000.0 / dt,
+                            pollFixCount, pollFixCount * 1000.0 / dt));
+                    }
+                    lastRateLogTime = nowLog;
+                    providerFixCount = 0;
+                    pollFixCount = 0;
+                }
+
+                // Periodic keep-alive / poll / daemon-restart recovery. Dropped
+                // from 4000ms -> 1000ms: at 4s this poll was the ONLY thing
+                // advancing GpsMonitor (the provider callback wasn't delivering),
+                // capping GPS at ~0.25Hz across both the MQTT feed AND the internal
+                // trip track. 1s makes GpsMonitor ~1Hz. Still well under RoadSense's
+                // 5s fix-staleness cutoff; CPU/IPC cost of a localhost write + one
+                // file cache per second is negligible (was 2s originally).
+                handler.postDelayed(this, 1000);
             }
         };
         handler.postDelayed(periodicSender, 5000);
@@ -295,8 +328,17 @@ public class LocationSidecarService extends Service implements LocationListener 
 
     @Override
     public void onLocationChanged(Location location) {
+        // Real provider callback (distinct from the periodic poll's re-injection,
+        // which calls processFix directly). Counting here isolates whether the
+        // LocationManager callback is delivering on the background looper at all.
+        providerFixCount++;
+        processFix(location);
+    }
+
+    /** Process a fix from either the provider callback or the periodic poll. */
+    private void processFix(Location location) {
         if (location == null) return;
-        
+
         long now = System.currentTimeMillis();
         float distanceMoved = (lastProcessedLocation != null) ? location.distanceTo(lastProcessedLocation) : Float.MAX_VALUE;
         long timeSinceLastProcess = now - lastProcessedTime;
