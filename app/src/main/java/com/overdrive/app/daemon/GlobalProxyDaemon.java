@@ -146,18 +146,17 @@ public class GlobalProxyDaemon {
      * Enable proxy - start sing-box and set system proxy.
      */
     private static void enableProxy() {
-        log(">>> ENABLING PROXY <<<");
-
+        // [local] Sing-box/VLESS proxy HARD-DISABLED in this custom build (2026-07-01).
+        // Never start sing-box or point the system at it — the proxy isn't needed on the
+        // private SIM and it destabilised the cloudflared tunnel. Actively clear any stale
+        // system http_proxy so nothing is left pointing at a dead 127.0.0.1:8119.
+        log(">>> PROXY DISABLED in this build — not starting sing-box/VLESS <<<");
         try {
-            stopSingbox();
-            createSingboxConfig();
-            startSingbox();
-            setupSystemProxy();
-
-            log("Proxy ENABLED - traffic routed through VLESS");
-        } catch (Exception e) {
-            log("Failed to enable proxy: " + e.getMessage());
-        }
+            execShell("settings delete global http_proxy 2>/dev/null");
+            execShell("settings delete global global_http_proxy_host 2>/dev/null");
+            execShell("settings delete global global_http_proxy_port 2>/dev/null");
+            execShell("settings put global http_proxy :0 2>/dev/null");
+        } catch (Exception ignored) {}
     }
 
     private static void createSingboxConfig() throws IOException {
