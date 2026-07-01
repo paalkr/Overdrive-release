@@ -36,12 +36,26 @@ class SingboxLauncher(
      * Launch sing-box proxy via ADB shell.
      */
     fun launchSingbox(callback: SingboxCallback) {
-        // [local] Sing-box (VLESS-Reality "ISP blocklist bypass") is HARD-DISABLED in this
-        // custom build (2026-07-01). It isn't needed on the private SIM (no destination block),
-        // and it destabilised the cloudflared tunnel via the system http_proxy it sets. Never
-        // launch it, regardless of the daemon toggle. Removing it from the path is the fix.
-        logManager.info(TAG, "Sing-box launch suppressed — disabled in this custom build")
-        callback.onLog("Sing-box is disabled in this build")
+        logManager.info(TAG, "Launching sing-box...")
+        callback.onLog("Setting up sing-box...")
+        
+        // Check if binary is installed
+        adbShellExecutor.execute(
+            command = "test -x $SINGBOX_TMP_PATH && echo yes || echo no",
+            callback = object : AdbShellExecutor.ShellCallback {
+                override fun onSuccess(output: String) {
+                    if (output.trim() == "yes") {
+                        killExistingAndLaunch(callback)
+                    } else {
+                        installSingbox(callback)
+                    }
+                }
+                
+                override fun onError(error: String) {
+                    installSingbox(callback)
+                }
+            }
+        )
     }
     
     private fun installSingbox(callback: SingboxCallback) {
