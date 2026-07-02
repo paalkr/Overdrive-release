@@ -415,6 +415,49 @@ public class CameraDaemon {
     private static java.io.RandomAccessFile lockFile;
     private static java.nio.channels.FileLock fileLock;
 
+    /**
+     * Re-assert secure setting location_mode=3 whenever the system flips it
+     * off (the head unit sets 0 on car-off/standby). Daemon-only: guarded on
+     * uid 2000 (shell), the uid this daemon always runs as and the one allowed
+     * to write secure settings — a defensive no-op anywhere else. Checks every
+     * 60s; logs only on an actual re-assert, not every tick.
+     */
+    private static void startLocationModeKeeper() {
+        if (android.os.Process.myUid() != 2000) {
+            log("LocationModeKeeper: not shell uid, keeper disabled");
+            return;
+        }
+        Thread keeper = new Thread(() -> {
+            while (true) {
+                try {
+                    Process p = Runtime.getRuntime().exec(
+                            new String[]{"settings", "get", "secure", "location_mode"});
+                    String mode;
+                    try (java.io.BufferedReader r = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(p.getInputStream()))) {
+                        mode = r.readLine();
+                    }
+                    p.waitFor();
+                    if (mode != null && !"3".equals(mode.trim())) {
+                        Runtime.getRuntime().exec(
+                                new String[]{"settings", "put", "secure", "location_mode", "3"})
+                                .waitFor();
+                        log("LocationModeKeeper: re-asserted location_mode=3 (was " + mode.trim() + ")");
+                    }
+                } catch (Throwable t) {
+                    // settings binary missing/denied — stay quiet, retry next tick
+                }
+                try {
+                    Thread.sleep(60_000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+        }, "location-mode-keeper");
+        keeper.setDaemon(true);
+        keeper.start();
+    }
+
     public static void main(String[] args) {
         initFileLogging();
 
@@ -463,6 +506,18 @@ public class CameraDaemon {
 
         // Grant all manifest permissions via shell (supplements PermissionBypassContext)
         PermissionGranter.grantAllPermissions(APP_PACKAGE_NAME());
+
+        // Keep Android location enabled so GPS keeps tracking while parked.
+        // The head unit re-asserts location_mode=0 on car-off/standby
+        // transitions, which powers the GNSS chip down: every location
+        // consumer (LocationSidecarService, even the factory nav's
+        // "initializing" wait) then eats a cold time-to-first-fix at the next
+        // drive, and trip-start positions are missing or late. This daemon
+        // runs as shell (uid 2000), which may write secure settings, so it
+        // re-asserts location_mode=3 whenever the system flips it off. The
+        // power cost of continuous GNSS tracking is negligible next to the
+        // surveillance pipeline this daemon already runs.
+        startLocationModeKeeper();
 
         // Global exception handler - NEVER let the daemon die from uncaught exceptions
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {

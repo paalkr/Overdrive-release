@@ -19,10 +19,24 @@ public class TelemetrySample {
     public final double lat;
     public final double lon;
     public final double altitude;
+    // The GPS fix's OWN timestamp (Location.getTime(), epoch ms); 0 if unknown.
+    // timestampMs above is the SAMPLE time — the position in this sample is
+    // typically ~1-4s older than that (GNSS latency on this HAL), and consumers
+    // aligning the track against wall-clock truth (video sync) need the real
+    // fix time per point.
+    public final long gpsFixTimeMs;
 
     public TelemetrySample(long timestampMs, int speedKmh, int accelPedalPercent,
                            int brakePedalPercent, boolean brakePedalPressed,
                            int gearMode, double lat, double lon, double altitude) {
+        this(timestampMs, speedKmh, accelPedalPercent, brakePedalPercent,
+                brakePedalPressed, gearMode, lat, lon, altitude, 0);
+    }
+
+    public TelemetrySample(long timestampMs, int speedKmh, int accelPedalPercent,
+                           int brakePedalPercent, boolean brakePedalPressed,
+                           int gearMode, double lat, double lon, double altitude,
+                           long gpsFixTimeMs) {
         this.timestampMs = timestampMs;
         this.speedKmh = speedKmh;
         this.accelPedalPercent = accelPedalPercent;
@@ -32,11 +46,12 @@ public class TelemetrySample {
         this.lat = lat;
         this.lon = lon;
         this.altitude = altitude;
+        this.gpsFixTimeMs = gpsFixTimeMs;
     }
 
     /**
      * Serialize to JSON with compact keys for storage.
-     * Keys: t, s, a, b, bp, g, la, lo, al
+     * Keys: t, s, a, b, bp, g, la, lo, al, gt
      */
     public JSONObject toJson() {
         JSONObject json = new JSONObject();
@@ -50,6 +65,7 @@ public class TelemetrySample {
             json.put("la", lat);
             json.put("lo", lon);
             json.put("al", altitude);
+            if (gpsFixTimeMs > 0) json.put("gt", gpsFixTimeMs);
         } catch (Exception e) {
             // JSONObject.put only throws on null key, which won't happen here
         }
@@ -69,7 +85,8 @@ public class TelemetrySample {
                 json.optInt("g", 1),
                 json.optDouble("la", 0.0),
                 json.optDouble("lo", 0.0),
-                json.optDouble("al", 0.0)
+                json.optDouble("al", 0.0),
+                json.optLong("gt", 0)
         );
     }
 }

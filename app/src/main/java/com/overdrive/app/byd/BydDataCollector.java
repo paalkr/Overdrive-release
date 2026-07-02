@@ -823,6 +823,24 @@ public class BydDataCollector {
             }
         }
 
+        // ACC just transitioned ON: force an immediate FULL collection before the
+        // scheduler restarts. The scheduler's delay-0 collectAll() below is not
+        // enough on this edge: it's gated by the 5s core-collect throttle (a 90s
+        // parked poll that fired within the preceding 5s makes it a no-op, pushing
+        // the first fresh read to +5s) and it reads speed/gear through the accIsOn
+        // skip logic. collectAllFull() bypasses the throttle and reads everything
+        // unconditionally, so consumers (MQTT state-change flush, trip start) get
+        // fresh bus values within this call instead of 7-10s-stale parked ones.
+        // The parked cadence itself stays 90s — this is wake speed, not idle rate.
+        if (isOn && !wasOn) {
+            try {
+                collectAllFull();
+                logger.info("ACC ON: immediate full collection (wake)");
+            } catch (Throwable t) {
+                logger.debug("ACC-on wake collection failed: " + t.getMessage());
+            }
+        }
+
         // Restart poll scheduler at the appropriate rate
         if (pollScheduler != null && !pollScheduler.isShutdown()) {
             pollScheduler.shutdownNow();

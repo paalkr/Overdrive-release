@@ -52,6 +52,12 @@ public class LocationSidecarService extends Service implements LocationListener 
     private volatile float heading = 0.0f;
     private volatile float accuracy = 0.0f;
     private volatile double altitude = 0.0;
+    // The fix's OWN timestamp (Location.getTime(), epoch ms) — distinct from
+    // the send time. GNSS fixes are already ~0.7s old on delivery and several
+    // seconds old through turns on this HAL, so downstream consumers (video
+    // sync in particular) need the true fix time to correct per-point instead
+    // of guessing a constant lag.
+    private volatile long fixTimeMs = 0;
     private boolean permissionGranted = false;
 
     // SOTA: Throttling fields to prevent IPC/Disk spam.
@@ -360,7 +366,7 @@ public class LocationSidecarService extends Service implements LocationListener 
         float distanceMoved = (lastProcessedLocation != null) ? location.distanceTo(lastProcessedLocation) : Float.MAX_VALUE;
         long timeSinceLastProcess = now - lastProcessedTime;
 
-        // Update volatiles immediately so the periodic sender (and any other 
+        // Update volatiles immediately so the periodic sender (and any other
         // internal consumer) has access to the absolutely latest fix.
         latitude = location.getLatitude();
         longitude = location.getLongitude();
@@ -368,6 +374,7 @@ public class LocationSidecarService extends Service implements LocationListener 
         heading = location.hasBearing() ? location.getBearing() : 0.0f;
         accuracy = location.hasAccuracy() ? location.getAccuracy() : 0.0f;
         altitude = location.hasAltitude() ? location.getAltitude() : 0.0;
+        fixTimeMs = location.getTime();
         
         // Throttle Log, IPC and Disk I/O — but keep the distinct-fix rate as
         // high as the provider delivers (GPS is requested at 1s/0m) so
@@ -510,6 +517,10 @@ public class LocationSidecarService extends Service implements LocationListener 
             json.put("accuracy", accuracy);
             json.put("altitude", altitude);
             json.put("time", System.currentTimeMillis());
+            // The fix's own timestamp — "time" above is the SEND time and keeps
+            // feeding GpsMonitor.lastUpdate (staleness checks); fix_time is the
+            // per-point truth consumers use to correct GNSS latency.
+            json.put("fix_time", fixTimeMs);
         } catch (Exception e) {
             return;
         }

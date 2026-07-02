@@ -42,6 +42,12 @@ public class GpsMonitor {
     private volatile float accuracy = 0.0f;
     private volatile double altitude = 0.0;
     private volatile long lastUpdate = 0;
+    // The current fix's OWN timestamp (Location.getTime(), epoch ms) as shipped
+    // by the sidecar. Distinct from lastUpdate (the IPC send time, which feeds
+    // staleness checks): GNSS fixes arrive already ~0.7s old and several
+    // seconds old through turns on this HAL, so consumers that need wall-clock
+    // truth per position (video sync, trip alignment) read this instead.
+    private volatile long fixTime = 0;
     private volatile boolean isRunning = false;
     private volatile boolean loadedFromCache = false;
     private volatile long lastLoggedAt = 0;
@@ -82,11 +88,15 @@ public class GpsMonitor {
      * Called by SurveillanceIpcServer when GPS update arrives via IPC.
      */
     public void updateFromIpc(double lat, double lng, float speed, float heading, float accuracy, long time, double altitude) {
+        updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, time);
+    }
+
+    public void updateFromIpc(double lat, double lng, float speed, float heading, float accuracy, long time, double altitude, long fixTime) {
         // Reject invalid coordinates (0,0 is in the ocean, not a real location)
         if (lat == 0.0 && lng == 0.0) {
             return;
         }
-        
+
         this.latitude = lat;
         this.longitude = lng;
         this.speed = speed;
@@ -94,6 +104,7 @@ public class GpsMonitor {
         this.accuracy = accuracy;
         this.altitude = altitude;
         this.lastUpdate = time;
+        this.fixTime = fixTime > 0 ? fixTime : time;
         this.loadedFromCache = false; // We have live data now
 
         // Persist to cache file
@@ -242,6 +253,8 @@ public class GpsMonitor {
     public float getAccuracy() { return accuracy; }
     public double getAltitude() { return altitude; }
     public long getLastUpdate() { return lastUpdate; }
+    /** The current fix's own timestamp (Location.getTime(), epoch ms); 0 if unknown. */
+    public long getFixTime() { return fixTime; }
     public String getProvider() { return "sidecar"; }
     public boolean isMoving() { return speed > 1.0f; }
 

@@ -1557,10 +1557,13 @@ public class SurveillanceIpcServer implements Runnable {
             float accuracy = (float) request.optDouble("accuracy", 0.0);
             double altitude = request.optDouble("altitude", 0.0);
             long time = request.optLong("time", System.currentTimeMillis());
-            
+            // The fix's own timestamp (Location.getTime()); falls back to send
+            // time for older sidecars that don't ship it.
+            long fixTime = request.optLong("fix_time", time);
+
             // Directly update GpsMonitor
             com.overdrive.app.monitor.GpsMonitor.getInstance()
-                .updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude);
+                .updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, fixTime);
             
         } catch (Exception e) {
             logger.error("Failed to update GPS", e);

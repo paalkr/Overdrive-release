@@ -311,13 +311,14 @@ public class TripTelemetryRecorder {
             double lat = gps.getLatitude();
             double lon = gps.getLongitude();
             double altitude = gps.getAltitude();
+            long gpsFixTime = gps.getFixTime();
 
             // Read gear from GearMonitor
             int gearMode = GearMonitor.getInstance().getCurrentGear();
 
             TelemetrySample sample = new TelemetrySample(
                     now, speedKmh, accelPedal, brakePedal,
-                    brakePedalPressed, gearMode, lat, lon, altitude);
+                    brakePedalPressed, gearMode, lat, lon, altitude, gpsFixTime);
 
             // Track GPS distance (haversine) and coverage stats.
             sampleCountTotal++;

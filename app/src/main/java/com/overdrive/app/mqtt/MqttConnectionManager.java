@@ -71,6 +71,10 @@ public class MqttConnectionManager {
     // Telemetry cache — prevents multiple MQTT threads from hammering BYD hardware concurrently.
     // Poll the car once, cache the result, let all publishers grab the cached JSON.
     private volatile JSONObject lastCachedTelemetry = null;
+    // ACC state at the previous collectTelemetry() call — detects the off→on
+    // edge to invalidate the cache (see collectTelemetry). Starts true so a
+    // daemon restart while driving doesn't spuriously invalidate.
+    private volatile boolean prevAccOnForCache = true;
     private volatile long lastCollectionTimeMs = 0;
     private static final long TELEMETRY_CACHE_TTL_MS = 2000; // 2 seconds
 
@@ -452,6 +456,11 @@ public class MqttConnectionManager {
                 if (alt != 0) copy.put("elevation", alt);
                 float heading = gpsMonitor.getHeading();
                 if (heading > 0) copy.put("heading", heading);
+                // Keep the fix timestamp in lockstep with the refreshed position —
+                // a stale gps_utc on fresh coordinates would mislead consumers
+                // that correct per-point (video sync).
+                long fixTime = gpsMonitor.getFixTime();
+                if (fixTime > 0) copy.put("gps_utc", fixTime);
             }
             return copy;
         } catch (Exception e) {
@@ -465,6 +474,18 @@ public class MqttConnectionManager {
      */
     private synchronized JSONObject collectTelemetry() {
         long now = System.currentTimeMillis();
+
+        // On the ACC off→on edge, drop the cached snapshot: it was collected while parked and
+        // carries pre-drive values. The state-change flush (MqttPublisherService) re-SENDS all
+        // keys on this edge, but re-sending a parked snapshot just delivers stale data promptly —
+        // the collect itself must be fresh. (The reverse edge doesn't need this: the parked
+        // publish cadence gives the cache no chance to matter.)
+        boolean accNowForCache = false;
+        try { accNowForCache = com.overdrive.app.monitor.AccMonitor.isAccOn(); } catch (Throwable ignored) {}
+        if (accNowForCache && !prevAccOnForCache) {
+            lastCachedTelemetry = null;
+        }
+        prevAccOnForCache = accNowForCache;
 
         // If we collected data less than 2 seconds ago, return the cached copy immediately.
         // This protects the BYD hardware from being spammed by multiple MQTT threads.
@@ -536,10 +557,12 @@ public class MqttConnectionManager {
                 payload.put("speed", gpsMonitor.getSpeed() * 3.6);
             }
 
-            // lat, lon
+            // lat, lon (+ the fix's own timestamp, epoch ms — see withLiveGps)
             if (gpsMonitor.hasLocation()) {
                 payload.put("lat", gpsMonitor.getLatitude());
                 payload.put("lon", gpsMonitor.getLongitude());
+                long fixTime = gpsMonitor.getFixTime();
+                if (fixTime > 0) payload.put("gps_utc", fixTime);
             }
 
             // is_charging — BMS state primary, with gun-connected + power-flowing
