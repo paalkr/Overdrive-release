@@ -485,13 +485,21 @@ public class HardwareEventRecorderGpu {
         // is just lastFramePtsUs (since firstFramePtsUs == 0).
         if (firstFramePtsUs < 0) {
             firstFramePtsUs = rebasedPts;
-            // True wall-clock of the first frame actually written to the muxer,
-            // keyed by the final .mp4 path for the sidecar writer. The cam_
-            // filename timestamp is stamped ~7-8s earlier at file-create; this
-            // is the real segment start. Fires once per segment (firstFramePtsUs
-            // resets to -1 on rotation) so every segment gets its own value.
+            // True CAPTURE wall-clock of this first frame, for the sidecar's
+            // first_frame_utc. This frame comes from the pre-record ring buffer
+            // (flushed oldest-first), so it was captured 5-10s BEFORE now —
+            // sampling System.currentTimeMillis() here over-stamps by the buffer
+            // depth. Instead convert the frame's own sensor PTS (absolutePts,
+            // pre-rebase) to wall-clock via the live capture-clock anchor that
+            // GpuMosaicRecorder records at compositing time. Falls back to now()
+            // only if no anchor exists yet (shouldn't happen once frames flow).
             try {
-                com.overdrive.app.geo.FirstFrameRegistry.put(outputPath, System.currentTimeMillis());
+                long capMs = com.overdrive.app.geo.CaptureClockAnchor
+                        .wallClockForPtsNs(absolutePts * 1000L);
+                long stampMs = capMs > 0 ? capMs : System.currentTimeMillis();
+                logger.info("first_frame_utc " + stampMs + " (buffer-correction "
+                        + (System.currentTimeMillis() - stampMs) + "ms) for " + outputPath);
+                com.overdrive.app.geo.FirstFrameRegistry.put(outputPath, stampMs);
             } catch (Throwable ignored) {}
         }
         lastFramePtsUs = rebasedPts;
