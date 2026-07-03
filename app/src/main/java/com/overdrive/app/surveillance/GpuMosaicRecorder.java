@@ -969,14 +969,6 @@ public class GpuMosaicRecorder {
         }
         lastSwappedPtsNs = stampedPtsNs;
 
-        // Live capture-clock anchor: this draw is happening ~now (live frame,
-        // before it enters the pre-record ring buffer), and stampedPtsNs is the
-        // exact value the encoder will emit as this frame's PTS. Recording it
-        // pairs the sensor-clock with wall-clock so the recorder can recover the
-        // TRUE capture wall-clock of any later (buffered) frame — used for
-        // first_frame_utc. See CaptureClockAnchor.
-        com.overdrive.app.geo.CaptureClockAnchor.mark(System.currentTimeMillis(), stampedPtsNs);
-
         try {
             eglCore.swapBuffersWithTimestamp(encoderSurface, stampedPtsNs);
             consecutiveSurfaceErrors = 0;  // Reset on success
