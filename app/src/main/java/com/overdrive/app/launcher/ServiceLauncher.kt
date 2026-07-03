@@ -209,9 +209,13 @@ class ServiceLauncher(
             "appops set $packageName WAKE_LOCK allow 2>/dev/null",
             // Method 4: Disable battery optimization
             "dumpsys deviceidle whitelist +$packageName 2>/dev/null",
-            // Method 5: BYD Start Control whitelist
-            "settings put global ssc_whitelist '$packageName' 2>/dev/null",
-            "settings put secure ssc_whitelist '$packageName' 2>/dev/null",
+            // Method 5: BYD Start Control whitelist — APPEND (merge), never
+            // overwrite. The old `settings put ... '$packageName'` clobbered the
+            // whole list to just OverDrive, wiping any co-installed app (e.g. the
+            // standalone head-unit keep-alive) that had added itself. Read
+            // current, add ourselves only if absent, preserve the rest.
+            "CUR=\$(settings get global ssc_whitelist 2>/dev/null); [ \"\$CUR\" = null ] && CUR=; case \",\$CUR,\" in *,$packageName,*) ;; *) settings put global ssc_whitelist \"\${CUR:+\$CUR,}$packageName\" 2>/dev/null;; esac",
+            "CUR=\$(settings get secure ssc_whitelist 2>/dev/null); [ \"\$CUR\" = null ] && CUR=; case \",\$CUR,\" in *,$packageName,*) ;; *) settings put secure ssc_whitelist \"\${CUR:+\$CUR,}$packageName\" 2>/dev/null;; esac",
             // Method 6: BYD app startup manager
             "content call --uri content://com.byd.appstartup/whitelist --method add --arg '$packageName' 2>/dev/null",
             "cmd appops set $packageName AUTO_START allow 2>/dev/null",
