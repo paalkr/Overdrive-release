@@ -114,7 +114,7 @@ public final class RecordingsIndex {
     // existing on-disk DBs migrate forward without a wipe.
     //   v1 → v2: added the `storage` column (INTERNAL / SD_CARD / USB), so the
     //            recordings library can filter by physical volume.
-    private static final int SCHEMA_VERSION = 3;
+    private static final int SCHEMA_VERSION = 2;
 
     // Singleton — one index per daemon process.
     private static volatile RecordingsIndex INSTANCE;
@@ -264,12 +264,7 @@ public final class RecordingsIndex {
                 // written before v2 (the storage filter treats NULL via the
                 // path-derivation fallback in rowToJson). Appended LAST so the
                 // upsert MERGE's positional VALUES list stays append-only.
-                "  storage         VARCHAR(16)," +
-                // v3: true first-encoded-frame wall-clock (epoch ms) from the
-                // recorder sidecar, distinct from ts_ms (parsed from the
-                // filename, ~7-8s before the first frame). 0/NULL when absent.
-                // Appended LAST — keep the positional VALUES list append-only.
-                "  first_frame_utc BIGINT" +
+                "  storage         VARCHAR(16)" +
                 ")"
             );
 
@@ -282,11 +277,6 @@ public final class RecordingsIndex {
             // from the path when the column is NULL, so the UI never shows a
             // blank badge for a legacy row.
             stmt.execute("ALTER TABLE recordings ADD COLUMN IF NOT EXISTS storage VARCHAR(16)");
-
-            // v2 → v3 migration: true first-frame wall-clock. Additive, so safe
-            // to run unconditionally; legacy rows get NULL and rowToJson simply
-            // omits the field until the clip's sidecar is re-read.
-            stmt.execute("ALTER TABLE recordings ADD COLUMN IF NOT EXISTS first_frame_utc BIGINT");
 
             // Indexes — covering most common access patterns.
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_ts ON recordings(ts_ms DESC)");
@@ -354,7 +344,7 @@ public final class RecordingsIndex {
         if (!initialized || row == null) return false;
         String sql =
             "MERGE INTO recordings KEY(filename) VALUES (" +
-            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setString(1, row.filename);
             ps.setString(2, row.absPath);
@@ -382,7 +372,6 @@ public final class RecordingsIndex {
             setNullableDouble(ps, 24, row.startLng);
             ps.setString(25, row.ymd);
             setNullableString(ps, 26, row.storage);
-            ps.setLong(27, row.firstFrameUtc);
             ps.executeUpdate();
             return true;
         } catch (Exception e) {
@@ -1342,7 +1331,6 @@ public final class RecordingsIndex {
                 }
                 JSONObject side = new JSONObject(sb.toString());
                 r.schemaVersion = side.optInt("version", 2);
-                r.firstFrameUtc = side.optLong("first_frame_utc", 0);
                 JSONObject stats = side.optJSONObject("stats");
                 if (stats != null) {
                     r.peakSeverity = stats.optString("peakSeverity", null);
@@ -1442,11 +1430,6 @@ public final class RecordingsIndex {
         rec.put("type", rs.getString("type"));
         rec.put("cameraId", rs.getInt("camera_id"));
         rec.put("timestamp", ts);
-        // True first-frame wall-clock (epoch ms) when the sidecar carried it —
-        // the accurate segment start, vs `timestamp` which is filename-derived
-        // (~7-8s early). Omitted when absent so consumers fall back to timestamp.
-        long ffUtc = rs.getLong("first_frame_utc");
-        if (ffUtc > 0) rec.put("first_frame_utc", ffUtc);
         long size = rs.getLong("size_bytes");
         rec.put("size", size);
         rec.put("sizeFormatted", formatSize(size));
@@ -1601,7 +1584,6 @@ public final class RecordingsIndex {
         Double startLng;
         String ymd;
         String storage;   // "INTERNAL" / "SD_CARD" / "USB" / null
-        long firstFrameUtc;  // epoch ms of first encoded frame; 0 = unknown
     }
 
     private static final class DirEntry {

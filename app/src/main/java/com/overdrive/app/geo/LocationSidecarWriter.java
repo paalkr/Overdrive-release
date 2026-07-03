@@ -131,8 +131,6 @@ public final class LocationSidecarWriter {
                     JSONObject layoutOnly = new JSONObject();
                     layoutOnly.put("version", 3);
                     layoutOnly.put("layout", layout);
-                    long ffUtc = FirstFrameRegistry.take(mp4File.getAbsolutePath());
-                    if (ffUtc > 0) layoutOnly.put("first_frame_utc", ffUtc);
                     writeJsonAtomic(mp4File, layoutOnly);
                     try {
                         com.overdrive.app.server.RecordingsIndex.getInstance().upsert(mp4File);
@@ -148,12 +146,6 @@ public final class LocationSidecarWriter {
             JSONObject root = new JSONObject();
             root.put("version", 3);
             if (dashcam) root.put("layout", layout);
-            // True first-encoded-frame wall-clock (epoch ms), from the recorder
-            // via FirstFrameRegistry — the real segment start, unlike the
-            // filename timestamp. Consumers (HA trip/video sync) use it to align
-            // video against the track without a guessed constant offset.
-            long ffUtc = FirstFrameRegistry.take(mp4File.getAbsolutePath());
-            if (ffUtc > 0) root.put("first_frame_utc", ffUtc);
             // durationMs unknown to this writer — the recorder owns it.
             // Readers tolerate absence; if a sentry reader tries
             // durationMs/0 they'll just get the default.

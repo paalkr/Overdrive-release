@@ -483,17 +483,7 @@ public class HardwareEventRecorderGpu {
         // Track REBASED PTS for duration computation. The close path uses
         // (lastFramePtsUs - firstFramePtsUs) which on a rebased timeline
         // is just lastFramePtsUs (since firstFramePtsUs == 0).
-        if (firstFramePtsUs < 0) {
-            firstFramePtsUs = rebasedPts;
-            // True wall-clock of the first frame actually written to the muxer,
-            // keyed by the final .mp4 path for the sidecar writer. The cam_
-            // filename timestamp is stamped ~7-8s earlier at file-create; this
-            // is the real segment start. Fires once per segment (firstFramePtsUs
-            // resets to -1 on rotation) so every segment gets its own value.
-            try {
-                com.overdrive.app.geo.FirstFrameRegistry.put(outputPath, System.currentTimeMillis());
-            } catch (Throwable ignored) {}
-        }
+        if (firstFramePtsUs < 0) firstFramePtsUs = rebasedPts;
         lastFramePtsUs = rebasedPts;
         return true;
     }
