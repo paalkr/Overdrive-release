@@ -175,6 +175,17 @@ public class MqttPublisherService implements MqttCallback {
                     try { newClient.close(); } catch (Exception ignored) {}
                     return false;
                 }
+                if (!com.overdrive.app.monitor.NetworkMonitor.isCellularValidated()) {
+                    // Cellular is present but has NO validated internet (typical case: an
+                    // IWLAN bearer whose carrier tunnel is down — observed 2026-07-04).
+                    // Binding would spin on a dead socket with an empty lastError. Treat
+                    // as no-cellular: abort with a named reason, backoff-retry.
+                    lastError = "pinToCellular: cellular present but not validated (no internet on bearer) — refusing WiFi; will retry";
+                    logger.warn(lastError);
+                    consecutiveFailures++;
+                    try { newClient.close(); } catch (Exception ignored) {}
+                    return false;
+                }
                 System.clearProperty("socksProxyHost");
                 System.clearProperty("socksProxyPort");
                 if (isSsl) {

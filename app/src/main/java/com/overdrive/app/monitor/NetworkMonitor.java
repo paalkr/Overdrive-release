@@ -103,6 +103,29 @@ public class NetworkMonitor {
     }
 
     /**
+     * Whether the dedicated cellular Network currently has VALIDATED internet.
+     * "Available" is not enough: an IWLAN bearer can be CONNECTED with dead
+     * internet (observed 2026-07-04: lastValidated=false while parked on home
+     * WiFi — a pinned MQTT socket bound to it and span on connect forever).
+     * Callers should treat available-but-unvalidated as no-cellular and retry.
+     */
+    public static boolean isCellularValidated() {
+        Network cell = cellularNetwork;
+        if (cell == null || appContext == null) return false;
+        try {
+            ConnectivityManager cm = (ConnectivityManager)
+                    appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            NetworkCapabilities caps = cm.getNetworkCapabilities(cell);
+            return caps != null
+                    && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+        } catch (Throwable t) {
+            CameraDaemon.log("NetworkMonitor: validated check failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * Refresh network state. Tries Android APIs first, falls back to shell.
      */
     public static void refresh() {
