@@ -3,8 +3,12 @@ package com.overdrive.app.navmap
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.PointF
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.View
@@ -14,6 +18,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.doOnLayout
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
@@ -116,6 +121,24 @@ open class RoadSenseMapActivity : AppCompatActivity() {
 
     // --- Navigation (route search + guidance) state ---
     private var routeSource: GeoJsonSource? = null
+    // Handles to the two route LineLayers (casing + main) so the per-frame traveled-route
+    // trim can update their line-gradient paint property without a getLayerAs lookup each
+    // frame. Re-captured on every onStyleLoaded (theme reload recreates the layers),
+    // nulled in onDestroy. See applyRouteTrim.
+    private var routeMainLayer: LineLayer? = null
+    private var routeCasingLayer: LineLayer? = null
+    // Traveled-route trim state (per Activity instance — head unit + cluster each run
+    // their own guidance + render tick). lastRouteProgress = monotonic clamp accumulator
+    // (the trim boundary never walks backward on a GPS wobble / brief off-route, so the
+    // traveled part never re-appears); lastAppliedProgress = paint dead-band so a parked /
+    // sub-metre-creeping car emits no gradient writes. Both reset at every new-route site.
+    private var lastRouteProgress: Float = 0f
+    private var lastAppliedProgress: Float = -1f
+    // Route theme colors (m3 ints) captured in onStyleLoaded — reused to rebuild the trim
+    // gradient each frame and re-applied on a day/night flip so the un-trimmed remainder
+    // keeps the right color (the gradient program ignores the static lineColor recolor).
+    private var routeMainColor: Int = 0
+    private var routeCasingColor: Int = 0
     private val guidance = NavGuidanceEngine()
     private var navVoice: NavVoice? = null
     @Volatile private var navigating = false
@@ -227,6 +250,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      */
     private var clusterMode = false
 
+
     // ── Motion smoothing (dead-reckoning) ───────────────────────────────────────
     // The 1s guidance tick is the TRUTH feeder (pulls a fix → estimator + engine);
     // the ~12fps render tick GLIDES the puck + camera from the dead-reckoned estimate
@@ -246,6 +270,87 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      *  smooth animated map is rendered only ONCE, on the cluster. Cluster instance leaves
      *  this false (it IS the live view). Polled off the looper — see headUnitProjectionPoll. */
     @Volatile private var projectionActive = false
+
+    // ── (C) Gyro yaw-rate fusion for SOTA crisp-turn heading ─────────────────────
+    // The puck math (VehicleMotionEstimator) runs in THIS (app) process, and so does
+    // the RoadSense IMU sidecar — but that one pumps samples OUT to the daemon for
+    // hazard detection. For the puck we tap the gyro DIRECTLY here (no daemon round
+    // trip): a lightweight SensorEventListener on the REAL "-iner" gyro (via ImuSource,
+    // never getDefaultSensor → that returns a frozen STUB on this head unit, F-001/3),
+    // plus a local GravityFrame to project the raw gyro vector onto measured gravity so
+    // we get the true SIGNED yaw-rate about vertical (the 9.2°-tilted mount means raw
+    // gz is not "up"; alongGravity tilt-corrects it — same technique the daemon's
+    // hazard path uses). The estimator fuses this complementary-style and only trusts
+    // it once it agrees with GPS heading, so a missing/stub/wrong-axis gyro silently
+    // degrades to today's GPS-only path. All sensor work runs on a background thread;
+    // it only calls into the estimator (its onGyroYaw is @Volatile-safe).
+    private var gyroSensorManager: android.hardware.SensorManager? = null
+    private var gyroSensor: android.hardware.Sensor? = null
+    private var accelSensor: android.hardware.Sensor? = null
+    private var sensorThread: android.os.HandlerThread? = null
+    private var sensorHandler: android.os.Handler? = null
+    /** Local gravity estimator for tilt-corrected yaw isolation (app-side copy; the
+     *  daemon has its own for hazard detection). Touched only on the sensor thread. */
+    private val puckGravity = com.overdrive.app.roadsense.detect.GravityFrame()
+    private val gyroListener = object : android.hardware.SensorEventListener {
+        override fun onSensorChanged(event: android.hardware.SensorEvent) {
+            when (event.sensor.type) {
+                android.hardware.Sensor.TYPE_ACCELEROMETER ->
+                    // Feed the gravity estimate so alongGravity() can isolate true yaw.
+                    puckGravity.update(event.values[0], event.values[1], event.values[2])
+                android.hardware.Sensor.TYPE_GYROSCOPE -> {
+                    // Signed yaw rate about TRUE vertical (rad/s), tilt-corrected.
+                    val yawRps = puckGravity.alongGravity(
+                        event.values[0], event.values[1], event.values[2]
+                    ).toDouble()
+                    val tsMs = android.os.SystemClock.elapsedRealtime()
+                    motionEstimator.onGyroYaw(yawRps, tsMs)
+                }
+            }
+        }
+        override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) {}
+    }
+
+    /** Start the app-side gyro tap (idempotent). No-op (stays GPS-only) when the trim
+     *  has no real "-iner" gyro. Registers on a background thread so 50 Hz sensor
+     *  callbacks never touch the UI looper. */
+    private fun startGyroFusion() {
+        if (gyroSensorManager != null) return   // already running
+        val sm = getSystemService(android.content.Context.SENSOR_SERVICE)
+            as? android.hardware.SensorManager ?: return
+        val resolved = com.overdrive.app.roadsense.detect.ImuSource.resolve(sm)
+        // Need the REAL inertial gyro; without it, leave the estimator on GPS-only.
+        if (resolved.gyroscope == null || !resolved.gyroIsInertial) return
+        val t = android.os.HandlerThread("puck-gyro", android.os.Process.THREAD_PRIORITY_DEFAULT)
+        t.start()
+        sensorThread = t
+        sensorHandler = android.os.Handler(t.looper)
+        gyroSensorManager = sm
+        gyroSensor = resolved.gyroscope
+        // Only feed the gravity frame from the REAL "-iner" accel. A stub accel emits a
+        // frozen, mostly-horizontal vector (F-001), which would make alongGravity() project
+        // the gyro onto a bogus "vertical" and corrupt the yaw — and the health latch would
+        // then just never trust the gyro (silent GPS-only, but fusion wasted on a doomed
+        // projection even though a REAL gyro exists). With no accel registered, GravityFrame
+        // is unseeded so alongGravity falls back to raw gz, which on the ~9.2° mount is
+        // ≈0.987 of true vertical — a far better yaw proxy that lets the gyro earn the latch.
+        accelSensor = resolved.accelerometer?.takeIf { resolved.accelIsInertial }
+        // SENSOR_DELAY_GAME (~50 Hz) is plenty for heading integration and far cheaper
+        // than the detection path's SENSOR_DELAY_FASTEST (~100 Hz).
+        accelSensor?.let { sm.registerListener(gyroListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME, sensorHandler) }
+        gyroSensor?.let { sm.registerListener(gyroListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME, sensorHandler) }
+    }
+
+    /** Stop the gyro tap + tear down its thread (call in onStop/onDestroy). */
+    private fun stopGyroFusion() {
+        gyroSensorManager?.let { try { it.unregisterListener(gyroListener) } catch (_: Throwable) {} }
+        gyroSensorManager = null
+        gyroSensor = null
+        accelSensor = null
+        sensorThread?.quitSafely()
+        sensorThread = null
+        sensorHandler = null
+    }
 
     /** Periodic guidance tick: pulls a fresh GPS fix and advances guidance. */
     private val guidanceRunnable = object : Runnable {
@@ -327,7 +432,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // display — if AMS placed it on display 0 (no cluster display present), it
         // would clobber the infotainment map. Finish immediately so the touch
         // instance is untouched.
-        if (clusterMode && display?.displayId == android.view.Display.DEFAULT_DISPLAY) {
+        if (clusterMode && currentDisplayId() == android.view.Display.DEFAULT_DISPLAY) {
             android.util.Log.w("RoadSenseMap", "cluster instance landed on display 0 — finishing")
             finishAndRemoveTask()
             return
@@ -440,11 +545,15 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             (searchColumn?.layoutParams as? android.view.ViewGroup.MarginLayoutParams)?.let {
                 it.topMargin = bars.top + dp(56); searchColumn.layoutParams = it
             }
-            (banner?.layoutParams as? android.view.ViewGroup.MarginLayoutParams)?.let {
-                // The +56dp clears the search bar on the head unit; the cluster has no
-                // search bar (chrome stripped) so it just wastes vertical space on the
-                // short 720px panel — pin the banner near the top edge there instead.
-                it.topMargin = bars.top + dp(if (clusterMode) 8 else 56); banner.layoutParams = it
+            // CLUSTER: applyClusterChrome OWNS the banner geometry (top-start, vertically
+            // centred in the clear band above the centre-left speed badge, overscan-safe
+            // margins, grows downward). The inset
+            // pass must NOT touch it here or it would fight that placement. HEAD UNIT: the
+            // +56dp clears the search bar below the status bar.
+            if (!clusterMode) {
+                (banner?.layoutParams as? android.view.ViewGroup.MarginLayoutParams)?.let {
+                    it.topMargin = bars.top + dp(56); banner.layoutParams = it
+                }
             }
             // Top-right map controls sit below the search bar.
             (controlsTop?.layoutParams as? android.view.ViewGroup.MarginLayoutParams)?.let {
@@ -458,7 +567,16 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 it.bottomMargin = bars.bottom + dp(24); fabLocate.layoutParams = it
             }
             (fabEnd?.layoutParams as? android.view.ViewGroup.MarginLayoutParams)?.let {
-                it.bottomMargin = bars.bottom + dp(24); fabEnd.layoutParams = it
+                // fabEndNav is the ONLY bottom|START control (every other bottom FAB is
+                // bottom|end). On head units whose system bar / gesture inset / display
+                // cutout sits on the LEFT edge (varies by OEM panel + orientation), a
+                // fixed marginStart would leave the button UNDER that bar — occluded, so
+                // it reads as "the cancel button isn't shown" on those models only. Add
+                // the left inset so it always clears the bar. bars.bottom keeps it above
+                // the nav bar as before.
+                it.bottomMargin = bars.bottom + dp(24)
+                it.marginStart = bars.left + dp(24)
+                fabEnd.layoutParams = it
             }
             (zoomControls?.layoutParams as? android.view.ViewGroup.MarginLayoutParams)?.let {
                 it.bottomMargin = bars.bottom + dp(96); zoomControls.layoutParams = it
@@ -548,6 +666,46 @@ open class RoadSenseMapActivity : AppCompatActivity() {
     private fun startClusterFollow() {
         mainHandler.removeCallbacks(clusterFollowRunnable)
         mainHandler.post(clusterFollowRunnable)
+        // Arm the cluster keep-warm repaint nudge alongside the follow loop (cluster
+        // only). It defends the "projection went black" symptom against a surface/EGL
+        // recreate that arrives BETWEEN resume/display events: under WHEN_DIRTY a parked
+        // map emits no dirty event, so a silently-recreated surface would stay black; a
+        // low-rate triggerRepaint() guarantees it repaints within one interval. Idempotent.
+        startClusterKeepWarm()
+    }
+
+    /**
+     * Force a single GL repaint of the cluster map NOW, bypassing the WHEN_DIRTY +
+     * puck/camera dead-band suppression. Cheap (one buffer swap); cluster-only callers.
+     * Also clears the puck dead-band anchor so the very next follow tick repaints too.
+     */
+    private fun forceClusterRepaint() {
+        if (isFinishing || isDestroyed) return
+        try { map?.triggerRepaint() } catch (_: Throwable) {}
+        puckPaintedLat = Double.NaN   // defeat the per-frame dead-band on the next tick
+    }
+
+    /**
+     * Cluster-only keep-warm repaint ticker. WHEN_DIRTY (set in onMapReady to kill the
+     * parked-car 60fps GPU cost) means a recreated/lost GL surface on the OEM fission
+     * display has no dirty event to repaint it on a stationary car → it stays BLACK until
+     * an off/on cycle. A low-rate triggerRepaint() (every CLUSTER_KEEP_WARM_MS) bounds how
+     * long a silently-recreated surface can stay black to one interval. Cost is ~one GL
+     * frame every few seconds — negligible vs the CONTINUOUS mode WHEN_DIRTY replaced
+     * (~80% of a core, doubled by the dual-map). Suspended in onStop with the other loops.
+     */
+    private val clusterKeepWarmRunnable = object : Runnable {
+        override fun run() {
+            if (isFinishing || isDestroyed || !clusterMode) return
+            try { map?.triggerRepaint() } catch (_: Throwable) {}
+            mainHandler.postDelayed(this, CLUSTER_KEEP_WARM_MS)
+        }
+    }
+
+    private fun startClusterKeepWarm() {
+        if (!clusterMode) return
+        mainHandler.removeCallbacks(clusterKeepWarmRunnable)
+        mainHandler.postDelayed(clusterKeepWarmRunnable, CLUSTER_KEEP_WARM_MS)
     }
 
     /**
@@ -572,7 +730,13 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 if (fix != null) mainHandler.post {
                     if (isFinishing || isDestroyed || navigating || clusterMode) return@post
                     lastFix = fix
-                    updateLocationPuck(fix)   // puck only — camera untouched
+                    // SOTA idle glide: feed the estimator + run the render tick so the
+                    // idle puck dead-reckons + gyro-fuses between the sparse 1 Hz fixes
+                    // (was: updateLocationPuck = raw teleport once/sec). renderMotionFrame
+                    // skips the camera block when NOT navigating/cluster (see its gate), so
+                    // this stays PUCK-ONLY — a user who panned away keeps their view.
+                    feedMotionTruth(fix)
+                    startMotionFollow()   // idempotent; 30/200ms adaptive tick
                 }
             }
             mainHandler.postDelayed(this, GUIDANCE_TICK_MS)
@@ -611,13 +775,45 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      * task (singleInstance alias), finishing it leaves the infotainment instance
      * untouched.
      */
+    /**
+     * The id of the display this Activity is on, version-safe. The Kotlin `display`
+     * property compiles to {@code Activity.getDisplay()}, which is **API 30**; this
+     * head unit runs **API 29** ([[reference_device_os_android10]]), so calling it
+     * throws {@link NoSuchMethodError} at runtime — and the `display?.` safe-call guards
+     * a null RETURN, not a missing METHOD, so it does NOT prevent the crash. Lint can't
+     * catch it either (build.gradle.kts sets abortOnError=false / checkReleaseBuilds=false).
+     * Use the API-30 accessor only when actually on ≥30; below that fall back to the
+     * deprecated {@code WindowManager.getDefaultDisplay()} (API 17+, present on 29).
+     * Returns -1 if neither is resolvable. This was crashing EVERY cluster map launch.
+     */
+    private fun currentDisplayId(): Int {
+        return try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                display?.displayId ?: -1
+            } else {
+                @Suppress("DEPRECATION")
+                (getSystemService(android.content.Context.WINDOW_SERVICE)
+                    as? android.view.WindowManager)?.defaultDisplay?.displayId ?: -1
+            }
+        } catch (_: Throwable) {
+            -1
+        }
+    }
+
     private fun registerClusterDisplayWatch() {
-        val myId = display?.displayId ?: return
+        val myId = currentDisplayId().takeIf { it >= 0 } ?: return
         val dm = getSystemService(android.content.Context.DISPLAY_SERVICE)
             as? android.hardware.display.DisplayManager ?: return
         val l = object : android.hardware.display.DisplayManager.DisplayListener {
             override fun onDisplayAdded(displayId: Int) {}
-            override fun onDisplayChanged(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                // A fission re-composite / display reconfigure fires this while the
+                // Activity stays RESUMED — the one event we receive that signals the GL
+                // surface may have been recreated (and, under WHEN_DIRTY on a parked map,
+                // left BLACK with no dirty event to repaint it). Force a repaint so the
+                // map self-heals in place instead of staying black until an off/on cycle.
+                if (displayId == myId) mainHandler.post { forceClusterRepaint() }
+            }
             override fun onDisplayRemoved(displayId: Int) {
                 if (displayId == myId) {
                     mainHandler.removeCallbacks(clusterFollowRunnable)
@@ -775,8 +971,8 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // true surface 1:1 (no upscale). The LAYOUT_FULLSCREEN|LAYOUT_STABLE flags
         // complement it by also zeroing any stable/system-bar inset attribution. ALL
         // cluster-only: applyClusterChrome runs solely from the clusterMode branch
-        // (onCreate) + onConfigurationChanged, so the head unit (display 0, no overscan)
-        // is byte-for-byte unchanged.
+        // (onCreate), exitImmersive (cluster), and onConfigurationChanged (cluster), so
+        // the head unit (display 0, no overscan) is byte-for-byte unchanged.
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_OVERSCAN)
         window.decorView.systemUiVisibility =
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
@@ -814,13 +1010,39 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                     ?.marginEnd = px(CLUSTER_BANNER_ICON_MARGIN_DP)
             }
         }
-        // Make the card itself a small fixed-width strip pinned top-start (instead of
-        // the head unit's full-width match_parent), with a tighter corner radius and
-        // inner padding, so it reads as a compact maneuver card and frees the map.
+        // Stack the maneuver card DIRECTLY BELOW the speed badge, LEFT-ALIGNED with it: the
+        // badge and the card share the same left edge (CLUSTER_SPEED_BADGE_LEFT_PX) and the
+        // card's TOP sits at panelH/2 — the shared "seam". The daemon-drawn speed badge
+        // (ClusterSpeedOverlay, z=MAX SurfaceControl) places its BOTTOM just above that same
+        // seam (panelH/2 − gap), so the two form a clean vertical stack: short speed strip
+        // on top, TBT card immediately below, both flush-left. The two processes never talk;
+        // they agree because both anchor to panelH/2 read from the same physical panel.
+        //
+        // panelH is just the height of OUR OWN window: the cluster Activity paints into the
+        // fission panel 1:1 (FLAG_LAYOUT_IN_OVERSCAN, set above — no border, no upscale), so
+        // the root view [R.id.mapRoot] measures exactly the panel. Read that directly — no
+        // DisplayManager, no dumpsys, no resources.displayMetrics (which on the fission
+        // VirtualDisplay can report the HEAD-UNIT metrics — the bug the old band-math hit).
+        // If the root isn't measured yet during cluster setup (height 0), defer this whole
+        // pass to the next layout with doOnLayout; the card stays at its XML default
+        // (gone/top) until then, so nothing flashes mis-placed.
+        val root = findViewById<View>(R.id.mapRoot)
+        val panelH = root?.height ?: 0
+        if (panelH <= 0) {
+            root?.doOnLayout { if (!isFinishing && !isDestroyed && clusterMode) applyClusterChrome() }
+            return
+        }
         findViewById<com.google.android.material.card.MaterialCardView>(R.id.navBanner)?.let { card ->
+            // Top-left corner = (badge left edge, panelH/2). Same left X as the badge →
+            // flush-left stack; top at the seam the badge ends just above.
+            val stackLeftX = CLUSTER_SPEED_BADGE_LEFT_PX
+            val stackSeamY = panelH / 2
             (card.layoutParams as? androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams)?.let { lp ->
                 lp.width = px(CLUSTER_BANNER_WIDTH_DP)
                 lp.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                lp.marginStart = stackLeftX
+                lp.topMargin = stackSeamY
+                lp.bottomMargin = 0
                 card.layoutParams = lp
             }
             card.radius = px(CLUSTER_BANNER_RADIUS_DP).toFloat()
@@ -835,11 +1057,48 @@ open class RoadSenseMapActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
-        // configChanges keeps the GL surface alive across rotation (no recreate);
+        // Bail on a not-yet-initialized instance (the display-0 early-return in onCreate
+        // finishes before mapView is assigned, yet AMS can still deliver a config delta).
+        // Symmetric with every other lifecycle override's ::mapView.isInitialized guard.
+        if (!::mapView.isInitialized) return
+        // configChanges (now incl. uiMode|density|fontScale|screenLayout) keeps the GL
+        // surface alive across rotation AND a system day/night flip — WITHOUT recreating
+        // the Activity mid-GL-init (the recreate-during-setStyle was a crash window). The
+        // tradeoff: we must now apply a uiMode (night) delta ourselves, since the Activity
+        // no longer restarts to pick it up.
         // re-apply responsive widths + re-request insets so panels reflow cleanly.
         applyResponsiveLayout()
+        // Re-assert the cluster's compact banner geometry + overscan chrome: a config
+        // delta delivered here (no recreate) would otherwise leave it un-refreshed, since
+        // applyResponsiveLayout deliberately skips the cluster banner. Cheap + idempotent.
+        if (clusterMode) applyClusterChrome()
         findViewById<View>(R.id.mapRoot)?.requestApplyInsets()
+        // A system day/night change only affects the map when the user hasn't pinned a
+        // scheme (mapThemeMode == AUTO). reloadStyleForTheme() is a no-op-safe reload that
+        // re-resolves styleBuilderForTheme() for the new effective scheme; its own
+        // in-flight guard + onStyleLoaded's isFullyLoaded guard keep it crash-safe even if
+        // this lands close to another reload. Guarded on an ACTUAL effective-scheme flip so
+        // a pure rotation/density delta doesn't pay for a style reload.
+        if (mapThemeMode == MAP_THEME_AUTO && map != null) {
+            // Use isNightTheme() (NOT raw newConfig.uiMode): for an AUTO map it honors the
+            // app's AppCompatDelegate night-mode pin BEFORE falling back to the system
+            // uiMode — matching the seed in onStyleLoaded (lastAppliedNight = isNightTheme())
+            // and every other reload site (cycleMapTheme / cluster theme-watch both gate on
+            // isNightTheme()). Reading the raw SYSTEM uiMode here instead would, when the app
+            // theme is PINNED and the system flips, fire a wasteful reload to the SAME
+            // effective scheme AND desync lastAppliedNight from what's actually painted.
+            val nightNow = isNightTheme()
+            if (nightNow != lastAppliedNight) {
+                lastAppliedNight = nightNow
+                reloadStyleForTheme()
+            }
+        }
     }
+
+    /** The night-ness the basemap was last loaded for, so onConfigurationChanged only
+     *  reloads the style on a REAL day/night flip (now that uiMode no longer recreates
+     *  the Activity). Seeded on first style load. */
+    private var lastAppliedNight: Boolean = false
 
     // ---------------------------------------------------------------------
     // Map setup
@@ -1161,6 +1420,21 @@ open class RoadSenseMapActivity : AppCompatActivity() {
     }
 
     private fun onStyleLoaded(style: Style) {
+        // CRASH GUARD (intermittent "clicking Map crashes the app"): this callback is
+        // async (setStyle{...}) and is re-entered on every theme switch (reloadStyleForTheme).
+        //  - Bail if the Activity is tearing down (rapid back-then-reopen).
+        //  - Bail if THIS style is no longer the fully-loaded one: an overlapping setStyle
+        //    (fast double-tap of the theme FAB, or the head-unit theme change + the cluster
+        //    theme-watch firing in the same process) supersedes the in-flight style, and
+        //    calling style.addSource/addLayer on a not-fully-loaded style throws MapLibre's
+        //    validateState IllegalStateException UNCAUGHT on the main thread → process death.
+        //  - Wrap the whole body so any residual add/decode failure is logged, never fatal.
+        if (isFinishing || isDestroyed || !::mapView.isInitialized) return
+        if (!style.isFullyLoaded) return
+        try {
+        // Record the scheme this style was loaded for, so onConfigurationChanged can tell
+        // a real day/night flip (→ reload) from a pure rotation/density delta (→ skip).
+        lastAppliedNight = isNightTheme()
         // 0) Route line FIRST (added before hazards/clusters so the line draws
         //    UNDER the hazard markers). Two-layer stroke: a wide casing under a
         //    narrower bright main line. Empty until a route is computed.
@@ -1169,10 +1443,28 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // basemap recolor uses, so the whole map flips day/night coherently.
         val routeColor = m3("primary")
         val routeCasing = m3("on_primary_container")
-        style.addSource(GeoJsonSource(ROUTE_SOURCE_ID, EMPTY_FEATURE_COLLECTION))
+        routeMainColor = routeColor
+        routeCasingColor = routeCasing
+        // withLineMetrics(true) is REQUIRED for line-gradient (line-progress is otherwise
+        // never generated and the gradient silently renders nothing). It's a source-
+        // construction option that persists across all later setGeoJson() calls. This
+        // drives the traveled-route trim (the gradient goes transparent behind the car).
+        style.addSource(
+            GeoJsonSource(
+                ROUTE_SOURCE_ID, EMPTY_FEATURE_COLLECTION,
+                GeoJsonOptions().withLineMetrics(true)
+            )
+        )
         style.addLayer(
             LineLayer(ROUTE_CASING_LAYER_ID, ROUTE_SOURCE_ID).withProperties(
+                // Keep the flat lineColor as a base/fallback (it does NOT conflict — a
+                // CONSTANT line-color coexists with line-gradient; the gradient just wins
+                // where it's set). The day/night recolor (setLayerColor) re-tints this so
+                // a theme flip stays coherent; the gradient is re-applied below to match.
                 PropertyFactory.lineColor(routeCasing),
+                // Traveled portion (line-progress < p) transparent, ahead full color.
+                // Seeded at p=0 (whole route visible until guidance feeds progress).
+                PropertyFactory.lineGradient(routeGradient(0f, routeCasing)),
                 PropertyFactory.lineWidth(11f),
                 PropertyFactory.lineOpacity(0.9f),
                 PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
@@ -1198,6 +1490,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         style.addLayer(
             LineLayer(ROUTE_MAIN_LAYER_ID, ROUTE_SOURCE_ID).withProperties(
                 PropertyFactory.lineColor(routeColor),
+                PropertyFactory.lineGradient(routeGradient(0f, routeColor)),
                 PropertyFactory.lineWidth(6f),
                 PropertyFactory.lineOpacity(0.95f),
                 PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
@@ -1205,6 +1498,17 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             )
         )
         routeSource = style.getSourceAs(ROUTE_SOURCE_ID)
+        routeCasingLayer = style.getLayerAs(ROUTE_CASING_LAYER_ID)
+        routeMainLayer = style.getLayerAs(ROUTE_MAIN_LAYER_ID)
+        // A style reload (day/night flip) mid-trip recreated the layers above at p=0 (full
+        // route). Re-apply the trim progress held across the reload so the traveled part
+        // stays hidden instead of flashing back in. lastAppliedProgress=-1 forces the
+        // next applyRouteTrim to repaint; here we paint the CURRENT clamp value directly.
+        if (navigating && lastRouteProgress > 0f) {
+            routeCasingLayer?.setProperties(PropertyFactory.lineGradient(routeGradient(lastRouteProgress, routeCasing)))
+            routeMainLayer?.setProperties(PropertyFactory.lineGradient(routeGradient(lastRouteProgress, routeColor)))
+            lastAppliedProgress = lastRouteProgress
+        }
 
         // 1) Register the four hazard marker icons (rasterized from the
         //    tintable vector drawables) once for this style.
@@ -1429,6 +1733,11 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         //     Guarded to run once per launch (a theme-driven style reload re-enters
         //     onStyleLoaded but must not re-restore on top of the live trip).
         if (!clusterMode) restoreTripIfAny()
+        } catch (t: Throwable) {
+            // Never let a style-setup failure kill the process — the map degrades to the
+            // basemap (which already loaded) instead of crashing the whole app.
+            android.util.Log.e("RoadSenseMap", "onStyleLoaded failed", t)
+        }
     }
 
     /**
@@ -1437,6 +1746,14 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      * follow; on clear → wipe the line and fall back to the idle GPS follow.
      */
     private fun subscribeClusterToNavSession() {
+        // Subscribe exactly once per Activity instance. This is called from
+        // onStyleLoaded, which RE-RUNS on every basemap reload — including each cluster
+        // day/night theme flip mid-trip (registerClusterThemeWatch → reloadStyleForTheme
+        // → onStyleLoaded). Without this guard each flip would add ANOTHER NavSession
+        // listener (only the newest tracked in navSessionListener), leaking destroyed-
+        // Activity closures into the process-wide NavSession singleton and dispatching
+        // every route update N× over a long drive. Drop any prior registration first.
+        navSessionListener?.let { NavSession.removeListener(it) }
         navSessionListener = NavSession.addListener { st ->
             mainHandler.post {
                 if (isFinishing || isDestroyed) return@post
@@ -1449,6 +1766,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                         guidance.start(route)
                         navigating = true
                         clusterNavRoute = route
+                        resetRouteTrim()   // new route → start un-trimmed
                         // Reveal the turn-by-turn banner on the cluster. The cluster
                         // never runs startGuidance() (that's the head-unit-only entry
                         // point), so without this the banner stays at its XML default
@@ -1475,6 +1793,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                         // guidanceRunnable keeps ticking — no re-post needed.
                         clusterNavRoute = route
                         guidance.start(route)
+                        resetRouteTrim()   // rerouted → reset trim against the NEW arc length
                         lastSpokenInstruction = null
                         // Reseed the banner to the NEW route immediately + drop the old
                         // route's turn glyph, so the prior route's maneuver text/ETA/icon
@@ -1507,6 +1826,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                     clusterNavRoute = null
                     mainHandler.removeCallbacks(guidanceRunnable)
                     guidance.stop()
+                    resetRouteTrim()   // route gone → reset trim (source emptied below)
                     findViewById<View>(R.id.navBanner)?.visibility = View.GONE
                     findViewById<View>(R.id.navBannerIcon)?.visibility = View.GONE
                     routeSource?.setGeoJson(EMPTY_FEATURE_COLLECTION)
@@ -1590,7 +1910,11 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // Hazard glyph, tinted in the body color, centered in the disc. Use a
         // SRC_IN color filter (not DrawableCompat.setTint) so it deterministically
         // overrides the vector's own baked android:tint across API levels.
-        val glyph = ContextCompat.getDrawable(this, glyphRes)!!.mutate()
+        // Null-safe (was `!!`): if the vector fails to resolve under a freshly-applied
+        // night/day Configuration (resource-lookup race on a theme reload), return the
+        // pin body WITHOUT the glyph instead of throwing a KotlinNullPointerException
+        // that would propagate out of onStyleLoaded → addImage → process crash.
+        val glyph = ContextCompat.getDrawable(this, glyphRes)?.mutate() ?: return bmp
         glyph.colorFilter = android.graphics.PorterDuffColorFilter(
             bodyColor, android.graphics.PorterDuff.Mode.SRC_IN
         )
@@ -1702,8 +2026,12 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         if (poiHit != null) {
             val kind = poiHit.getStringProperty(POI_PROP_KIND) ?: "fuel"
             val name = poiHit.getStringProperty(POI_PROP_NAME).orEmpty()
-            val lat = poiHit.getNumberProperty(POI_PROP_LAT).toDouble()
-            val lng = poiHit.getNumberProperty(POI_PROP_LNG).toDouble()
+            // Null-safe deref: MapLibre's click-listener dispatch has no try/catch, so a
+            // malformed POI feature missing lat/lng would crash the app on tap. The
+            // hasProperty(LAT) filter above normally guarantees presence; this is belt-
+            // and-suspenders against a bad feature.
+            val lat = poiHit.getNumberProperty(POI_PROP_LAT)?.toDouble() ?: return false
+            val lng = poiHit.getNumberProperty(POI_PROP_LNG)?.toDouble() ?: return false
             showPoiSheet(kind, name, lat, lng)
             return true
         }
@@ -1991,19 +2319,50 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      */
     private fun reloadStyleForTheme() {
         val m = map ?: return
-        m.setStyle(styleBuilderForTheme()) { style ->
-            // Re-add all static sources/layers/icons + refetch hazards.
-            onStyleLoaded(style)
-            // Repaint the live overlays the fresh style dropped.
-            if (previewRoutes.isNotEmpty()) {
-                drawRoutePreview(previewRoutes, previewSelectedIdx)
+        // Coalesce overlapping reloads: a second setStyle() issued while the first is
+        // still parsing (fast double-tap of the theme FAB, or the head-unit theme change
+        // racing the cluster theme-watch in the same process) supersedes the in-flight
+        // style, and the first callback would then run onStyleLoaded against a not-fully-
+        // loaded style → MapLibre validateState IllegalStateException → crash. The flag
+        // drops the duplicate request; the persisted KEY_MAP_THEME already holds the
+        // latest mode, and styleBuilderForTheme() reads the live mode, so the single
+        // in-flight reload lands on the correct scheme. (onStyleLoaded also defends with
+        // its own isFullyLoaded guard — this is the structural complement.)
+        if (styleReloadInFlight) return
+        styleReloadInFlight = true
+        // OUTER try/catch: the inner finally only resets the flag on the ASYNC callback
+        // path. If styleBuilderForTheme() or setStyle() itself throws SYNCHRONOUSLY (e.g.
+        // the native map peer was torn down), the callback never registers and the flag
+        // would leak stuck-true — permanently blocking every future theme reload via the
+        // `if (styleReloadInFlight) return` guard above. Reset it here so a synchronous
+        // failure self-heals.
+        try {
+            m.setStyle(styleBuilderForTheme()) { style ->
+                try {
+                    if (isFinishing || isDestroyed) return@setStyle
+                    // Re-add all static sources/layers/icons + refetch hazards.
+                    onStyleLoaded(style)
+                    // Repaint the live overlays the fresh style dropped.
+                    if (previewRoutes.isNotEmpty()) {
+                        drawRoutePreview(previewRoutes, previewSelectedIdx)
+                    }
+                    lastFix?.let { updateLocationPuck(it) }
+                    // Repaint the dropped pin too (if a place sheet is still showing one), so
+                    // it survives a theme switch like every other overlay.
+                    droppedPinLatLng?.let { (lat, lng) -> showDroppedPin(lat, lng) }
+                } finally {
+                    styleReloadInFlight = false
+                }
             }
-            lastFix?.let { updateLocationPuck(it) }
-            // Repaint the dropped pin too (if a place sheet is still showing one), so
-            // it survives a theme switch like every other overlay.
-            droppedPinLatLng?.let { (lat, lng) -> showDroppedPin(lat, lng) }
+        } catch (t: Throwable) {
+            styleReloadInFlight = false
+            android.util.Log.e("RoadSenseMap", "reloadStyleForTheme setStyle threw", t)
         }
     }
+
+    /** True while a theme-driven [reloadStyleForTheme] setStyle() is parsing, so an
+     *  overlapping reload request is coalesced (see reloadStyleForTheme). */
+    private var styleReloadInFlight = false
 
     /** Reflect the active map-theme mode on the theme FAB icon (auto/sun/moon). */
     private fun updateMapThemeFab() {
@@ -2121,7 +2480,9 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             color = 0xFFFFFFFF.toInt(); style = android.graphics.Paint.Style.STROKE; strokeWidth = s * 0.04f
         }
         c.drawCircle(cx, cx, r, rim)
-        val glyph = ContextCompat.getDrawable(this, glyphRes)!!.mutate()
+        // Null-safe (was `!!`): a failed glyph resolve returns the pin body without the
+        // glyph rather than crashing out of onStyleLoaded → addImage. See buildHazardPin.
+        val glyph = ContextCompat.getDrawable(this, glyphRes)?.mutate() ?: return bmp
         glyph.colorFilter = android.graphics.PorterDuffColorFilter(
             0xFFFFFFFF.toInt(), android.graphics.PorterDuff.Mode.SRC_IN)
         val g = (r * 1.2f).toInt()
@@ -2779,17 +3140,56 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         val focus = lastFix
         val token = ++acToken
         ioExecutor().execute {
-            val results = ForwardGeocoder.autocomplete(query, 6, focus?.lat, focus?.lng)
+            // Local matches (saved places + recents whose label contains the query) —
+            // they need no network and make a place the user once saved permanently
+            // findable by name, even if no geocoder has it. Computed INSIDE the executor
+            // (runAutocomplete itself runs on the main thread): localMatches reads two
+            // SharedPreferences files + parses JSON, which must not touch the UI thread.
+            val local = localMatches(query)
+            val remote = ForwardGeocoder.autocomplete(query, 6, focus?.lat, focus?.lng)
+            // Merge local first (the user's own places rank above remote hits),
+            // dropping any remote row that is the SAME place as a local one so a
+            // saved pin doesn't appear twice. Dedup uses the store's shared rule.
+            val merged = if (local.isEmpty()) remote else
+                local + remote.filterNot { r -> local.any { RecentSearchStore.isSamePlace(it, r) } }
             mainHandler.post {
                 if (isFinishing || isDestroyed) return@post
                 if (token != acToken) return@post // superseded by a newer query
                 // No rows for this (partial) query — a transient hide while typing,
                 // NOT a back-out, so keep any armed save-intent for the refined pick.
-                if (results.isEmpty()) { hideSearchDropdown(clearSaveIntent = false); return@post }
+                if (merged.isEmpty()) { hideSearchDropdown(clearSaveIntent = false); return@post }
                 hideSavedChips()   // live results replace the saved-place chips
-                searchAdapter.submitResults(results)   // live results → no remove (✕)
+                searchAdapter.submitResults(merged)   // live results → no remove (✕)
                 showSearchDropdown()
             }
+        }
+    }
+
+    /**
+     * Synchronous, NETWORK-FREE prefix/substring match over the user's own saved
+     * places (Home / Work / favourites) + recent destinations, for surfacing
+     * inside the live autocomplete dropdown. Case-insensitive label `contains`;
+     * saved places first, then recents, de-duplicated by the store's same-place
+     * rule (so a place that is both saved and recent shows once). Capped small so
+     * local rows never crowd out remote suggestions. Never throws.
+     */
+    private fun localMatches(query: String): List<SearchResult> {
+        val q = query.trim()
+        if (q.length < AUTOCOMPLETE_MIN_CHARS) return emptyList()
+        return try {
+            val needle = q.lowercase()
+            val saved = SavedPlacesStore.getAll(applicationContext).map { it.result }
+            val recents = RecentSearchStore.getAll(applicationContext)
+            val out = ArrayList<SearchResult>(4)
+            for (r in saved + recents) {
+                if (!r.label.lowercase().contains(needle)) continue
+                if (out.any { RecentSearchStore.isSamePlace(it, r) }) continue
+                out.add(r)
+                if (out.size >= LOCAL_MATCH_CAP) break
+            }
+            out
+        } catch (_: Throwable) {
+            emptyList()
         }
     }
 
@@ -3086,9 +3486,15 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // here would wipe a slot the user re-armed during an in-flight submitSearch
         // (whose save path passes an explicit snapshot kind, not the live field).
         if (kind == SavedPlacesStore.KIND_CUSTOM) {
+            // A pin the geocoder couldn't name carries the "Dropped pin" placeholder.
+            // Pre-filling THAT as the favourite label is useless (and wouldn't be
+            // findable by name later via the local-autocomplete merge), so start the
+            // field EMPTY and lean on the hint to prompt a real name. A named/coordinate
+            // /Plus-Code result still pre-fills its first segment as before.
+            val unnamed = result.label.trim() == getString(R.string.roadsense_map_dropped_pin)
             val input = android.widget.EditText(this).apply {
                 hint = getString(R.string.roadsense_map_custom_label_hint)
-                setText(firstSegment(result.label))
+                if (!unnamed) setText(firstSegment(result.label))
                 setSingleLine()
             }
             val pad = (16 * resources.displayMetrics.density).toInt()
@@ -3096,19 +3502,40 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 setPadding(pad, pad / 2, pad, 0)
                 addView(input)
             }
-            com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            val dlg = com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
                 .setTitle(R.string.roadsense_map_custom_label_title)
                 .setView(container)
-                .setPositiveButton(R.string.roadsense_map_save) { _, _ ->
-                    val name = input.text?.toString()?.trim().orEmpty()
-                    val labelled = if (name.isNotEmpty())
-                        result.copy(label = name) else result
-                    SavedPlacesStore.save(applicationContext, kind, labelled)
-                    showSnackbar(getString(R.string.roadsense_map_saved_added))
-                    buildSavedChips()
-                }
+                // Positive listener is null here; the real handler is wired in
+                // setOnShowListener below so it can KEEP THE DIALOG OPEN on an empty
+                // unnamed save (the default setPositiveButton lambda auto-dismisses, so
+                // an abort there would close the dialog instead of letting the user type
+                // a name). A named/coordinate/Plus-Code result saves + dismisses normally.
+                .setPositiveButton(R.string.roadsense_map_save, null)
                 .setNegativeButton(R.string.roadsense_map_cancel, null)
-                .show()
+                .create()
+            dlg.setOnShowListener {
+                dlg.getButton(android.content.DialogInterface.BUTTON_POSITIVE)
+                    ?.setOnClickListener {
+                        val name = input.text?.toString()?.trim().orEmpty()
+                        // An UNNAMED dropped pin left blank must NOT save the literal
+                        // "Dropped pin" placeholder (useless + not findable by name via the
+                        // autocomplete merge). Keep the dialog OPEN + refocus so the user
+                        // can type a real name. A NAMED result (reverse-geocode hit /
+                        // coordinate / Plus Code) cleared to empty keeps its own useful label.
+                        if (name.isEmpty() && unnamed) {
+                            input.error = getString(R.string.roadsense_map_custom_label_hint)
+                            input.requestFocus()
+                            return@setOnClickListener   // do NOT dismiss
+                        }
+                        val labelled = if (name.isNotEmpty())
+                            result.copy(label = name) else result
+                        SavedPlacesStore.save(applicationContext, kind, labelled)
+                        showSnackbar(getString(R.string.roadsense_map_saved_added))
+                        buildSavedChips()
+                        dlg.dismiss()
+                    }
+            }
+            dlg.show()
         } else {
             SavedPlacesStore.save(applicationContext, kind, result)
             showSnackbar(getString(R.string.roadsense_map_saved_added))
@@ -3139,7 +3566,18 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 if (isFinishing || isDestroyed) return@post
                 val top = results.firstOrNull()
                 if (top == null) {
-                    showSnackbar(getString(R.string.roadsense_map_no_results))
+                    // Distinguish a genuine zero-hit query from a TRANSPORT failure (the
+                    // network/proxy couldn't reach the search hosts). Without this, a
+                    // blocked host showed "No places found" — identical to a real miss —
+                    // which read as "search never works". ForwardGeocoder.lastError carries
+                    // the typed reason from the just-finished search.
+                    val msg = when (com.overdrive.app.navmap.nav.ForwardGeocoder.lastError) {
+                        com.overdrive.app.navmap.nav.ForwardGeocoder.SearchError.TIMEOUT,
+                        com.overdrive.app.navmap.nav.ForwardGeocoder.SearchError.NETWORK ->
+                            R.string.roadsense_map_search_network
+                        else -> R.string.roadsense_map_no_results
+                    }
+                    showSnackbar(getString(msg))
                     // Failed submit → restore the save-intent so the user can retry
                     // without re-tapping the chip, unless they armed a fresher one.
                     if (saveKind != null && pendingSaveKind == null) pendingSaveKind = saveKind
@@ -3262,7 +3700,30 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 lockedDestLat = destLat
                 lockedDestLng = destLng
                 drawRoutePreview(routes, 0)
-                if (autoStart) {
+                // A MID-NAV itinerary edit (add/remove/reorder a stop, or a
+                // full-destination replace, while already navigating) must re-arm the
+                // head-unit engine AND publish the new route to the cluster so the two
+                // surfaces commit to the SAME route together — publishing without
+                // re-arming let the cluster guide the new route while the head-unit kept
+                // ticking the old one. But this MUST mirror switchToRouteDuringNav: it
+                // silently re-arms on the new route and stays immersive (no sheet). It
+                // must NOT also raise the route-options chooser, which would commit
+                // engine+voice+cluster to routes[0] while inviting the driver to pick a
+                // DIFFERENT route — leaving the surfaces hard-committed to an unchosen
+                // route (and strandable via the sheet's Close). So the re-arm path and
+                // the chooser are mutually exclusive: a navigating edit re-arms+publishes
+                // (no sheet); the autoStart restore arms through startGuidance; only a
+                // fresh (not-yet-navigating) preview shows the chooser.
+                if (!clusterMode && navigating) {
+                    // Route line already redrawn by drawRoutePreview above; staying in
+                    // this branch (no showRouteOptionsSheet/frameRoutes) keeps the
+                    // immersive follow view intact — matching switchToRouteDuringNav.
+                    guidance.start(routes[0])
+                    resetRouteTrim()
+                    lastSpokenInstruction = null
+                    NavSession.publishRoute(routes[0], destLabel)
+                    loadHazardCountsForRoutes(routes)
+                } else if (autoStart) {
                     // Restoring an active nav trip → resume turn-by-turn straight
                     // into the immersive view (no route-options sheet).
                     loadHazardCountsForRoutes(routes)
@@ -3394,6 +3855,79 @@ open class RoadSenseMapActivity : AppCompatActivity() {
     private fun routeFeature(route: NavRoute, idx: Int): String {
         return "{\"type\":\"Feature\",\"properties\":{\"idx\":$idx}," +
             "\"geometry\":{\"type\":\"LineString\",\"coordinates\":${coordArray(route)}}}"
+    }
+
+    /**
+     * Build the line-gradient Expression that hides the TRAVELED portion of the route.
+     * Transparent for line-progress in [0, p), then [fullColor] from p to the end, with a
+     * tiny feather band just before p so the cut antialiases instead of being a hard pixel
+     * edge. [p] is the traveled fraction in [0,1].
+     *
+     * Constraints honored: interpolate() REQUIRES strictly-ascending stop inputs, so p is
+     * clamped to [TRIM_FEATHER, 1−ε] and the feather stop (p−feather) stays below p > 0.
+     * Transparency lives in the gradient color stops (rgba alpha 0) — line-gradient cannot
+     * vary alpha via lineOpacity. p=0 ⇒ the feather stop clamps to 0 and the whole line is
+     * full color (no trim), which is the seed/preview state.
+     */
+    private fun routeGradient(p: Float, fullColor: Int): Expression {
+        val full = Expression.color(fullColor)
+        // p≈0 (seed / preview / pre-progress): SOLID full color, no transparent band — and
+        // critically, only TWO stops (0<1) so we never emit two stops at input 0 (which a
+        // feathered band at p=0 would, violating interpolate's strictly-ascending rule and
+        // throwing at layer build → crash on map open).
+        if (p <= TRIM_FEATHER) {
+            return Expression.interpolate(
+                Expression.linear(), Expression.lineProgress(),
+                Expression.stop(0f, full),
+                Expression.stop(1f, full)
+            )
+        }
+        // Trim case: transparent up to (pc−feather), feather to pc, full beyond. pc in
+        // (TRIM_FEATHER, 0.9999] guarantees 0 < (pc−feather) < pc < 1 — strictly ascending.
+        val pc = p.coerceIn(TRIM_FEATHER, 0.9999f)
+        val clear = Expression.rgba(0, 0, 0, 0)
+        return Expression.interpolate(
+            Expression.linear(), Expression.lineProgress(),
+            Expression.stop(0f, clear),
+            Expression.stop(pc - TRIM_FEATHER, clear),
+            Expression.stop(pc, full),
+            Expression.stop(1f, full)
+        )
+    }
+
+    /**
+     * Per-frame traveled-route trim: move the line-gradient boundary to the car's
+     * along-route progress so the path behind the puck disappears (Waze/GMaps style). A
+     * GPU PAINT-property update (setProperties(lineGradient)) — NOT setGeoJson, so it does
+     * NOT re-tessellate geometry / peg the RenderThread. Driven from renderMotionFrame with
+     * the SAME snapped point that paints the puck, so the boundary sits under the puck.
+     *
+     * Guards: only while navigating + on-route (off-route HOLDS the last boundary so the
+     * traveled part can't snap to a wrong spot or re-appear); MONOTONIC (never walks
+     * backward on a GPS wobble / global-rescan); paint dead-band (skip when p barely moved,
+     * so a parked car emits zero gradient writes). Each map instance runs its own.
+     */
+    private fun applyRouteTrim(snap: NavGuidanceEngine.Snapped?, onRoute: Boolean) {
+        if (!navigating || snap == null || !onRoute) return
+        val arc = guidance.routeArcLengthMeters()
+        if (arc <= 1.0) return
+        var p = (snap.alongRouteM / arc).toFloat().coerceIn(0f, 1f)
+        p = maxOf(p, lastRouteProgress)          // monotonic: traveled part never re-appears
+        lastRouteProgress = p
+        if (kotlin.math.abs(p - lastAppliedProgress) < TRIM_PROGRESS_EPS) return   // paint dead-band
+        lastAppliedProgress = p
+        routeMainLayer?.setProperties(PropertyFactory.lineGradient(routeGradient(p, routeMainColor)))
+        routeCasingLayer?.setProperties(PropertyFactory.lineGradient(routeGradient(p, routeCasingColor)))
+    }
+
+    /** Reset the traveled-route trim to "full route" (p=0) and repaint both layers. Called
+     *  at every new-route site (nav start / reroute / route switch) so the fresh route
+     *  starts un-trimmed and a stale boundary from the prior route can't hide it. */
+    private fun resetRouteTrim() {
+        lastRouteProgress = 0f
+        lastAppliedProgress = -1f
+        routeMainLayer?.setProperties(PropertyFactory.lineGradient(routeGradient(0f, routeMainColor)))
+        routeCasingLayer?.setProperties(PropertyFactory.lineGradient(routeGradient(0f, routeCasingColor)))
     }
 
     private fun lineFeature(route: NavRoute): String =
@@ -3766,6 +4300,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         previewSelectedIdx = idx
         val chosen = previewRoutes[idx]
         guidance.start(chosen)
+        resetRouteTrim()   // switched to a different route → reset trim to the new line
         lastSpokenInstruction = null
         drawRoutePreview(previewRoutes, idx)
         // Mirror the driver's mid-nav route switch to the cluster too.
@@ -3806,6 +4341,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
     private fun startGuidance(route: NavRoute, destLabel: String) {
         guidance.start(route)
         navigating = true
+        resetRouteTrim()   // nav start → route fully visible, trim begins from 0
         // Guidance owns the puck now (its 1 Hz tick + 30 fps dead-reckon) — stop the
         // head-unit idle follow so the two don't both write the puck.
         stopIdleFollow()
@@ -4075,6 +4611,20 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                     nearStopTicks = 0
                 }
                 val nearStopArrived = nearStopTicks >= NEAR_STOP_ARRIVAL_TICKS
+                // PUCK-PROXIMITY arrival (the "nav never ends near the destination"
+                // fix). The guidance engine above is advanced ONLY by the 1 Hz daemon
+                // /api/gps poll, whose position can lag or sit 20-30 m off the true pin
+                // — so engine.arrived + the near-stop net can both miss even though the
+                // PUCK the driver sees (driven by the low-latency DIRECT platform fix
+                // through the motion estimator) has visibly reached the destination.
+                // Cross-check the estimator pose against the LOCKED destination: when
+                // the puck is within the arrival radius and the car has stopped, the
+                // driver HAS arrived. Same speed gate + 2-tick debounce as the near-stop
+                // net so a brief halt short of the pin can't end nav early. Head-unit
+                // only (the locked dest + estimator live here; the cluster has neither).
+                val puckArrived = puckReachedDestination() && fix.bestSpeedMps <= NEAR_STOP_SPEED_MPS
+                if (puckArrived) puckArrivedTicks++ else puckArrivedTicks = 0
+                val puckArrivedConfirmed = puckArrivedTicks >= NEAR_STOP_ARRIVAL_TICKS
                 // ARRIVAL + REROUTE are LIFECYCLE actions owned by the head-unit (the
                 // control surface). The cluster is a VIEW-ONLY mirror: it must not end
                 // nav or recompute a route itself — it has no routeStops/locked dest, so
@@ -4086,7 +4636,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 // lifecycle blocks to the head-unit; the cluster falls through to the
                 // banner-display update below.
                 if (!clusterMode) {
-                    if (state.arrived || nearStopArrived) {
+                    if (state.arrived || nearStopArrived || puckArrivedConfirmed) {
                         speakOnce(getString(R.string.roadsense_map_arrived))
                         showSnackbar(getString(R.string.roadsense_map_arrived))
                         stopGuidance()
@@ -4128,6 +4678,28 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Is the PUCK (the on-screen vehicle position) within the arrival radius of the
+     * locked destination? Drives the puck-proximity arrival path so nav ends when the
+     * driver visibly reaches the pin even if the daemon-poll engine position lags.
+     *
+     * Uses the motion estimator's current pose — the same source the puck is painted
+     * from (low-latency DIRECT fix, dead-reckoned to the present) — NOT the laggy
+     * daemon poll the guidance engine consumes. Measures straight-line distance to the
+     * LOCKED destination (lockedDestLat/Lng, set on every route start/recompute) with
+     * the engine's haversine. False when no locked dest, no estimator fix, or the puck
+     * isn't yet inside the radius. Bias-free: estimate() returns null before the first
+     * truth fix, so a fresh trip can't false-arrive at the origin.
+     */
+    private fun puckReachedDestination(): Boolean {
+        if (lockedDestLat.isNaN() || lockedDestLng.isNaN()) return false
+        if (!motionEstimator.hasFix()) return false
+        val nowMono = android.os.SystemClock.elapsedRealtime()
+        val m = motionEstimator.estimate(nowMono, nowMono) ?: return false
+        val d = guidance.haversineMeters(m.lat, m.lng, lockedDestLat, lockedDestLng)
+        return d <= com.overdrive.app.navmap.nav.NavGuidanceEngine.ARRIVAL_RADIUS_M
+    }
+
     /** Roundabout exit ordinal suffix (" • exit 2") when Valhalla gave one and the
      *  instruction text doesn't already mention that ordinal. Empty otherwise. */
     private fun roundaboutExitSuffix(m: com.overdrive.app.navmap.nav.RouteManeuver): String {
@@ -4149,11 +4721,96 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      * forward from the last real fix uninterrupted). When the daemon gives no
      * timestamp (shouldn't happen on this HU) we treat every fix as new.
      */
+    /**
+     * Freeze-guard re-anchor (called from the render tick when truth has gone stale near
+     * the dead-reckon cap). Re-feeds the LAST KNOWN real position ([lastFix]) into the
+     * estimator stamped at [nowMono], advancing the baseline so the dead-reckon dt resets
+     * and the puck holds at the last real fix instead of freezing at the 3-s extrapolation
+     * cap. Bypasses the daemon fallback gate (this is the safety net the gate can't be) and
+     * the duplicate-ts guard (we deliberately re-stamp the same position at a new instant).
+     * No-op until a first fix exists. Cheap: one onTruthPoint with the held position, which
+     * the estimator absorbs as a tiny/zero move (no snap). Speed is held from lastFix so the
+     * puck keeps coasting at the last real speed, not a stale extrapolated one.
+     */
+    private fun reanchorToLastFix(nowMono: Long) {
+        val fix = lastFix ?: return
+        if (!motionEstimator.hasFix()) return
+        // CLAMP the accuracy so the estimator can NEVER reject this re-anchor. lastFix is
+        // written unconditionally by the daemon feeders and may carry a coarse accuracy
+        // (>55m, the estimator's MAX_ACCEPTED_ACCURACY_M reject threshold) — and a coarse
+        // fix is exactly the degraded-GPS case where truth goes stale and this watchdog
+        // must fire. A rejected re-anchor would NOT advance the estimator baseline, so the
+        // puck would stay frozen at the dead-reckon cap while the anchor writes below
+        // (mistakenly) re-armed the watchdog timer and kept the daemon gated — a re-armed
+        // permanent freeze. Feeding a guaranteed-accepted accuracy (<= the estimator's
+        // GOOD bar) makes the re-anchor always advance the baseline. We hold the LAST REAL
+        // position (not the extrapolation), so a tight accuracy is the honest claim here.
+        val reanchorAcc = minOf(fix.accuracy ?: REANCHOR_ACCURACY_M, REANCHOR_ACCURACY_M)
+        val accepted = motionEstimator.onTruthPoint(
+            lat = fix.lat, lng = fix.lng,
+            speedMps = fix.bestSpeedMps,
+            rawBearingDeg = fix.bearing,
+            accuracyM = reanchorAcc,
+            tsMs = nowMono,
+            brakePercent = fix.brakePercent
+        ).timestampMs == nowMono
+        // Advance the anchors ONLY on a confirmed accept (mirrors onDirectFix), so a
+        // surprise rejection can't re-arm the watchdog / keep the daemon gated on a
+        // baseline that never moved. With the clamp above this always accepts; the
+        // acceptance check is defensive belt-and-suspenders.
+        if (accepted) {
+            lastTruthElapsedMs = nowMono
+            lastFixCaptureMonoMs = nowMono
+            lastAcceptedFixMonoMs = nowMono
+        }
+    }
+
     private fun feedMotionTruth(fix: RoadSenseHazardApiClient.LatLngFix) {
         val ts = fix.timestampMs
-        if (ts != null && ts == lastFedFixTsMs) return  // duplicate re-poll — don't re-anchor
+        // Drop a duplicate OR OUT-OF-ORDER re-poll (ts <= last fed) so we don't re-anchor
+        // the dead-reckon clock. Equality covers the 4s re-send of the same fix; the <=
+        // also covers a BACK-DATED fix — the periodicSender getLastKnownLocation re-inject
+        // can carry an older getTime() than the latest live fix, which an equality-only
+        // gate would treat as new and re-anchor (a small backward puck step). The estimator
+        // also rejects ts<=lastAcceptedTs, but the re-anchor happens HERE before that, so
+        // gate it here too.
+        if (ts != null && ts <= lastFedFixTsMs) return
         lastFedFixTsMs = ts ?: 0L
-        lastTruthElapsedMs = android.os.SystemClock.elapsedRealtime()
+        // FALLBACK GATE: when the DIRECT in-process source is delivering fixes, it owns
+        // the puck — skip feeding the estimator here so the coarser/older 1 Hz daemon
+        // poll can't snap the puck back. The daemon poll stays the source only until the
+        // direct listener warms up, or if it goes quiet (no permission / provider off).
+        //
+        // TWO conditions, both required to skip the daemon:
+        //  (1) a direct fix was RECEIVED within the window — the deadlock tie-breaker: the
+        //      daemon must STOP re-pinning the estimator baseline so a direct fix (carrying
+        //      the EARLIER hardware-capture instant) can overtake it and win acceptance.
+        //  (2) the puck was actually fed an ACCEPTED fix within the window — a freeze guard:
+        //      if direct fixes keep arriving but the estimator keeps REJECTING them past
+        //      this window (pathological: a provider whose capture instant trails ingest by
+        //      more than the dead-reckon cap), resume the daemon so the puck can't strand at
+        //      the MAX_DEAD_RECKON_S cap. The daemon feed (ingest=now) then out-ranks the
+        //      stale baseline and is accepted, and the reset baseline lets direct overtake
+        //      again immediately — so this can neither deadlock nor freeze. In NORMAL warmup
+        //      (gap < ~2 s) a direct fix is accepted within ~2 fixes, well inside the window,
+        //      so (2) never trips and there is no extra daemon feed / snap-back.
+        val nowGate = android.os.SystemClock.elapsedRealtime()
+        if (directGpsActive &&
+            nowGate - lastDirectFixSeenMonoMs < DIRECT_FIX_FALLBACK_MS &&
+            nowGate - lastAcceptedFixMonoMs < DIRECT_FIX_FALLBACK_MS) {
+            return
+        }
+        // Feed the estimator in the MONOTONIC (elapsedRealtime) domain — same clock as
+        // the direct source and the render tick — so the two feeders never collide in the
+        // estimator's timestamp baseline (the daemon fix carries a WALL-CLOCK send-time,
+        // ~1.78e12, that would otherwise reject or freeze a mono-stamped direct fix). The
+        // daemon fix lost its true capture instant upstream (send-time stamping), so this
+        // path stays ingestion-anchored (no transport-age compensation) — that's the
+        // intended fallback behaviour; the DIRECT path is the one that extrapolates to now.
+        val ingestMono = android.os.SystemClock.elapsedRealtime()
+        lastTruthElapsedMs = ingestMono
+        lastFixCaptureMonoMs = ingestMono
+        lastAcceptedFixMonoMs = ingestMono   // daemon feed is accepted (ingest=now > baseline)
         motionEstimator.onTruthPoint(
             lat = fix.lat, lng = fix.lng,
             // Prefer the smooth BYD CAN wheel speed over noisy GPS speed (falls back to
@@ -4163,7 +4820,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             speedMps = fix.bestSpeedMps,
             rawBearingDeg = fix.bearing,
             accuracyM = fix.accuracy,
-            tsMs = ts ?: android.os.SystemClock.elapsedRealtime(),
+            tsMs = ingestMono,
             // Brake pedal (0-100) when the CAN bus reported it — lets the estimator
             // shed predicted speed during braking so the puck eases to a stop instead
             // of overshooting then being pulled back.
@@ -4175,6 +4832,171 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      *  duplicate re-poll (same timestamp) doesn't re-anchor the dead-reckon clock. */
     @Volatile private var lastFedFixTsMs: Long = 0L
 
+    // ── In-process direct GPS source (low-latency truth) ─────────────────────────
+    // The map runs in the app process and holds ACCESS_FINE_LOCATION, so it subscribes
+    // to the platform location provider DIRECTLY — standard nav practice — instead of
+    // learning each fix only through the 1 Hz loopback poll of the daemon. The daemon
+    // poll (fetchCurrentLocation) stays as a cold-start seed + fallback, gated to fire
+    // only when a direct fix hasn't arrived recently. Two wins over the poll:
+    //   1) No poll-phase wait + no IPC round-trip — each fix reaches the estimator the
+    //      instant the provider delivers it.
+    //   2) The fix carries its HARDWARE-CAPTURE instant (Location.getElapsedRealtimeNanos,
+    //      already in the elapsedRealtime/monotonic domain the render tick uses), so the
+    //      dead-reckoner can extrapolate the pose to the TRUE present — including all
+    //      transport age — instead of anchoring to the ingestion moment and trailing the
+    //      vehicle by the pipeline latency (the puck-lag the daemon-poll path could never
+    //      shed, since the fix's own time was overwritten with a send-time upstream).
+    private var gpsThread: HandlerThread? = null
+    @Volatile private var directGpsActive = false
+    /** elapsedRealtime (ms) the last DIRECT fix was RECEIVED (regardless of whether the
+     *  estimator accepted it). This — NOT acceptance — gates the daemon fallback feed.
+     *  WHY reception, not acceptance: the daemon stamps the estimator at ingestion-now,
+     *  so its lastAcceptedTs sits ≈now; a direct fix carries the EARLIER hardware-capture
+     *  instant, so while the daemon keeps feeding, every direct fix is rejected
+     *  (tsMs <= lastAcceptedTs) and could NEVER win acceptance — a permanent deadlock that
+     *  left the puck on the laggy daemon feed forever. Gating on reception makes the daemon
+     *  stop feeding as soon as direct fixes arrive; lastAcceptedTs then goes stale within
+     *  DIRECT_FIX_FALLBACK_MS and the next direct capture out-ranks it → handoff completes. */
+    @Volatile private var lastDirectFixSeenMonoMs: Long = 0L
+    /** elapsedRealtime (ms) the estimator last ACCEPTED a fix from EITHER feeder — the
+     *  freeze-guard: the daemon fallback resumes if no accepted fix landed within
+     *  DIRECT_FIX_FALLBACK_MS, so a direct source that keeps getting rejected (pathological
+     *  >cap capture-to-ingest lag) can't strand the puck at the dead-reckon cap. */
+    @Volatile private var lastAcceptedFixMonoMs: Long = 0L
+
+    // Explicit anonymous LocationListener overriding ALL FOUR methods — NOT a SAM lambda.
+    // On the API-29 runtime the three non-location callbacks have NO interface default
+    // (defaults were added in API 30), and core-library desugaring is OFF, so a lambda
+    // (which implements only onLocationChanged) throws AbstractMethodError the moment
+    // LocationManager dispatches a provider enable/disable/status — routine while driving.
+    // Mirrors LocationSidecarService's listener, which overrides all four.
+    private val gpsListener = object : LocationListener {
+        override fun onLocationChanged(loc: Location) { onDirectFix(loc) }
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+    }
+
+    /** Start the map's own location subscription (idempotent). GPS at the 1 Hz cadence
+     *  + a coarse NETWORK fallback, delivered on a background looper so the provider
+     *  callback never touches the UI thread. No-op (daemon poll remains the source) when
+     *  permission is absent or no provider is enabled. */
+    private fun startDirectGps() {
+        if (directGpsActive) return
+        val lm = getSystemService(LOCATION_SERVICE) as? LocationManager ?: return
+        val t = HandlerThread("map-gps").also { it.start() }
+        gpsThread = t
+        try {
+            var registered = false
+            if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, gpsListener, t.looper)
+                registered = true
+            }
+            if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 5000L, 0f, gpsListener, t.looper)
+                registered = true
+            }
+            // Only claim the direct source is active if a provider actually registered —
+            // otherwise directGpsActive=true would (via a getLastKnownLocation seed) gate
+            // the daemon poll OFF while no live provider feeds the puck. With no provider,
+            // leave directGpsActive=false so the daemon poll stays the source.
+            if (!registered) { stopDirectGps(); return }
+            // Seed immediately from the last known fix so the puck isn't stale at open.
+            lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.let { onDirectFix(it) }
+            directGpsActive = true
+        } catch (_: SecurityException) {
+            // Permission not granted (yet) → leave the daemon poll as the source. Tear
+            // down the half-started thread so we don't leak it.
+            stopDirectGps()
+        } catch (_: Throwable) {
+            stopDirectGps()
+        }
+    }
+
+    /** Stop the direct subscription + tear down its thread. Idempotent. */
+    private fun stopDirectGps() {
+        directGpsActive = false
+        try {
+            (getSystemService(LOCATION_SERVICE) as? LocationManager)?.removeUpdates(gpsListener)
+        } catch (_: Throwable) {}
+        gpsThread?.let { try { it.quitSafely() } catch (_: Throwable) {} }
+        gpsThread = null
+    }
+
+    /**
+     * A direct platform fix arrived (on the gps HandlerThread). Hop to the main thread,
+     * feed the estimator with the fix's HARDWARE-CAPTURE instant in the elapsedRealtime
+     * (monotonic) domain so [renderMotionFrame] dead-reckons to the true present. CAN
+     * wheel-speed/brake (when present) still come from the daemon fuse via [lastFix];
+     * fall back to the fix's own GPS speed otherwise.
+     */
+    private fun onDirectFix(loc: Location) {
+        if (loc.latitude == 0.0 && loc.longitude == 0.0) return
+        // Capture instant in the MONOTONIC domain (== the render tick's nowMono clock).
+        // A stub/emulated provider can report 0 here → fall back to "now" (loses age
+        // compensation but keeps the no-poll/no-IPC latency win).
+        val capRaw = loc.elapsedRealtimeNanos / 1_000_000L
+        val captureMono = if (capRaw > 0L) capRaw else android.os.SystemClock.elapsedRealtime()
+        mainHandler.post {
+            if (isFinishing || isDestroyed) return@post
+            if (captureMono <= lastFedFixCaptureMonoMs) return@post  // de-dup / out-of-order
+            lastFedFixCaptureMonoMs = captureMono
+            // Mark RECEPTION (before the acceptance check) so the daemon fallback stops
+            // feeding as soon as direct fixes flow — this is the tie-breaker that lets the
+            // direct source escape the daemon's lastAcceptedTs≈now pin and win acceptance.
+            lastDirectFixSeenMonoMs = android.os.SystemClock.elapsedRealtime()
+            // Prefer the smooth BYD CAN wheel speed (carried on the last daemon fix) over
+            // the noisy GPS speed; fall back to the fix's own speed, else 0.
+            val canMps = lastFix?.canSpeedKmh?.let { it / 3.6 }
+            val speedMps = canMps ?: (if (loc.hasSpeed()) loc.speed.toDouble() else 0.0)
+            val result = motionEstimator.onTruthPoint(
+                lat = loc.latitude, lng = loc.longitude,
+                speedMps = speedMps,
+                rawBearingDeg = if (loc.hasBearing()) loc.bearing.toDouble() else null,
+                accuracyM = if (loc.hasAccuracy()) loc.accuracy.toDouble() else null,
+                tsMs = captureMono,                       // fix-capture instant, MONO domain
+                brakePercent = lastFix?.brakePercent
+            )
+            // ACCEPTANCE gate: onTruthPoint returns a Motion stamped with the accepted
+            // tsMs on success, or the UNCHANGED prior Motion on rejection (bad accuracy,
+            // or tsMs <= the estimator baseline — which happens for the first 1-3 direct
+            // fixes right after the daemon seeded the baseline with a LATER ingestion
+            // instant). Only treat the fix as "the direct source is live" when it was
+            // ACCEPTED. Otherwise: do NOT advance the render anchor (would dead-reckon off
+            // a frozen baseline). The daemon fallback GATE is keyed on RECEPTION
+            // (lastDirectFixSeenMonoMs, set above) — NOT on acceptance — so the daemon
+            // stops feeding and lets the estimator baseline go stale, which is what
+            // ultimately lets a direct fix win acceptance here.
+            val accepted = result.timestampMs == captureMono
+            if (!accepted) return@post
+            lastAcceptedFixMonoMs = android.os.SystemClock.elapsedRealtime()  // freeze-guard signal
+            // Anchor the render clock to this capture instant so the dead-reckon dt =
+            // (nowMono − capture) covers the full transport age (see renderMotionFrame).
+            lastFixCaptureMonoMs = captureMono
+            // Mirror into lastFix so recenter()/idle readers see the fresh position. Build
+            // a lightweight LatLngFix; timestampMs stays the capture instant (mono) — only
+            // the estimator path consumes it now.
+            lastFix = RoadSenseHazardApiClient.LatLngFix(
+                lat = loc.latitude, lng = loc.longitude,
+                bearing = if (loc.hasBearing()) loc.bearing.toDouble() else lastFix?.bearing,
+                speed = if (loc.hasSpeed()) loc.speed.toDouble() else null,
+                accuracy = if (loc.hasAccuracy()) loc.accuracy.toDouble() else null,
+                timestampMs = captureMono,
+                canSpeedKmh = lastFix?.canSpeedKmh,
+                accelPercent = lastFix?.accelPercent,
+                brakePercent = lastFix?.brakePercent
+            )
+            startMotionFollow()   // idempotent — ensure the glide tick is running
+        }
+    }
+
+    /** elapsedRealtime (ms) capture-instant of the last fix fed via the DIRECT source,
+     *  for de-dup. Distinct from [lastFedFixTsMs] (the daemon wall-clock dedup). */
+    @Volatile private var lastFedFixCaptureMonoMs: Long = 0L
+    /** Capture instant (elapsedRealtime ms) the dead-reckon clock anchors to. Set by
+     *  the direct source ([onDirectFix]); the render tick extrapolates from it. */
+    @Volatile private var lastFixCaptureMonoMs: Long = 0L
+
     /**
      * Paint one render frame from the dead-reckoned motion estimate: glide the puck
      * to the predicted position and ease the heading-up camera to follow it. Runs at
@@ -4185,11 +5007,36 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      * position/bearing dead-band so a parked car doesn't churn frames.
      */
     private fun renderMotionFrame() {
-        // Use the daemon clock domain when we have it, else the monotonic clock.
-        val now = lastFix?.timestampMs?.let {
-            it + (android.os.SystemClock.elapsedRealtime() - lastTruthElapsedMs)
-        } ?: android.os.SystemClock.elapsedRealtime()
-        val m = motionEstimator.estimate(now) ?: return
+        // Single MONOTONIC clock for the dead-reckon. Both truth feeders now stamp the
+        // estimator in the elapsedRealtime domain: the DIRECT source uses the fix's true
+        // HARDWARE-CAPTURE instant (Location.getElapsedRealtimeNanos), so the dead-reckon
+        // dt = (nowMono − capture) extrapolates the pose to the TRUE present INCLUDING the
+        // full transport age — the lag fix (the old path anchored to the INGESTION instant
+        // and could never shed the fix→ingestion latency); the daemon FALLBACK path stamps
+        // the ingestion instant (no capture time survives upstream), so it stays
+        // ingestion-anchored as before. `now` == `nowMono` so estimate()'s dt is correct
+        // for both; the second arg feeds the (disabled) gyro-silence check in the same epoch.
+        val nowMono = android.os.SystemClock.elapsedRealtime()
+        // FREEZE-GUARD (render-tick watchdog, GRID-INDEPENDENT). The dead-reckon caps at
+        // MAX_DEAD_RECKON_S (3 s): past it the puck FREEZES at the 3-s-ahead point until a
+        // fresh truth fix lands. The daemon fallback poll is quantized to the 1 Hz feeder
+        // grid (and can return null), so it cannot reliably re-feed BEFORE the cap. This
+        // watchdog runs at the sub-second render cadence: if the estimator baseline is
+        // approaching the cap and no truth fix has refreshed it, RE-ANCHOR the estimator to
+        // the last known REAL position (lastFix) at `nowMono`. That holds the puck at the
+        // last real fix (NOT flying off on a stale extrapolation) and resets the dead-reckon
+        // clock, so the puck can never sit frozen at the cap regardless of grid phase or a
+        // failed daemon poll. Only fires in a genuine truth STALL — during normal driving a
+        // truth fix refreshes the baseline every ~1 s, far inside this window.
+        // Guard lastFixCaptureMonoMs>0: a 0 baseline is "no truth anchored yet" (fresh /
+        // post-resume-reset) — NOT a 2.2s-old stale anchor — so don't let the elapsed-since-
+        // epoch-0 value (huge) trip the watchdog and re-anchor off a stale lastFix before the
+        // first real fix lands. Also requires the estimator to already hold a fix.
+        if (lastFixCaptureMonoMs > 0L &&
+            (nowMono - lastFixCaptureMonoMs) >= KEEP_WARM_BEFORE_CAP_MS) {
+            reanchorToLastFix(nowMono)
+        }
+        val m = motionEstimator.estimate(nowMono, nowMono) ?: return
 
         // Snap the dead-reckoned prediction onto the route polyline so the puck
         // rides the LINE (not floating beside it) and the heading-up camera can
@@ -4208,6 +5055,9 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             puckOnRoute -> snap.offsetM <= PUCK_SNAP_EXIT_M    // already snapped → stay until clearly off
             else -> snap.offsetM <= PUCK_SNAP_ENTER_M          // not snapped → enter only when close
         }
+        // Trim the traveled route behind the car (GPU line-gradient; uses this same
+        // snapped progress so the boundary rides under the puck). Off-route holds.
+        applyRouteTrim(snap, puckOnRoute)
 
         val targetLat: Double; val targetLng: Double; val rawBearing: Double
         if (puckOnRoute && snap != null) {
@@ -4237,13 +5087,38 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             puckLng = renderedPuckLng + (targetLng - renderedPuckLng) * frac
         }
         renderedPuckLat = puckLat; renderedPuckLng = puckLng; lastPuckEaseMs = nowMs
-        // Still EMA the bearing so even a tangent step at a vertex eases rather than
-        // snapping; below the moving gate this no-ops to the held value.
-        val bearing = if (moving) smoothBearing(rawBearing) else rawBearing
+        // Bearing source for the painted heading:
+        //  (A) ON-ROUTE: the route tangent IS ground-truth heading (smooth by
+        //      construction — it only steps at vertices), so steer by it DIRECTLY
+        //      instead of low-passing it through smoothBearing. The EMA was added to
+        //      tame noisy GPS heading, but it also LAGS a real turn (corner-cut); the
+        //      tangent has no noise to tame, so skipping the lag makes turns crisp.
+        //  OFF-ROUTE / no route: keep the EMA over the (raw GPS or gyro-fused) heading.
+        //      When the gyro is healthy m.bearingDeg is already the real-time gyro-
+        //      integrated heading from estimate(), so the EMA just smooths its vertices.
+        val bearing = when {
+            puckOnRoute && snap != null && moving -> {
+                // Paint the crisp tangent, but ALSO keep smoothBearing's state primed with
+                // it (advances smoothedBearing + lastBearingSmoothMs). Otherwise the EMA
+                // freezes for the whole on-route stretch and, at a snap-EXIT flip (lane
+                // split / off-route), the next smoothBearing() would ease from a stale held
+                // value → a visible heading whip. Priming keeps the flip seamless.
+                smoothBearing(rawBearing)
+                rawBearing                                               // tangent, no EMA lag
+            }
+            moving -> smoothBearing(rawBearing)
+            else -> rawBearing
+        }
         lastBearing = bearing
         // Puck at the eased pose — instant, it's already smooth.
         updateLocationPuckAt(puckLat, puckLng, bearing)
 
+        // PUCK-ONLY when idle-browsing (not navigating, not the cluster mirror): the
+        // idle follow now runs this same render tick (SOTA idle glide), but the idle
+        // contract is "puck glides underneath, camera stays where the user panned". So
+        // gate the heading-up camera follow on an active follow regime. Navigating + the
+        // cluster mirror DO drive the camera (heading-up immersive view).
+        if (!navigating && !clusterMode) return
         // Dead-band keyed on the PUCK position so a parked car doesn't churn frames.
         // While moving we want EVERY frame to glide, so the gate is intentionally
         // tiny (sub-metre) — its only job is to freeze a stationary vehicle.
@@ -4299,6 +5174,10 @@ open class RoadSenseMapActivity : AppCompatActivity() {
     /** Consecutive guidance ticks the car has been near-stopped within the final-approach
      *  band — debounces the speed-gated arrival against a brief halt just short of the pin. */
     private var nearStopTicks: Int = 0
+    /** Consecutive guidance ticks the PUCK (estimator pose, fed by the low-latency direct
+     *  fix) has been within the arrival radius of the locked destination AND stopped — the
+     *  puck-proximity arrival debounce, independent of the laggy daemon-poll engine state. */
+    private var puckArrivedTicks: Int = 0
 
     // Dead-band for the guidance/cluster camera follow: skip the animateCamera when
     // the new target is within ~3m of the last animated target AND |Δbearing| < ~2°,
@@ -4351,6 +5230,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 previewRoutes = routes
                 previewSelectedIdx = 0
                 guidance.start(routes[0])
+                resetRouteTrim()   // rerouted → reset trim against the NEW route arc length
                 lastSpokenInstruction = null
                 drawRoutePreview(routes, 0)
                 // Propagate the NEW best route to the cluster mirror. Without this
@@ -4415,6 +5295,9 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         puckOnRoute = false             // reset the on-route snap latch
         lastFedFixTsMs = 0L             // reset the duplicate-fix dedup for the next trip
         nearStopTicks = 0               // reset the near-stop arrival debounce
+        puckArrivedTicks = 0            // reset the puck-proximity arrival debounce
+        lastRouteProgress = 0f          // reset traveled-route trim (source emptied below)
+        lastAppliedProgress = -1f
         routeSource?.setGeoJson(EMPTY_FEATURE_COLLECTION)
         altRouteSource?.setGeoJson(EMPTY_FEATURE_COLLECTION)
         clearItineraryMarkers()
@@ -4552,6 +5435,13 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      *  dead-reckoning render frame (interpolated pose) and the fix-based path. */
     private fun updateLocationPuckAt(lat: Double, lng: Double, bearing: Double) {
         val style = map?.style ?: return
+        // Skip while a style is mid-load (theme reload): the ~30fps render tick is a
+        // SEPARATE caller from onStyleLoaded, so during the setStyle swap map.style points
+        // at a not-fully-loaded style — getSourceAs returns null → the addSource/addLayer
+        // path below would hit MapLibre's validateState ("newer style is loading") and
+        // crash. The reload's onStyleLoaded re-registers the puck right after, and the
+        // next render tick repaints it, so skipping this frame is invisible.
+        if (!style.isFullyLoaded) return
         // Hot path: the puck source is rewritten EVERY render frame (~30fps from
         // renderMotionFrame). Push a TYPED Feature, not a JSON string. setGeoJson(String)
         // routes to nativeSetGeoJsonString, which runs a full JSON PARSER on the native
@@ -4760,12 +5650,53 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // crashed the whole app — the intermittent "clicking Map crashes Overdrive".
         // Guard every forward with ::mapView.isInitialized.
         if (::mapView.isInitialized) mapView.onStart()
+        // (C) Start the app-side gyro tap for crisp-turn heading fusion. Idempotent +
+        // self-disabling when no real gyro — safe to call unconditionally. Paired with
+        // stopGyroFusion() in onStop so a backgrounded map isn't holding the sensor.
+        if (::mapView.isInitialized) startGyroFusion()
     }
 
     override fun onResume() {
         super.onResume()
         if (!::mapView.isInitialized) return
         mapView.onResume()
+        // RESUME-SNAP: while backgrounded the render tick was suspended, so the estimator's
+        // filtered state + the painted puck (renderedPuckLat) are frozen at the position
+        // from when we left. On return, resuming the loops would EMA-glide the estimator
+        // and ramp the painted puck (PUCK_MAX_CATCHUP_MPS clamp) from that stale spot toward
+        // the live fix — the "puck starts where I backgrounded and slides to where I am"
+        // artifact. SOTA is to resume at the EXACT current position with no glide. After a
+        // real away-period, hard-RESET the estimator (next truth fix SEEDS directly, no EMA
+        // blend) and clear the painted anchor (renderMotionFrame's NaN branch seeds the puck
+        // directly). The fresh direct-GPS subscription / daemon poll started below delivers
+        // that current fix within ~1s. A momentary flip (< the threshold) skips the reset so
+        // a quick notification-shade peek doesn't re-seed needlessly.
+        val awayMs = if (backgroundedAtMono > 0L)
+            android.os.SystemClock.elapsedRealtime() - backgroundedAtMono else 0L
+        backgroundedAtMono = 0L
+        if (awayMs >= RESUME_SNAP_AFTER_MS) {
+            motionEstimator.reset()        // next onTruthPoint seeds directly (no glide)
+            renderedPuckLat = Double.NaN   // paint re-seeds at the target (no catchup ramp)
+            renderedPuckLng = Double.NaN
+            lastFixCaptureMonoMs = 0L       // force a fresh truth anchor on the next fix
+            lastFedFixCaptureMonoMs = 0L
+            lastFedFixTsMs = 0L
+            // Also clear the daemon-fallback gate timestamps. Otherwise, if the in-process
+            // getLastKnownLocation seed comes back null on resume, these stay ~awayMs old
+            // and can still read < DIRECT_FIX_FALLBACK_MS for the first ~1s — gating the
+            // daemon poll OFF while the estimator is empty (reset) → a ~1s blank puck until
+            // the live 1 Hz listener seeds. Zeroing them makes (now − last) huge → the gate
+            // opens → the first daemon poll feeds/SEEDS the reset estimator immediately (the
+            // daemon feed on a null estimator takes the SEED path, so no snap-back); a real
+            // direct fix then re-pins both and the gate re-engages normally.
+            lastDirectFixSeenMonoMs = 0L
+            lastAcceptedFixMonoMs = 0L
+        }
+        // Subscribe to the platform location provider directly (low-latency truth feed;
+        // see startDirectGps). Idempotent + permission-safe; the daemon poll below stays
+        // as the cold-start seed + fallback until this warms up. getLastKnownLocation seeds
+        // it immediately so the post-reset puck appears at the current position promptly.
+        startDirectGps()
         // Resume the camera/guidance loops suspended in onStop (state was kept).
         if (navigating) {
             mainHandler.removeCallbacks(guidanceRunnable); mainHandler.post(guidanceRunnable)
@@ -4780,6 +5711,18 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             // refreshes on resume and keeps tracking. PUCK-ONLY (never moves the camera)
             // so a user who panned away keeps their view.
             startIdleFollow()
+        }
+        // CLUSTER black-projection self-heal — runs on EVERY cluster resume, OUTSIDE the
+        // navigating/idle branch split. A cluster instance can be navigating (the mirror
+        // sets navigating=true from NavSession), and that branch above starts the motion
+        // render tick but NOT the keep-warm ticker (removed in onStop) nor a one-shot
+        // repaint — so a navigating cluster resumed while STATIONARY on a silently-
+        // recreated WHEN_DIRTY surface would stay BLACK. Arm the keep-warm ticker + force
+        // one repaint here so the heal covers BOTH navigating and idle cluster resumes.
+        // (forceClusterRepaint/startClusterKeepWarm are no-ops / self-deduped off-cluster.)
+        if (clusterMode) {
+            startClusterKeepWarm()
+            forceClusterRepaint()
         }
         // Head unit: resume watching the cluster-projection flag (suspended in onStop).
         if (!clusterMode) startHeadUnitProjectionPoll()
@@ -4798,15 +5741,24 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // so onResume restarts seamlessly.
         mainHandler.removeCallbacks(guidanceRunnable)
         mainHandler.removeCallbacks(clusterFollowRunnable)
+        mainHandler.removeCallbacks(clusterKeepWarmRunnable)   // suspend the keep-warm repaint nudge
         mainHandler.removeCallbacks(idleFollowRunnable)
         stopHeadUnitProjectionPoll()   // suspend the cluster-projection watch while backgrounded
         projectionActive = false       // clear so onResume re-derives it (the poll's first
                                        // read is 1s out; don't carry a stale-true → avoid
                                        // ~1s of throttled glide after a resume)
         stopMotionFollow()   // pause the dead-reckoning render tick while backgrounded
+        stopGyroFusion()     // release the gyro + its thread while backgrounded
+        stopDirectGps()      // release the platform location subscription + its thread
+        backgroundedAtMono = android.os.SystemClock.elapsedRealtime()   // for the resume-snap
         if (::mapView.isInitialized) mapView.onStop()
         super.onStop()
     }
+
+    /** elapsedRealtime (ms) the map was backgrounded (onStop), so onResume can tell a
+     *  brief flip from a real away-period and SNAP the puck to the current position
+     *  instead of gliding it from the stale pre-background spot. 0 = never backgrounded. */
+    @Volatile private var backgroundedAtMono: Long = 0L
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
@@ -4836,6 +5788,8 @@ open class RoadSenseMapActivity : AppCompatActivity() {
     override fun onDestroy() {
         navigating = false
         mainHandler.removeCallbacksAndMessages(null)
+        stopGyroFusion()   // defensive: release the gyro thread if onStop was skipped
+        stopDirectGps()    // defensive: release the location subscription + thread
         clusterDisplayListener?.let { l ->
             try {
                 (getSystemService(android.content.Context.DISPLAY_SERVICE)
@@ -4876,6 +5830,8 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         MapTilePrefetcher.cancelPending()
         hazardSource = null
         routeSource = null
+        routeMainLayer = null
+        routeCasingLayer = null
         // Null symmetry: drop the remaining style-bound source/layer + sheet refs
         // so they don't pin a destroyed Style/MapView (no-op safety; map is gone).
         altRouteSource = null
@@ -5025,12 +5981,46 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // Autocomplete debounce + minimum query length (don't spam the geocoder).
         const val AUTOCOMPLETE_DEBOUNCE_MS = 300L
         const val AUTOCOMPLETE_MIN_CHARS = 3
+        /** Max local (saved + recent) rows surfaced above remote autocomplete hits. */
+        const val LOCAL_MATCH_CAP = 4
 
         // Guidance loop cadence + camera/announce thresholds. The camera
         // animation duration is matched to the tick interval so each glide ends
         // right as the next fix arrives — continuous motion, no animate-then-freeze
         // stutter (the old 2000ms tick / 900ms anim left the puck frozen ~1.1s).
         const val GUIDANCE_TICK_MS = 1000L
+        /** Window after which the daemon poll resumes feeding the puck if the DIRECT
+         *  in-process GPS source hasn't (a) delivered a fix OR (b) had a fix accepted —
+         *  the two-clause source-preference gate in feedMotionTruth.
+         *
+         *  This NO LONGER has to beat the dead-reckon cap — the render-tick freeze-guard
+         *  (reanchorToLastFix, fired at KEEP_WARM_BEFORE_CAP_MS) guarantees the puck can't
+         *  freeze at the cap independently of this value or the 1 Hz grid. So this is now a
+         *  pure source-preference knob: 2500 ms ≈ 2× the ~1 s direct-fix interval, so a
+         *  SINGLE dropped direct fix (≈2 s gap) does NOT hand control back to the coarser
+         *  daemon feed (avoiding the per-dropped-fix snap-back a 1500 ms value caused),
+         *  while a genuinely-dead direct source (no permission / provider off, >2.5 s quiet)
+         *  still lets the daemon poll resume as the fallback truth feed. */
+        const val DIRECT_FIX_FALLBACK_MS = 2500L
+        /** Render-tick freeze-guard threshold (ms): when the estimator baseline is this old
+         *  and no truth fix has refreshed it, reanchorToLastFix() holds the puck at the last
+         *  real position. MUST be < MAX_DEAD_RECKON_S (3000 ms) by a comfortable margin so a
+         *  re-anchor always lands before the dead-reckon caps. Sub-second render cadence
+         *  (RENDER_TICK_MS=33 / IDLE_RENDER_TICK_MS=200) makes this grid-independent — no
+         *  1 Hz quantization. 2200 ms leaves ~800 ms headroom below the cap. */
+        const val KEEP_WARM_BEFORE_CAP_MS = 2200L
+        /** Accuracy (m) the freeze-guard re-anchor feeds the estimator — clamped to the
+         *  estimator's GOOD bar (18m) so the re-anchor is ALWAYS accepted (never hits the
+         *  55m reject), even when the last real fix was coarse. We hold the last real
+         *  position, so claiming a tight accuracy is honest. */
+        const val REANCHOR_ACCURACY_M = 18.0
+        /** Min background duration (ms) before onResume hard-snaps the puck to the current
+         *  position (estimator reset + paint re-seed, no glide). Below it, a momentary flip
+         *  (notification shade, quick app switch) keeps the smooth state so it doesn't
+         *  needlessly re-seed. ~1.2s ≈ just over one fix interval — long enough that the
+         *  pre-background position is genuinely stale, short enough to catch any real
+         *  away-and-back. */
+        const val RESUME_SNAP_AFTER_MS = 1200L
         const val GUIDANCE_CAM_ANIM_MS = 1000
         const val MANEUVER_ANNOUNCE_M = 180.0
 
@@ -5056,6 +6046,22 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         const val CLUSTER_BANNER_PAD_V_DP = 8
         const val CLUSTER_BANNER_RADIUS_DP = 16
         const val CLUSTER_BANNER_ICON_MARGIN_DP = 10
+        // (The old CLUSTER_OVERSCAN_X/Y_DP top-start insets are gone: the banner now anchors
+        // to the speed-badge CENTRE, which sits well inside the panel — far clear of the
+        // (80,50)px overscan band — so no separate overscan margin is needed.)
+        // Traveled-route trim (line-gradient). TRIM_FEATHER = the line-progress width of
+        // the antialiased fade at the trim boundary (~1.2% of the route). TRIM_PROGRESS_EPS
+        // = the paint dead-band: skip a gradient repaint until progress advances this much
+        // (~0.2% of the route ≈ a few metres), so a parked/creeping car emits zero writes.
+        const val TRIM_FEATHER = 0.012f
+        const val TRIM_PROGRESS_EPS = 0.002f
+        // The speed badge (ClusterSpeedOverlay, a daemon SurfaceControl layer at z=MAX so it
+        // always composites OVER this map) is a short strip on the LEFT whose BOTTOM sits just
+        // above the panel vertical centre. The TBT banner stacks directly below it, sharing
+        // this left edge and pinning its TOP at panelH/2 (see applyClusterChrome). Only the
+        // left edge needs to match the daemon; the seam is panelH/2 on both sides, and the
+        // badge's own height/aspect are private to ClusterSpeedOverlay now.
+        const val CLUSTER_SPEED_BADGE_LEFT_PX = 56    // mirrors ClusterSpeedOverlay.LEFT_MARGIN_PX
 
         // Immersive driving view: 3D tilt, close zoom, heading-up follow.
         const val IMMERSIVE_TILT = 55.0
@@ -5086,6 +6092,10 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         // FPS cap discards. Match the compute rate to the cap (≈67ms = 15fps) — same
         // glance-smooth motion, half the per-frame pose math on the shared SoC.
         const val CLUSTER_RENDER_TICK_MS = 67L
+        /** Cluster keep-warm repaint interval (ms): bounds how long a silently-recreated
+         *  WHEN_DIRTY surface can stay black before a triggerRepaint() repaints it. ~3s is
+         *  a negligible GPU cost (one frame/3s) vs the parked-car black-out risk. */
+        const val CLUSTER_KEEP_WARM_MS = 3000L
 
         // Idle render tick: when the car is parked (no motion to interpolate) drop the
         // dead-reckon tick from 30fps to 5fps. At 30fps the tick + per-frame puck

@@ -20,4 +20,14 @@
         android:contentDescription="@string/settings_language_label"
         android:src="@drawable/ic_language"
         app:tint="?attr/colorOnSurfaceVariant" />
+
+    <ImageButton
+        android:id="@+id/railHelpButton"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:layout_marginTop="6dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/onboarding_help_cd"
+        android:src="@drawable/ic_help"
+        app:tint="?attr/colorOnSurfaceVariant" />
 </LinearLayout>

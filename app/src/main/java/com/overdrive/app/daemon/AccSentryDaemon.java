@@ -1897,25 +1897,18 @@ public class AccSentryDaemon {
      * @return The correct GO_TO_SLEEP_REASON code (9 for older, 13 for SDK 32+).
      */
     private static int getSystemSleepReasonCode() {
-        // esco (p111dh/C5006t.java:152-156) and DiPlus (p010b0/C1569m.java:33)
-        // both probe ONLY GO_TO_SLEEP_REASON_ACCOFF (BYD's added constant) and
-        // fall back to the SDK_INT >= 32 ? 13 : 9 literal. The previous
-        // multi-name probe was a foot-gun: GO_TO_SLEEP_REASON_DEVICE_ADMIN is
-        // value 1 in AOSP (NOT 13), so the probe order could return 1 on
-        // ROMs without GO_TO_SLEEP_REASON_ACCOFF — wildly wrong.
+        // Probe the BYD-added GO_TO_SLEEP_REASON_ACCOFF constant; if absent,
+        // fall back to the SDK-version literal (13 on SDK 32+, else 9).
         try {
             java.lang.reflect.Field field =
                 PowerManager.class.getDeclaredField("GO_TO_SLEEP_REASON_ACCOFF");
             field.setAccessible(true);
             return field.getInt(null);
-        } catch (NoSuchFieldException ignored) {
-            // BYD's constant isn't in this PowerManager — fall through to
-            // the AOSP-version literal.
-        } catch (Exception ignored) {
-            // Access error — same fall-through.
+        } catch (NoSuchFieldException e) {
+            // Constant not present on this firmware — use the version literal.
+        } catch (Exception e) {
+            // Access error — use the version literal.
         }
-        // SDK_INT >= 32 → 13 (modern), else 9 (legacy). Matches esco
-        // C5006t.m22831g and DiPlus C1563g.m1723l exactly.
         return android.os.Build.VERSION.SDK_INT >= 32 ? 13 : 9;
     }
 
@@ -1927,47 +1920,29 @@ public class AccSentryDaemon {
      * CRITICAL: This is the initial wake call when entering sentry mode.
      * The keep-alive thread maintains this state via userActivity().
      */
+    // Cached 3-arg PowerManager.wakeUp(long, int, String), resolved once.
+    private static volatile Method pmWakeUp3ArgMethod;
+
     private static void performSystemWakeUp() {
         if (appContext == null) {
             log("performSystemWakeUp: No context available");
             return;
         }
-        
+
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
             PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
-            
-            // 1. Get the correct lock key (9 or 13) dynamically
+
             int reasonID = getSystemSleepReasonCode();
-            
-            // 2. Try the 3-arg wakeUp method (most reliable on BYD)
-            try {
-                Method method = PowerManager.class.getMethod("wakeUp", Long.TYPE, Integer.TYPE, String.class);
-                method.invoke(pm, android.os.SystemClock.uptimeMillis(), reasonID, "ACC_ON");
-                log("System wake-up sent (reason: " + reasonID + ")");
-                return;
-            } catch (NoSuchMethodException e) {
-                // Fall through to 1-arg version
+
+            if (pmWakeUp3ArgMethod == null) {
+                pmWakeUp3ArgMethod = PowerManager.class.getMethod(
+                        "wakeUp", Long.TYPE, Integer.TYPE, String.class);
             }
-            
-            // 3. Fallback: 1-arg wakeUp (older Android)
-            try {
-                Method method = PowerManager.class.getMethod("wakeUp", long.class);
-                method.invoke(pm, android.os.SystemClock.uptimeMillis());
-                log("System wake-up sent (1-arg fallback)");
-                return;
-            } catch (NoSuchMethodException e) {
-                // Fall through to keyevent
-            }
-            
-            // 4. Last resort: keyevent
-            log("wakeUp methods unavailable, using keyevent fallback");
-            execShell("input keyevent 224");
-            
-        } catch (Exception e) {
-            log("Wake-up failed: " + e.getMessage());
-            // Fallback for extreme cases
-            execShell("input keyevent 224");
+            pmWakeUp3ArgMethod.invoke(pm, android.os.SystemClock.uptimeMillis(), reasonID, "ACC_ON");
+            log("System wake-up sent (reason: " + reasonID + ")");
+        } catch (Throwable t) {
+            log("Wake-up failed: " + t.getMessage());
         }
     }
 
@@ -2105,20 +2080,28 @@ public class AccSentryDaemon {
             // in enterSentryMode; this only defends against the MCU/BCM
             // silently dropping the flag mid-session.
             final long ISP_VOTE_REASSERT_EVERY_TICKS = 30;  // 30 * 10s = 5 min
+            // Periodic MCU re-wake + peripheral-rail re-assert cadence. On some
+            // models the BCM drifts the MCU back to sleep mid-park after the
+            // one-shot enterSentryMode wake, which collapses the USB-bridged SD
+            // reader rail and the modem/data rail — the unit then loses USB/SD
+            // power AND network connectivity while parked. Re-asserting on a slow
+            // cadence holds them up. 48 ticks * 10s = 8 min.
+            final long MCU_REWAKE_EVERY_TICKS = 48;  // 48 * 10s = 8 min
             long tick = 0;
 
             while (running && inSentryMode) {  // Check BOTH flags
                 try {
                     // 1. Maintain Network Interface Stability
                     ensureWifiEnabled();
-                    // Fake-activity injection resets the AP sleep timer (2-arg
-                    // userActivity(long, true) at :2579 keeps the CPU awake without
-                    // turning the screen on). That directly defeats "Keep USB power"
-                    // OFF, where performSystemWakeUp() was deliberately skipped so the
-                    // AP can reach deep sleep and USB drops. Only inject when the
-                    // toggle is ON (default). The ISP/AVM camera vote and AVC
-                    // keep-alive below stay unconditional — they're the camera rail,
-                    // not the AP wake, and surveillance needs them either way.
+                    // Fake-activity injection resets the AP sleep timer using the
+                    // 2-arg stealth userActivity(uptime, noChangeLights=true), which
+                    // holds the AP awake (USB VBUS follows wakefulness) WITHOUT
+                    // relighting the panel. We can therefore keep the backlight OFF
+                    // and USB powered at the same time. Only inject when "Keep USB
+                    // powered" is ON (default); toggle OFF lets the AP drift to sleep
+                    // and USB drop to save the 12 V battery. The ISP/AVM camera vote
+                    // and AVC keep-alive below stay unconditional — they're the camera
+                    // rail, not the AP wake, and surveillance needs them either way.
                     if (isKeepUsbPowerOnAccOff()) {
                         injectFakeUserActivity();
                     }
@@ -2144,27 +2127,34 @@ public class AccSentryDaemon {
                     // actively consuming frames. Useful even on legacy if
                     // a dashcam mode is running across ACC OFF (rare).
                     //
-                    // "Keep USB powered" gate: on DiLink 3.0 / legacy panoramic
-                    // trims the SD card is a USB-bridged reader (block major 8)
-                    // whose power rail follows the AP/display wake state. When
-                    // surveillance is suppressed (e.g. parked in a safe zone) the
-                    // GPU pipeline never starts, so cameraActiveUntilMs is never
-                    // published and isCameraPipelineActive() stays false — the
-                    // backlight-off tick then fires, the screen goes off,
-                    // injectFakeUserActivity() self-skips (it no-ops with the
-                    // screen off, see :2558), the AP sleeps, and the bridged-SD
-                    // rail drops ~90s into the park even though the user asked to
-                    // keep USB powered. So when the toggle is ON, hold the
-                    // backlight on regardless of pipeline state — this keeps the
-                    // AP awake (userActivity keeps re-pumping with the screen on)
-                    // and the SD mounted. Mirrors the toggle gate already on
-                    // performSystemWakeUp() (:1335) and injectFakeUserActivity()
-                    // (:2122). Toggle OFF → unchanged: let the screen sleep and
-                    // USB/SD drop to save the 12 V battery.
+                    // "Keep USB powered" is NO LONGER a backlight gate. Keeping
+                    // USB powered needs the AP awake (wakefulness AWAKE → VBUS),
+                    // NOT the panel illuminated — so we let the backlight go off
+                    // here even with the toggle ON, rather than pinning the panel
+                    // lit for the whole park (the old behaviour: a parked car with
+                    // a fully lit screen all night).
+                    //
+                    // AP wakefulness is held by two mechanisms: (a) the per-tick
+                    // injectFakeUserActivity() above WHILE the panel is on (it
+                    // self-skips once getPowerScreenStatus()==0, i.e. after this
+                    // backlight-off tick), and (b) the periodic performSystemWakeUp()
+                    // in the 8-min re-assert block below, which re-arms wakefulness
+                    // with the panel dark (then immediately re-darks it). (b) is the
+                    // load-bearing re-assert once the screen is off.
+                    //
+                    // We still suppress the backlight-off in three cases that
+                    // genuinely need the panel powered:
+                    //   - a screen deterrent is on-screen (it owns the backlight);
+                    //   - DiLink 4 AVMCamera HAL ties its preview surface to display
+                    //     power — backlight off makes it emit event=8 ("camera
+                    //     died") and tear down 24/7 sentry recording;
+                    //   - the GPU camera pipeline is actively consuming frames
+                    //     (cameraActiveUntilMs lease) on a display-coupled HAL.
+                    // Legacy pano_h/pano_l HALs are display-state-agnostic, so on
+                    // those the backlight goes off here even mid-recording.
                     if (!isScreenDeterrentActive()
                             && !isDilink4CameraMode()
-                            && !isCameraPipelineActive()
-                            && !isKeepUsbPowerOnAccOff()) {
+                            && !isCameraPipelineActive()) {
                         setBacklightState(false);
                     }
 
@@ -2198,6 +2188,53 @@ public class AccSentryDaemon {
                             applySentryIspPowerVote(true);
                         } catch (Throwable t) {
                             log("ISP power vote re-assert failed: " + t.getMessage());
+                        }
+                    }
+
+                    // Periodic MCU re-wake + peripheral-rail re-assert (every
+                    // MCU_REWAKE_EVERY_TICKS, ~8 min). Gated on the "Keep USB
+                    // powered" toggle so the battery-save (toggle-OFF) path is
+                    // byte-unchanged — when the user opted to let the AP/USB
+                    // sleep we must NOT re-wake the MCU here. Skipped on tick 0
+                    // because enterSentryMode just ran the same sequence seconds
+                    // ago. configurePeripheralPower(true) is idempotent and
+                    // already self-checks MCU status (re-waking it if asleep)
+                    // before re-writing the rails, so this is the exact same
+                    // proven entry-path call, just re-run on a slow cadence to
+                    // counter the BCM drifting the MCU back to sleep mid-park.
+                    if (tick > 0 && tick % MCU_REWAKE_EVERY_TICKS == 0
+                            && isKeepUsbPowerOnAccOff()) {
+                        try {
+                            log("Periodic MCU re-wake + rail re-assert (8-min cadence)");
+                            // Re-assert the MCU + peripheral rails (idempotent;
+                            // self-wakes the MCU if the BCM slept it).
+                            configurePeripheralPower(true);
+                            // ALSO re-establish AP wakefulness. configurePeripheralPower
+                            // only drives the MCU/DC-DC rail, NOT the AP wake state —
+                            // and on DiLink 3.0 USB VBUS follows AP wakefulness. The
+                            // per-tick injectFakeUserActivity() pump self-skips once the
+                            // backlight is off (it returns early on getPowerScreenStatus
+                            // ==0), so without this the AP can drift to sleep mid-park and
+                            // USB/SD drops even with the toggle ON. performSystemWakeUp()
+                            // is the same AP-wake enterSentryMode casts at ACC-OFF.
+                            // NOTE: wakeUp() lights the panel. Left alone, the screen
+                            // would stay on until the next backlight-off tick (up to one
+                            // SYSTEM_KEEPALIVE_INTERVAL_MS away) — an ~8-min screen flash
+                            // on a parked car. So immediately re-dark the panel here under
+                            // the SAME conditions the per-tick backlight-off gate uses
+                            // (skip when a deterrent owns the panel, on dilink4 where
+                            // backlight-off kills the AVM HAL, or while the GPU pipeline is
+                            // actively consuming frames). The AP wakefulness set by
+                            // wakeUp() persists with the panel dark — exactly the desired
+                            // state. Gated on the same toggle so the OFF path is untouched.
+                            performSystemWakeUp();
+                            if (!isScreenDeterrentActive()
+                                    && !isDilink4CameraMode()
+                                    && !isCameraPipelineActive()) {
+                                setBacklightState(false);
+                            }
+                        } catch (Throwable t) {
+                            log("Periodic MCU re-wake / rail re-assert failed: " + t.getMessage());
                         }
                     }
                     tick++;

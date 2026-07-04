@@ -144,6 +144,11 @@ public class SurveillanceConfig {
     private boolean detectPerson = true;
     private boolean detectCar = true;
     private boolean detectBike = false;
+    // Animals (COCO 14-23: bird/cat/dog/horse/sheep/cow/elephant/bear/zebra/
+    // giraffe). Default OFF — opt-in only, like detectBike. The downstream
+    // pipeline (Actor.ClassGroup.ANIMAL, animalCount stats, recordings
+    // "Animal" filter chip) already exists; this flag is the input gate.
+    private boolean detectAnimal = false;
     
     // Recording
     private int preRecordSeconds = 5;
@@ -206,6 +211,11 @@ public class SurveillanceConfig {
     private boolean[] cameraEnabled = {true, true, true, true};  // front, right, rear, left (matches quadrant order: Q0=front, Q1=right, Q2=rear, Q3=left)
     private boolean motionHeatmapEnabled = false;
     private boolean filterDebugLogEnabled = false;
+    // Aggressively discard a recording that ended with NO real (non-static) actor
+    // when the scene was bright everywhere and nothing approached — the
+    // shadow/tree-branch false-positive. Default OFF. See the engine's
+    // shouldDiscardEvent() for the full safety predicate.
+    private boolean discardEmptyBrightMotionEvents = false;
     private int shadowFilterMode = 2;               // 0=OFF, 1=LIGHT, 2=NORMAL, 3=AGGRESSIVE
 
     // ========================================================================
@@ -280,6 +290,7 @@ public class SurveillanceConfig {
     }
     public boolean isMotionHeatmapEnabled() { return motionHeatmapEnabled; }
     public boolean isFilterDebugLogEnabled() { return filterDebugLogEnabled; }
+    public boolean isDiscardEmptyBrightMotionEvents() { return discardEmptyBrightMotionEvents; }
     public int getShadowFilterMode() { return shadowFilterMode; }
     
     // V2 setters
@@ -299,6 +310,7 @@ public class SurveillanceConfig {
         if (quadrant >= 0 && quadrant < 4) cameraEnabled[quadrant] = enabled;
     }
     public void setMotionHeatmapEnabled(boolean enabled) { this.motionHeatmapEnabled = enabled; }
+    public void setDiscardEmptyBrightMotionEvents(boolean enabled) { this.discardEmptyBrightMotionEvents = enabled; }
     public void setFilterDebugLogEnabled(boolean enabled) { this.filterDebugLogEnabled = enabled; }
     public void setShadowFilterMode(int mode) { this.shadowFilterMode = Math.max(0, Math.min(3, mode)); }
     
@@ -647,6 +659,7 @@ public class SurveillanceConfig {
     public boolean isDetectPerson() { return detectPerson; }
     public boolean isDetectCar() { return detectCar; }
     public boolean isDetectBike() { return detectBike; }
+    public boolean isDetectAnimal() { return detectAnimal; }
     public int getPreRecordSeconds() { return preRecordSeconds; }
     public int getPostRecordSeconds() { return postRecordSeconds; }
 
@@ -675,6 +688,7 @@ public class SurveillanceConfig {
     public void setDetectPerson(boolean detect) { this.detectPerson = detect; }
     public void setDetectCar(boolean detect) { this.detectCar = detect; }
     public void setDetectBike(boolean detect) { this.detectBike = detect; }
+    public void setDetectAnimal(boolean detect) { this.detectAnimal = detect; }
     
     public void setPreRecordSeconds(int seconds) {
         this.preRecordSeconds = Math.max(1, Math.min(30, seconds));

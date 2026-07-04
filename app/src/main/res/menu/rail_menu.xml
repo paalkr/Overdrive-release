@@ -26,6 +26,10 @@
         android:icon="@drawable/ic_trips"
         android:title="@string/rail_trips" />
     <item
+        android:id="@+id/chargingFragment"
+        android:icon="@drawable/ic_charging"
+        android:title="@string/rail_charging" />
+    <item
         android:id="@+id/integrationsFragment"
         android:icon="@drawable/ic_integrations"
         android:title="@string/rail_integrations" />

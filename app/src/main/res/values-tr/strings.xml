@@ -1068,6 +1068,7 @@
     <string name="roadsense_map_search_action">Search</string>
     <string name="roadsense_map_searching">Aranıyor…</string>
     <string name="roadsense_map_no_results">Yer bulunamadı</string>
+    <string name="roadsense_map_search_network">Arama hizmetine ulaşılamadı. Bağlantınızı veya proxy ayarınızı kontrol edip tekrar deneyin.</string>
     <string name="roadsense_map_pick_destination">Hedef seçin</string>
     <string name="roadsense_map_routing">Finding route…</string>
     <string name="roadsense_map_route_failed">Rota bulunamadı. Tekrar deneyin.</string>

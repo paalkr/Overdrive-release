@@ -98,6 +98,16 @@ class DiagnosticsFragment : Fragment() {
         view.findViewById<View>(R.id.cardBattery).setOnClickListener {
             (activity as? MainActivity)?.invokeBatteryHealthAction()
         }
+        // Hidden affordance: long-press Battery tile to wipe onboarding state and replay
+        // the first-run guide (for re-demos / support). No visible label — discoverable
+        // only deliberately. The normal click (battery health) stays intact.
+        view.findViewById<View>(R.id.cardBattery).setOnLongClickListener {
+            (activity as? MainActivity)?.resetAndReplayOnboarding()
+            android.widget.Toast.makeText(
+                requireContext(), R.string.onboarding_reset_toast, android.widget.Toast.LENGTH_SHORT
+            ).show()
+            true
+        }
         view.findViewById<View>(R.id.cardSettingsShortcut)?.setOnClickListener {
             // Settings is a peer rail destination — match rail fade-through
             // motion so the cardSettings shortcut feels like rail navigation.

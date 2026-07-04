@@ -90,10 +90,18 @@ public class TripScoreEngine {
     private static final int SPEED_WINSOR_CAP = 200;
 
     // Consistency (intra-trip behavioral uniformity): CV of per-window pedal demand.
-    private static final double CONS_GOOD_CV = 0.25;   // ≤25% swing around mean → uniform
-    private static final double CONS_BAD_CV = 0.80;    // ~80% swing → erratic
+    // Anchors are the FLAT/URBAN baseline; kinematic state and gradient widen them
+    // below (gridlock stop-and-go and mountain regen are inherently variable, so a
+    // fixed 0.25 "excellent" anchor mis-scored normal driving as erratic).
+    private static final double CONS_GOOD_CV = 0.35;   // ≤35% swing around mean → uniform
+    private static final double CONS_BAD_CV = 0.95;    // ~95% swing → erratic
     private static final int CONS_MIN_WINDOWS = 4;     // need a few windows to talk uniformity
     private static final double CONS_MIN_MEAN_INTENSITY = 1.0; // guard CV div-by-~0 on idle trips
+    // CV denominator floor. CV = σ/μ blows up when mean demand μ is tiny, which
+    // perversely punishes the smoothest low-demand drivers (a 4% swing around a
+    // 10% mean reads as 40% CV). Measuring the swing against max(μ, floor) keeps
+    // CV a measure of demand variability, not an artifact of a small denominator.
+    private static final double CONS_INTENSITY_FLOOR = 20.0;
 
     // Speed discipline window: 30 samples at 5Hz = 6 seconds
     private static final int SD_WINDOW_SIZE = 30;
@@ -529,30 +537,35 @@ public class TripScoreEngine {
         double efficiencyGradientFactor;   // Multiplier on worstEff (higher = more lenient)
         double smoothnessGradientFactor;   // Multiplier on maxJerk (higher = more lenient)
         double anticipationGradientFactor; // Multiplier on targetGapMs (lower = more lenient)
+        double consistencyGradientFactor;  // Multiplier on CV anchors (higher = more lenient)
         switch (gradProfile) {
             case MOUNTAIN_CLIMB:
                 efficiencyBestAdjust = 0;
                 efficiencyGradientFactor = 1.6;    // 60% wider efficiency range
                 smoothnessGradientFactor = 1.4;    // 40% more jerk tolerance
                 anticipationGradientFactor = 0.6;   // 40% shorter coast gap expected
+                consistencyGradientFactor = 1.3;   // sustained climb forces pedal modulation
                 break;
             case MOUNTAIN_DESCENT:
                 efficiencyBestAdjust = -0.05;       // Good driver should be net-negative kWh/km
                 efficiencyGradientFactor = 1.0;     // Normal worst-case (they shouldn't be consuming much)
                 smoothnessGradientFactor = 1.35;    // Regen modulation causes pedal variation
                 anticipationGradientFactor = 0.5;   // Very little coasting — managing speed via regen
+                consistencyGradientFactor = 1.4;   // regen speed-management = inherently variable demand
                 break;
             case HILLY:
                 efficiencyBestAdjust = 0;
                 efficiencyGradientFactor = 1.25;   // 25% wider efficiency range
                 smoothnessGradientFactor = 1.15;   // 15% more jerk tolerance
                 anticipationGradientFactor = 0.85;  // 15% shorter coast gap expected
+                consistencyGradientFactor = 1.15;  // rolling terrain adds some demand variation
                 break;
             default: // FLAT
                 efficiencyBestAdjust = 0;
                 efficiencyGradientFactor = 1.0;
                 smoothnessGradientFactor = 1.0;
                 anticipationGradientFactor = 1.0;
+                consistencyGradientFactor = 1.0;
                 break;
         }
 
@@ -694,8 +707,23 @@ public class TripScoreEngine {
         if (consWindowCount >= 2 && consMean > CONS_MIN_MEAN_INTENSITY) {
             double consVariance = consM2 / consWindowCount; // population variance
             if (consVariance < 0) consVariance = 0;
-            consCV = Math.sqrt(consVariance) / consMean;
-            rawConsistency = smoothScore(consCV, /* good */ CONS_GOOD_CV, /* bad */ CONS_BAD_CV);
+            // Divide the std-dev by max(mean, floor) rather than the raw mean so a
+            // small denominator can't inflate CV for a calm, low-demand driver.
+            double consDenom = Math.max(consMean, CONS_INTENSITY_FLOOR);
+            consCV = Math.sqrt(consVariance) / consDenom;
+            // Context-aware anchors: gridlock stop-and-go is unavoidably variable,
+            // highway cruising should be tighter; gradient widens further. Mirrors
+            // how every other axis adapts its band to kinematic state + terrain.
+            double goodCV = CONS_GOOD_CV;
+            double badCV = CONS_BAD_CV;
+            switch (kinState) {
+                case HEAVY_GRIDLOCK:   goodCV = 0.45; badCV = 1.10; break;
+                case HIGHWAY_CRUISING: goodCV = 0.25; badCV = 0.70; break;
+                default: /* URBAN_FLOW: baseline */                 break;
+            }
+            goodCV *= consistencyGradientFactor;
+            badCV *= consistencyGradientFactor;
+            rawConsistency = smoothScore(consCV, /* good */ goodCV, /* bad */ badCV);
             consistencyCoverage = Math.min(1.0, (double) consWindowCount / CONS_MIN_WINDOWS);
         }
         trip.consistencyScore = applyCoverage(rawConsistency, consistencyCoverage);

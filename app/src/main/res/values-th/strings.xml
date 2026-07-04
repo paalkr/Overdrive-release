@@ -1058,6 +1058,7 @@
     <string name="roadsense_map_search_action">ค้นหา</string>
     <string name="roadsense_map_searching">กำลังค้นหา…</string>
     <string name="roadsense_map_no_results">ไม่พบสถานที่</string>
+    <string name="roadsense_map_search_network">ไม่สามารถเชื่อมต่อบริการค้นหาได้ โปรดตรวจสอบการเชื่อมต่อหรือ proxy แล้วลองอีกครั้ง</string>
     <string name="roadsense_map_pick_destination">เลือกปลายทาง</string>
     <string name="roadsense_map_routing">กำลังค้นหาเส้นทาง…</string>
     <string name="roadsense_map_route_failed">ไม่พบเส้นทาง ลองอีกครั้ง</string>

@@ -11,10 +11,10 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js"></script>
+    <script src="../shared/app-shell.js?v=2"></script>
     <link rel="stylesheet" href="../shared/leaflet.css">
     <script src="../shared/leaflet.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=16">
+    <link rel="stylesheet" href="../shared/styles.css?v=17">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 </head>
@@ -160,6 +160,36 @@
                             <div class="dash-metric"><span data-i18n="dashboard.metric_lock">Lock</span><strong id="dashLock">--</strong></div>
                         </div>
                     </article>
+
+                    <!-- Charging card — live plug/charge state + key metrics,
+                         tap-through to the full charging.html history page. -->
+                    <article class="dash-card dash-info-card" data-card-id="charging">
+                        <div class="dash-card-head">
+                            <div>
+                                <span class="dash-card-kicker" data-i18n="charge.kicker">Energy</span>
+                                <h2 data-i18n="charge.card_title">Charging</h2>
+                            </div>
+                            <button class="dash-card-grip" type="button" aria-label="Drag to reorder" tabindex="-1">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="18" r="1"/></svg>
+                            </button>
+                        </div>
+                        <div class="dash-charge-chip" id="dashChargeChip">
+                            <span class="ic_status_dot dot-idle" id="dashChargeDot"></span>
+                            <span id="dashChargeState" data-i18n="charge.state_idle">Idle</span>
+                        </div>
+                        <div class="dash-metric-grid dash-metric-grid--4">
+                            <div class="dash-metric"><span data-i18n="charge.metric_soc">SoC</span><strong id="dashChargeSoc">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="charge.metric_power">Power</span><strong id="dashChargePower">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="charge.metric_session">Session</span><strong id="dashChargeKwh">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="charge.metric_ttf">Time to full</span><strong id="dashChargeTtf">--</strong></div>
+                        </div>
+                        <div class="dash-action-row">
+                            <button class="dash-primary-btn" type="button" onclick="location.href='charging.html'">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/></svg>
+                                <span data-i18n="charge.open">Charging details</span>
+                            </button>
+                        </div>
+                    </article>
                 </section>
             </div>
         </main>
@@ -253,6 +283,47 @@
         .dash-action-row {
             display: flex;
             gap: 8px;
+        }
+        /* When an action row follows a metric grid (the Charging card), the grid
+           has no bottom margin, so add space above the button. Other cards put a
+           map / command-grid (already margin-bottom'd) before their action row,
+           so this adjacent-sibling rule only affects the metric-grid case. */
+        .dash-metric-grid + .dash-action-row { margin-top: 16px; }
+
+        /* Charging card live-state chip + status dot. The dot colour maps to
+           the charge state (idle/plugged/charging/full/fault). */
+        .dash-charge-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 14px;
+            padding: 7px 12px;
+            border-radius: 999px;
+            background: var(--bg-elevated);
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+        .ic_status_dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: var(--text-tertiary, #9aa0a6);
+            flex: 0 0 auto;
+        }
+        .ic_status_dot.dot-idle   { background: var(--text-tertiary, #9aa0a6); }
+        .ic_status_dot.dot-warn   { background: #f5a623; }
+        .ic_status_dot.dot-active {
+            background: #0ea5e9;
+            box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.6);
+            animation: dashChargePulse 1.8s ease-out infinite;
+        }
+        .ic_status_dot.dot-good   { background: #2ecc71; }
+        .ic_status_dot.dot-danger { background: #e74c3c; }
+        @keyframes dashChargePulse {
+            0%   { box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.55); }
+            70%  { box-shadow: 0 0 0 7px rgba(14, 165, 233, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(14, 165, 233, 0); }
         }
 
         .dash-hero-status {
@@ -569,6 +640,14 @@
             gap: 10px;
         }
 
+        /* Charging card has 4 metrics, not 6 — give them their own 4-up track
+           so they fill the full-width card evenly instead of leaving two empty
+           trailing columns. The ≤980px media rule below still collapses this to
+           2-up (same specificity, declared later wins inside the breakpoint). */
+        .dash-metric-grid--4 {
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+
         .dash-metric {
             min-height: 76px;
             padding: 13px;
@@ -603,6 +682,7 @@
             .dash-metric-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
+            .dash-metric-grid--4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .dash-info-card { grid-column: auto; }
         }
 
@@ -632,6 +712,7 @@
             .dash-metric-grid {
                 grid-template-columns: 1fr 1fr;
             }
+            .dash-metric-grid--4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             /* Media tiles (Live / Recordings / Trips) stay 3 across so the
                row never widows a single tile on a second line. */
             .dash-command-grid-media {
@@ -774,6 +855,42 @@
                     setChip('dashGpsChip', gpsChip, stale ? 'warn' : 'good');
                 } else {
                     setChip('dashGpsChip', BYD.i18n.t('dashboard.chip_gps_pending') || 'GPS --', '');
+                }
+
+                // ----- Charging card -----
+                // status.charging carries the dashboard fields added by the
+                // daemon's /api/status assembler (charging/plugged/full/fault +
+                // powerKw/socPercent/timeToFullMin). Absent on non-EV reads.
+                var c = status.charging;
+                if (c) {
+                    var stateKey = c.fault ? 'charge.state_fault'
+                                 : c.full ? 'charge.state_full'
+                                 : c.charging ? 'charge.state_charging'
+                                 : c.plugged ? 'charge.state_plugged'
+                                 : 'charge.state_idle';
+                    var dotCls = c.fault ? 'dot-danger'
+                               : c.full ? 'dot-good'
+                               : c.charging ? 'dot-active'
+                               : c.plugged ? 'dot-warn'
+                               : 'dot-idle';
+                    var dot = document.getElementById('dashChargeDot');
+                    if (dot) dot.className = 'ic_status_dot ' + dotCls;
+                    var fallbackState = c.fault ? 'Charge fault' : c.full ? 'Full'
+                                      : c.charging ? 'Charging' : c.plugged ? 'Plugged in' : 'Idle';
+                    setText('dashChargeState', BYD.i18n.t(stateKey) || fallbackState);
+
+                    if (c.socPercent !== undefined && c.socPercent !== null) {
+                        setText('dashChargeSoc', Math.round(c.socPercent) + '%');
+                    }
+                    // Don't show the estimated/placeholder kW (nav bar suppresses
+                    // it too) — it read a fabricated ~7 kW vs the real 6.1.
+                    setText('dashChargePower', (c.charging && c.powerKw > 0 && !c.isEstimated) ? c.powerKw.toFixed(1) + ' kW' : '--');
+                    setText('dashChargeKwh', (c.sessionKwh && c.sessionKwh > 0) ? c.sessionKwh.toFixed(1) + ' kWh' : '--');
+                    if (c.charging && c.timeToFullMin && c.timeToFullMin > 0) {
+                        setText('dashChargeTtf', Math.floor(c.timeToFullMin / 60) + 'h ' + (c.timeToFullMin % 60) + 'm');
+                    } else {
+                        setText('dashChargeTtf', '--');
+                    }
                 }
             },
             openDirections: function() {

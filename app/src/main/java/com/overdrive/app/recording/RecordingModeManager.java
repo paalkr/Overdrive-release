@@ -835,6 +835,60 @@ public class RecordingModeManager {
     }
 
     /**
+     * Force a warmup-routed restart of the current camera-owning mode.
+     *
+     * <p>Unlike {@link #resyncFromHardware}, this does NOT gate on the
+     * disk/encoder wedge heuristics — those are blind to a camera that is
+     * delivering ZERO frames while the encoder keeps ticking on its pre-record
+     * ring (getLastEncodedFrameMs() advances even with no live frames). This is
+     * the escalation entrypoint for PanoramicCameraGpu's zero-frame-reopen loop
+     * (CameraYieldListener.onHalRecoveryNeeded): the camera layer has already
+     * proven the HAL is wedged (N consecutive reopens, no frames), so we
+     * unconditionally route through activateModeWithWarmup(force=true) — full
+     * teardown + com.byd.avc warmup + pipeline rebuild, the only sequence
+     * observed to recover a wedged AVM HAL co-consumer state.
+     *
+     * <p>No-op when ACC is off or no camera-owning mode is active (nothing to
+     * restart). The warmup worker's own CAS (warmupInFlight) coalesces this
+     * against any concurrent activation.
+     */
+    public void forceWarmupRestart(String reason) {
+        final Mode mode;
+        final boolean acc;
+        synchronized (this) {
+            mode = currentMode;
+            acc = accIsOn;
+        }
+        if (!acc || mode == Mode.NONE) {
+            logger.info("forceWarmupRestart(" + reason + ") — no-op (accIsOn=" + acc
+                + ", mode=" + mode + "); nothing to restart");
+            return;
+        }
+        logger.warn("forceWarmupRestart(" + reason + ") — full teardown + com.byd.avc "
+            + "warmup to recover wedged AVM HAL co-consumer state, then re-activate " + mode);
+        // CRITICAL: tear the pipeline DOWN first. The wedged-HAL case has the
+        // GL pipeline still running (camera dead, encoder ticking on its
+        // pre-record ring), so pipeline.isRunning()==true. activateModeWithWarmup's
+        // worker SKIPS avcWarmup.warmupAndWait() when the pipeline is already
+        // running (RecordingModeManager:1243) — and warmupAndWait (the `am start
+        // com.byd.avc` + settle) is the ONLY thing that recovers the wedged AVM
+        // HAL co-consumer state. So without an explicit stop() here the
+        // "warmup restart" would do a bare recording stop/start on the SAME dead
+        // camera and never recover — exactly the bare-reopen loop we are
+        // escalating away from. The field recovery that worked was setMode(NONE)
+        // -> pipeline.stop() (full GL teardown) -> setMode(CONTINUOUS) (warmup).
+        // pipeline.stop() is synchronized + idempotent (no-op if already stopped).
+        try {
+            pipeline.stop();
+            logger.info("forceWarmupRestart: pipeline stopped — warmup will now run on cold open");
+        } catch (Throwable t) {
+            logger.warn("forceWarmupRestart: pipeline.stop() failed: " + t.getMessage()
+                + " — proceeding to warmup-activate anyway");
+        }
+        activateModeWithWarmup(mode, "force-warmup-" + reason, true);
+    }
+
+    /**
      * Single-flight serializer for {@link #activateMode}/{@link #deactivateMode}.
      * Held INSTEAD of the manager monitor across the heavy I/O inside those
      * methods (camera/encoder init, storage cleanup pre-flight, etc.) so the
@@ -2543,7 +2597,12 @@ public class RecordingModeManager {
                     || currentMode == Mode.PROXIMITY_GUARD);
         if (recordingModeOwnsCamera() || pipelineIsRecording() || activationInFlight) {
             boolean proximity = (currentMode == Mode.PROXIMITY_GUARD);
-            int fps = Math.max(configuredRecordingFps(), streamFps);
+            // activeConfiguredFps() picks the surveillance fps while the pipeline
+            // sits in ACC-off SENTRY (pipelineIsRecording() counts surveillance as
+            // an owner), else the ACC-on recording fps. The proximity branch below
+            // is ACC-on only (PROXIMITY_GUARD never runs parked), so it keeps using
+            // configuredRecordingFps() directly — surveillance never reaches it.
+            int fps = Math.max(activeConfiguredFps(), streamFps);
             if (proximity) {
                 // PROXIMITY detection is RADAR-driven, not camera-driven. While
                 // the controller is MONITORING (the common parked-idle state) it
@@ -2623,7 +2682,13 @@ public class RecordingModeManager {
             pipeline.setCameraTargetFps(want.fps);
             if (want.ownStrideBitrate) {
                 pipeline.setRecorderFrameStride(1);
-                pipeline.setRecordingBitrate(pipeline.getConfiguredRecordingBitrate());
+                // activeConfiguredBitrate() = surveillance tier while parked in
+                // SENTRY, else the ACC-on recording tier. ownStrideBitrate is set
+                // by the "recording:continuous-style" rung, which surveillance
+                // reaches (via pipelineIsRecording); this is what keeps the live
+                // bitrate on the surveillance tier even after a stream open/close
+                // reconcile fires mid-parked-recording.
+                pipeline.setRecordingBitrate(activeConfiguredBitrate());
             } else if (currentMode == Mode.PROXIMITY_GUARD && want.fps != prevFps
                     && proximityController != null) {
                 // Proximity owns its stride, computed as round(cameraFps/monitorFps)
@@ -2703,7 +2768,12 @@ public class RecordingModeManager {
         try {
             pipeline.setRecorderLaneEnabled(true);
             pipeline.setRecorderFrameStride(1);
-            pipeline.setRecordingBitrate(pipeline.getConfiguredRecordingBitrate());
+            // Mode-aware: surveillance tier while parked in SENTRY, else the
+            // ACC-on recording tier. This method's callers are ACC-on activation
+            // paths (isSurveillanceMode() == false there), so this is
+            // byte-identical for them; the branch just keeps it correct if ever
+            // reached under surveillance.
+            pipeline.setRecordingBitrate(activeConfiguredBitrate());
             // Floor at the live-view stream fps: the stream (PASS 1B) shares the
             // one camera, so the camera HAL rate must satisfy max(recording,
             // stream) or a SMOOTH(25)/MAX(30) stream opened during recording (incl.
@@ -2711,7 +2781,7 @@ public class RecordingModeManager {
             // play at the lower recording rate. The recorder draw-stride still
             // sub-samples the recorder lane to the record rate; proximity then
             // layers its MONITORING stride on top (recomputed against this fps).
-            int recFps = Math.max(configuredRecordingFps(), activeStreamFps());
+            int recFps = Math.max(activeConfiguredFps(), activeStreamFps());
             pipeline.setCameraTargetFps(recFps);
         } catch (Throwable t) {
             logger.warn("applyFullRecordingProfile failed: " + t.getMessage());
@@ -2726,6 +2796,43 @@ public class RecordingModeManager {
             if (cam != null) return cam.optInt("targetFps", 15);
         } catch (Throwable ignored) {}
         return 15;
+    }
+
+    /** User-configured ACC-off SURVEILLANCE fps (camera.surveillanceTargetFps).
+     *  Falls back to the ACC-on targetFps when unset — byte-identical to the
+     *  pre-split world. Only consulted when the pipeline is in surveillance
+     *  mode; every ACC-on rung uses {@link #configuredRecordingFps()}. */
+    private int configuredSurveillanceFps() {
+        try {
+            org.json.JSONObject cam = UnifiedConfigManager.loadConfig().optJSONObject("camera");
+            if (cam != null) {
+                int accOnFallback = cam.optInt("targetFps", 15);
+                return cam.optInt("surveillanceTargetFps", accOnFallback);
+            }
+        } catch (Throwable ignored) {}
+        return 15;
+    }
+
+    /** The active recording flow's configured fps: surveillance fps while the
+     *  pipeline sits in ACC-off SENTRY, else the ACC-on recording fps. This is
+     *  the single chokepoint both the reconcile ladder and the full-profile
+     *  baseline read, so the two never disagree about which fps the current
+     *  mode wants. */
+    private int activeConfiguredFps() {
+        return pipeline.isSurveillanceMode()
+            ? configuredSurveillanceFps()
+            : configuredRecordingFps();
+    }
+
+    /** The active recording flow's effective bitrate: surveillance tier while
+     *  the pipeline sits in ACC-off SENTRY, else the ACC-on recording tier.
+     *  Both honor an active thermal/network customBitrate. Mirrors
+     *  {@link #activeConfiguredFps()} so fps and bitrate always describe the
+     *  SAME mode. */
+    private int activeConfiguredBitrate() {
+        return pipeline.isSurveillanceMode()
+            ? pipeline.getEffectiveSurveillanceBitrate()
+            : pipeline.getConfiguredRecordingBitrate();
     }
 
     /** Whether the blind-spot view is currently being shown on screen (turn

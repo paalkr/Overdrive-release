@@ -81,6 +81,18 @@
             android:defaultValue="/trips" />
     </fragment>
 
+    <!-- Charging (web canonical) -->
+    <fragment
+        android:id="@+id/chargingFragment"
+        android:name="com.overdrive.app.ui.fragment.WebViewFragment"
+        android:label="@string/rail_charging"
+        tools:layout="@layout/fragment_webview">
+        <argument
+            android:name="page_path"
+            app:argType="string"
+            android:defaultValue="/charging" />
+    </fragment>
+
     <!-- Integrations: roll-up of Telegram + ABRP + MQTT -->
     <fragment
         android:id="@+id/integrationsFragment"

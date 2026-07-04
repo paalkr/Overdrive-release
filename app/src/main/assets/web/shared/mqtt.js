@@ -312,6 +312,15 @@ const MQTT = {
             data.maxIntervalSeconds = data.minIntervalSeconds;
         }
 
+        // The edit form never prefills the stored password (see editConnection).
+        // A blank field on edit therefore means "leave the password as-is", so
+        // drop the key entirely rather than sending "" and wiping the saved
+        // secret on the backend. On add, a blank password is sent through as an
+        // empty string (broker with no auth), which is the correct behaviour.
+        if (this.editingId && data.password === '') {
+            delete data.password;
+        }
+
         if (!data.name) { this.toast(BYD.i18n.t('mqtt.err_name_required'), 'error'); return; }
         if (!data.brokerUrl) { this.toast(BYD.i18n.t('mqtt.err_broker_required'), 'error'); return; }
         if (!data.topic) { this.toast(BYD.i18n.t('mqtt.err_topic_required'), 'error'); return; }

@@ -58,6 +58,15 @@ public class LocationSidecarService extends Service implements LocationListener 
     // sync in particular) need the true fix time to correct per-point instead
     // of guessing a constant lag.
     private volatile long fixTimeMs = 0;
+    // MONOTONIC since-boot timestamp (SystemClock.elapsedRealtime ms) of the GPS
+    // fix currently published — distinct from the "time" field we send (send/
+    // receive-time, on purpose, for the RoadSense 5s cutoff + puck dead-reckon
+    // clock). Geo-tagging ages against THIS (daemon compares vs its own
+    // elapsedRealtime) so a parked car's stale fix re-sent every 4s by the
+    // keep-alive doesn't read as fresh and tag the clip with a last-known
+    // location — AND it can't cross the device-RTC clock domain (which is wrong
+    // at cold boot until GPS/NTP corrects it).
+    private volatile long fixElapsedMs = 0L;
     private boolean permissionGranted = false;
 
     // SOTA: Throttling fields to prevent IPC/Disk spam.
@@ -73,6 +82,32 @@ public class LocationSidecarService extends Service implements LocationListener 
     private volatile int providerFixCount = 0;   // real LocationListener callbacks
     private volatile int pollFixCount = 0;        // fixes injected by the periodic poll
     private long lastRateLogTime = 0;
+    // Wall-clock (ms) of the last accepted GPS_PROVIDER fix. Used to REJECT a coarse
+    // NETWORK_PROVIDER fix while a recent real GPS fix is still valid — see
+    // onLocationChanged. 0 until the first GPS fix arrives.
+    private long lastGpsFixTime = 0;
+    // Accuracy (m) of the last accepted GPS fix — the anchor the NETWORK "not wildly worse"
+    // guard compares against. MUST be the last GPS accuracy (not the last PROCESSED fix of
+    // any provider): comparing vs lastProcessedLocation let accuracy ratchet ~200 m worse
+    // per accepted NETWORK step during a sustained outage (each net fix compared only to the
+    // previous net fix), defeating the documented "a 1 km cell fix must never clobber a 5 m
+    // GPS one" intent. Float.MAX_VALUE until the first GPS fix (so the guard is inert before
+    // we have a GPS reference to protect).
+    private float lastGpsAccuracyM = Float.MAX_VALUE;
+    // A NETWORK fix is only allowed to take over after GPS has been silent this long
+    // (tunnel / cold start / GPS outage). MUST be BELOW the downstream consumer staleness
+    // cutoff (LocationSource.DEFAULT_MAX_FIX_AGE_MS = 5000 ms), not above it: at 8000 ms a
+    // GPS stutter left the consumer with NO fix from 5 s onward (it declares the pose stale
+    // and RoadSense publishes idle → the "next hazard ahead" warning VANISHES) while the
+    // NETWORK fallback stayed gated off until 8 s — so the warning dropped out and only
+    // re-acquired late on GPS recovery (the "hazards show late" report). 4000 ms lets a
+    // coarse fallback fix arrive ~1 s BEFORE the consumer would call the pose stale, so the
+    // warning bridges the gap instead of blinking out. (NETWORK_MAX_WORSE_ACCURACY_M still
+    // blocks a wildly-worse cell fix from clobbering a good last GPS position.)
+    private static final long GPS_STALE_BEFORE_NETWORK_MS = 4000;
+    // A NETWORK fix this much WORSE (accuracy, metres) than the last GPS fix is dropped
+    // even past the staleness window — a 1 km cell fix must never clobber a 5 m GPS one.
+    private static final float NETWORK_MAX_WORSE_ACCURACY_M = 200.0f;
 
     @Override
     public void onCreate() {
@@ -363,6 +398,41 @@ public class LocationSidecarService extends Service implements LocationListener 
         if (location == null) return;
 
         long now = System.currentTimeMillis();
+
+        // ── Provider-quality gate (fixes the "GPS jumps + RoadSense distance wrong"
+        //    bug). We listen to BOTH GPS_PROVIDER (1s, ~5m) and NETWORK_PROVIDER (5s,
+        //    often 100-1500m, and usually with NO bearing/speed). Previously EVERY fix
+        //    from EITHER provider unconditionally overwrote the published lat/lng/speed/
+        //    heading — so a coarse cell/wifi fix periodically clobbered the good GPS
+        //    position (puck teleport / lag) AND zeroed heading+speed (defeating the
+        //    dead-reckon + gyro fusion), and poisoned RoadSense's Haversine distance.
+        //    Keep GPS as the source of truth: accept a NETWORK fix ONLY when GPS has
+        //    gone genuinely silent (tunnel / cold start) AND the network fix isn't
+        //    wildly worse than the last GPS accuracy. GPS fixes always pass. ──
+        boolean isGps = LocationManager.GPS_PROVIDER.equals(location.getProvider());
+        if (isGps) {
+            lastGpsFixTime = now;
+            // Snapshot the GPS accuracy as the anchor for the NETWORK "not wildly worse"
+            // guard below (so it compares vs the last real GPS fix, never a prior net fix).
+            lastGpsAccuracyM = location.hasAccuracy() ? location.getAccuracy() : Float.MAX_VALUE;
+        } else {
+            // Non-GPS (network/passive/fused) fix. Reject while a recent GPS fix is live.
+            long sinceGps = (lastGpsFixTime == 0) ? Long.MAX_VALUE : (now - lastGpsFixTime);
+            if (sinceGps < GPS_STALE_BEFORE_NETWORK_MS) {
+                return;   // GPS still fresh — ignore the coarse fix entirely.
+            }
+            // GPS is stale: allow the network fix as a fallback, but still drop a fix that is
+            // far less accurate than the GPS we last had (avoid a huge jump). Compare against
+            // the last GPS accuracy — NOT lastProcessedLocation — so a sustained outage can't
+            // ratchet accuracy ~200 m worse per accepted net step (each net fix would else be
+            // judged only against the previous net fix).
+            float netAcc = location.hasAccuracy() ? location.getAccuracy() : Float.MAX_VALUE;
+            if (lastGpsAccuracyM != Float.MAX_VALUE
+                    && netAcc - lastGpsAccuracyM > NETWORK_MAX_WORSE_ACCURACY_M) {
+                return;
+            }
+        }
+
         float distanceMoved = (lastProcessedLocation != null) ? location.distanceTo(lastProcessedLocation) : Float.MAX_VALUE;
         long timeSinceLastProcess = now - lastProcessedTime;
 
@@ -371,11 +441,53 @@ public class LocationSidecarService extends Service implements LocationListener 
         latitude = location.getLatitude();
         longitude = location.getLongitude();
         speed = location.hasSpeed() ? location.getSpeed() : 0.0f;
-        heading = location.hasBearing() ? location.getBearing() : 0.0f;
+        // HOLD the last bearing when this fix carries none (low speed, just-acquired, or
+        // a network fix) rather than slamming heading to 0.0 — a spurious 0° (due North)
+        // mid-drive snapped the puck/heading-up camera and skewed any heading-based math.
+        // Consumers already treat heading as noise when stationary, so holding is safe.
+        if (location.hasBearing()) heading = location.getBearing();
         accuracy = location.hasAccuracy() ? location.getAccuracy() : 0.0f;
         altitude = location.hasAltitude() ? location.getAltitude() : 0.0;
         fixTimeMs = location.getTime();
         
+        // Fix age basis = the MONOTONIC since-boot clock, NOT UTC getTime(). The
+        // earlier attempt used location.getTime() (GNSS-UTC) and aged it against
+        // the daemon's System.currentTimeMillis() (device RTC) — two clock domains.
+        // BYD units boot with a wrong RTC until GPS/NTP corrects it (see AppUpdater /
+        // UnifiedConfigManager), so during the cold-boot window that cross-clock
+        // delta could exceed the 5-min gate and DROP a perfectly fresh fix's tag.
+        // elapsedRealtime() is since-boot, identical across processes on the device,
+        // and immune to RTC correction — so app-side fix time and daemon-side now
+        // are on the SAME monotonic clock and their delta is the true fix age.
+        //
+        // BUG FIX (parked-clip "tags as Home"): the previous fallback stamped a
+        // stamp-LESS fix with elapsedRealtime()=NOW, which made it read as
+        // eternally fresh. A last-known / cached seed Location (the fix the OS
+        // hands back once the data iface dies ~17s after ACC-OFF — the parked
+        // sentry case) has getElapsedRealtimeNanos()==0, so it got NOW-stamped
+        // and the daemon's geo gate then tagged the sentry clip with the last
+        // real fix before the blackout — the driveway, inside the Home
+        // SafeLocation zone. ACC-ON was unaffected because live GPS fixes always
+        // carry a real elapsedRealtimeNanos. The fix: when the fix carries no
+        // monotonic stamp, DERIVE one from its true UTC age (getTime()) by
+        // back-dating our own elapsedRealtime() — so a 10-min-old seed reads as
+        // 10-min-old and the 5-min gate rejects it — instead of fabricating NOW.
+        // Both operands of the back-date (now/currentTimeMillis and getTime) are
+        // the device RTC, so their DELTA (the fix age) is skew-immune even if the
+        // absolute RTC is wrong; only the delta is used. If getTime() is also
+        // unusable (0 / future-dated), leave fixElapsedMs=0 → the daemon gate's
+        // send-time fallback governs (never worse than before this feature).
+        long ern = location.getElapsedRealtimeNanos();
+        if (ern > 0) {
+            fixElapsedMs = ern / 1_000_000L;
+        } else {
+            long fixUtc = location.getTime();
+            long ageByUtc = (fixUtc > 0) ? (now - fixUtc) : -1L;
+            fixElapsedMs = (ageByUtc >= 0)
+                    ? android.os.SystemClock.elapsedRealtime() - ageByUtc
+                    : 0L;
+        }
+
         // Throttle Log, IPC and Disk I/O — but keep the distinct-fix rate as
         // high as the provider delivers (GPS is requested at 1s/0m) so
         // RoadSense back-projection (GpsRingBuffer ~2 Hz design, 5s max fix
@@ -424,8 +536,16 @@ public class LocationSidecarService extends Service implements LocationListener 
             json.put("heading", heading);
             json.put("accuracy", accuracy);
             json.put("altitude", altitude);
+            // Send/receive-time (see sendGpsViaTcp) — what the daemon ages against; never
+            // the fix's own back-datable getTime().
             json.put("time", System.currentTimeMillis());
-            
+            // Monotonic since-boot fix timestamp for geo-tagging staleness (see
+            // sendGpsViaTcp). NOTE: elapsedRealtime resets across reboots, so a
+            // cache loaded after a reboot has an incomparable value — but a
+            // cache-loaded fix is already rejected by isLoadedFromCache in the geo
+            // gate, so the cross-boot value is never used for an age decision.
+            json.put("fixElapsedMs", fixElapsedMs);
+
             // Write to app's files directory
             java.io.File file = new java.io.File(getFilesDir(), "gps_cache.json");
             java.io.File tmp = new java.io.File(getFilesDir(), "gps_cache.json.tmp");
@@ -516,11 +636,26 @@ public class LocationSidecarService extends Service implements LocationListener 
             json.put("heading", heading);
             json.put("accuracy", accuracy);
             json.put("altitude", altitude);
+            // SEND-TIME (receive-time), NOT the GPS fix's own getTime(). This field flows
+            // to GpsMonitor.lastUpdate, which LocationSource.latest() ages against a 5 s
+            // cutoff (DEFAULT_MAX_FIX_AGE_MS); a fresh re-send must read as fresh. Stamping
+            // the fix's own (back-datable) getTime() let a periodicSender re-send of a
+            // ~10 s-old last-known fix age past 5 s → latest()=null → RoadSense publishIdle
+            // → the "next hazard ahead" card vanished. This matches the v26.8/v27.3 baseline
+            // (both used System.currentTimeMillis()) and keeps the puck dead-reckon clock
+            // anchored to ingestion as designed (feedMotionTruth re-anchors on a NEW ts; the
+            // estimator + feedMotionTruth already de-dupe identical re-polls by position/ts).
             json.put("time", System.currentTimeMillis());
             // The fix's own timestamp — "time" above is the SEND time and keeps
             // feeding GpsMonitor.lastUpdate (staleness checks); fix_time is the
             // per-point truth consumers use to correct GNSS latency.
             json.put("fix_time", fixTimeMs);
+            // MONOTONIC since-boot fix timestamp — SEPARATE from "time". Geo-tagging
+            // ages this against the daemon's own elapsedRealtime() so a parked car's
+            // stale fix (re-sent every 4s by the keep-alive, which keeps "time"
+            // perpetually fresh) reads as stale, WITHOUT crossing the device-RTC
+            // clock domain (wrong at cold boot until GPS/NTP corrects it).
+            json.put("fixElapsedMs", fixElapsedMs);
         } catch (Exception e) {
             return;
         }

@@ -127,6 +127,33 @@ class SettingsAboutFragment : Fragment() {
     }
 
     /**
+     * Re-resolve the displayed version every time the pane is shown.
+     *
+     * The version row is painted once in onViewCreated and would otherwise
+     * stay frozen at whatever VERSION_FILE held when the view was created.
+     * VERSION_FILE (/data/local/tmp/overdrive_version) is advanced by ANY
+     * install path — including a daemon/web/Telegram-triggered update that
+     * lands while this fragment is on the back stack — so a stale snapshot
+     * here disagrees with the live read the "Check for updates" toast does
+     * (the "About shows v27.2 but check says v27.4" report). Re-reading on
+     * resume keeps About in lock-step with the toast / status surfaces.
+     *
+     * Same off-thread + attach-guard discipline as the first paint:
+     * getDisplayVersion does a /data/local/tmp file read, which must not run
+     * on the looper.
+     */
+    override fun onResume() {
+        super.onResume()
+        val v = view ?: return
+        val versionView = v.findViewById<TextView>(R.id.tvAboutVersion) ?: return
+        (avatarExecutor ?: Executors.newSingleThreadExecutor().also { avatarExecutor = it })
+            .execute {
+                val resolved = AppUpdater.getDisplayVersion(requireContext().applicationContext)
+                mainHandler.post { if (isAdded && view?.parent != null) versionView.text = resolved }
+            }
+    }
+
+    /**
      * Wire the Alpha / Braveheart channel toggle.
      *
      * Channel state lives in UnifiedConfigManager's "updates" section (cross-

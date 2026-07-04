@@ -1068,6 +1068,7 @@
     <string name="roadsense_map_search_action">खोजें</string>
     <string name="roadsense_map_searching">खोज रहा है…</string>
     <string name="roadsense_map_no_results">कोई स्थान नहीं मिला</string>
+    <string name="roadsense_map_search_network">खोज सेवा तक नहीं पहुँच सका। अपने कनेक्शन या प्रॉक्सी की जाँच करें और फिर से प्रयास करें।</string>
     <string name="roadsense_map_pick_destination">गंतव्य चुनें</string>
     <string name="roadsense_map_routing">मार्ग ढूँढ रहा है…</string>
     <string name="roadsense_map_route_failed">कोई मार्ग नहीं मिला। पुनः प्रयास करें।</string>

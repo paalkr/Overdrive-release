@@ -417,6 +417,13 @@ public class BydVehicleData {
             if (chargingMode != UNAVAILABLE) chg.put("mode", chargingMode);
             putIfValid(chg, "powerKw", chargingPowerKw);
             putIfValid(chg, "externalPowerKw", externalChargingPowerKw);
+            // DC pack-side (getChargePower). Only emit an in-band value: the getter
+            // returns ~359 garbage when idle, which would otherwise mislead anyone
+            // reading this diagnostic JSON during a charge test. Same band the
+            // consumers (getChargingState / MQTT / ABRP) gate on.
+            if (!Double.isNaN(chargePowerKw) && chargePowerKw > 0.1 && chargePowerKw <= 300) {
+                putIfValid(chg, "chargePowerKw", chargePowerKw);
+            }
             j.put("charging", chg);
 
             // Gear

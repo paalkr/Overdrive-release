@@ -534,6 +534,38 @@ public class MqttPublisherService implements MqttCallback {
         return connect();
     }
 
+    /**
+     * Active connection health check, run every scheduler cycle independent of
+     * whether a telemetry publish is actually due.
+     *
+     * Why this is needed: reconnect is otherwise only attempted as a side effect
+     * of {@link #publishString} throwing. But the change-gated publish loop skips
+     * idle cycles for up to {@code maxIntervalSeconds} (default 300s) while parked,
+     * so a silently-dropped link (NAT/firewall idle-timeout, the ACC-OFF data
+     * blackout) is never noticed — and with QoS 0 even the eventual heartbeat
+     * publish can succeed into a half-open socket without throwing. The result is
+     * a connection that reports "running" but transmits nothing until a manual
+     * restart.
+     *
+     * Paho's keep-alive (30s) flips {@code client.isConnected()} to false / fires
+     * {@code connectionLost} within ~keep-alive seconds of a real drop. Polling
+     * that here lets the scheduler reconnect promptly instead of waiting for the
+     * next heartbeat. A failed reconnect leaves {@code consecutiveFailures}
+     * incremented (by {@link #connect}), so the scheduler's backoff spaces out
+     * retries rather than hammering a dead broker every cycle.
+     *
+     * @return true if connected (already, or after a successful reconnect)
+     */
+    public synchronized boolean ensureAlive() {
+        if (!running) return false;
+        if (client != null && client.isConnected()) {
+            connected = true;
+            return true;
+        }
+        connected = false;
+        return connect();
+    }
+
     private Set<String> discoverableKeys(JSONObject snap) {
         Set<String> keys = new HashSet<>();
         Iterator<String> it = snap.keys();

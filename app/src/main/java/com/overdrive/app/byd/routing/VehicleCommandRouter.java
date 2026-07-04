@@ -863,28 +863,39 @@ public final class VehicleCommandRouter {
     }
 
     /**
-     * Trunk open: cloud unlock first (avoid alarm), then SDK tailgate motor.
-     * If cloud unlock fails, do NOT fire the motor — the body controller will
-     * trip the alarm if the tailgate opens while the car is locked.
+     * Trunk open: fire the SDK tailgate motor, but only once the car is unlocked
+     * — the body controller trips the alarm if the tailgate opens while locked.
+     *
+     * <p>Lock state comes from the local OTA rail
+     * ({@link BydDataCollector#readDoorLockState}, the same signal AccSentry
+     * uses), so an already-unlocked car opens directly with no cloud round-trip.
+     * Only when the car reports LOCKED do we send the cloud unlock, validate its
+     * response, and then fire the motor. If lock state can't be read (INVALID),
+     * we fall back to the unlock-then-open path so we never risk the alarm.
      */
     private CommandResult executeTrunkOpen() {
         long start = System.currentTimeMillis();
-        UnlockCommand unlock = new UnlockCommand();
-        CommandResult unlockResult = execute(unlock);
-        if (unlockResult.outcome != Outcome.SUCCESS) {
-            return unlockResult;
-        }
 
-        try { Thread.sleep(CLOUD_TRUNK_UNLOCK_SETTLE_MS); }
-        catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        int lockState = BydDataCollector.getInstance().readDoorLockState();
+        if (lockState != BydDataCollector.DOOR_STATE_UNLOCK) {
+            // LOCKED (or INVALID — treat conservatively as locked): unlock via
+            // cloud and confirm success before firing the motor.
+            UnlockCommand unlock = new UnlockCommand();
+            CommandResult unlockResult = execute(unlock);
+            if (unlockResult.outcome != Outcome.SUCCESS) {
+                return unlockResult;
+            }
+            try { Thread.sleep(CLOUD_TRUNK_UNLOCK_SETTLE_MS); }
+            catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
 
         try {
             boolean ok = BydDataCollector.getInstance().openTailgate();
             long elapsed = System.currentTimeMillis() - start;
-            if (ok) return CommandResult.success(Path.CLOUD_THEN_SDK,
-                    msg("local_sent"), elapsed);
-            return CommandResult.failed(Path.CLOUD_THEN_SDK,
-                    msg("not_supported"), elapsed, null);
+            Path path = lockState == BydDataCollector.DOOR_STATE_UNLOCK
+                    ? Path.SDK : Path.CLOUD_THEN_SDK;
+            if (ok) return CommandResult.success(path, msg("local_sent"), elapsed);
+            return CommandResult.failed(path, msg("not_supported"), elapsed, null);
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - start;
             return CommandResult.failed(Path.CLOUD_THEN_SDK,

@@ -138,16 +138,44 @@ public final class ThumbnailBuffer {
             // already excludes these (RecordingsApiHandler honours the result
             // for the distance chip filter). Mirror the same gate here so the
             // hero / per-actor JPEGs agree with the recording-level summary.
-            if (a.isStatic
+            // Timeline-static superset: also exclude a parked car detected via
+            // the never-moved signal (which may not have latched the severity-path
+            // isStatic under sparse cadence) from the hero pool, so it can't win
+            // the thumbnail on an otherwise-empty event. PERSON unaffected
+            // (isStaticForTimeline == isStatic for persons).
+            if (a.isStaticForTimeline
                     && a.classGroup != Actor.ClassGroup.PERSON
                     && a.peakSeverity == Actor.Severity.NOTICE) {
+                continue;
+            }
+            // Skip the low-confidence FAR NOTICE misclassification profile from
+            // the hero pool (the on-car case: a parked motorcycle read as
+            // "person · far" @0.44 that won the hero over the real moving car and
+            // drew a grey box on a bike with no person present). HERO scope drops
+            // it for ALL classes incl. PERSON — a phantom box is the visible bug
+            // and the hero falls back to a real MP4 keyframe. (Summary surfaces
+            // use Actor.suppressFromSummary, which exempts PERSON.)
+            if (Actor.suppressFromHero(a)) {
                 continue;
             }
             long incoming = score(a.peakSeverity, a.peakConfidence, a.peakProximity, a.classGroup);
             Slot existing = slots.get(a.actorId);
             long existingScore = existing != null
                     ? score(existing.severity, existing.confidence, existing.proximity, existing.classGroup) : -1L;
-            if (incoming <= existingScore) continue;
+            // Recapture on a strict score improvement OR — at equal score — when
+            // the actor's latched bbox has moved to a FRESHER frame (the dwell
+            // refresh in ActorTracker re-points peakBbox while the actor stays at
+            // its peak proximity tier). Without the equal-score branch, a moving
+            // actor that holds its peak tier never re-captures, so the hero keeps
+            // a stale (rgb, bbox) pair from first-touch — the "delayed + wrong
+            // position" bug. The branch re-pairs THIS frame's rgb with the
+            // freshened bbox, so coherence is preserved. peakSeverityWallMs is the
+            // latch's frame-time; a newer value means the bbox was re-pointed.
+            boolean scoreImproved = incoming > existingScore;
+            boolean dwellRefresh = existing != null
+                    && incoming == existingScore
+                    && a.peakSeverityWallMs > existing.peakWallMs;
+            if (!scoreImproved && !dwellRefresh) continue;
 
             // CRITICAL: bbox alignment guard. The actor's peakBbox lives in
             // peakBboxQuadW × peakBboxQuadH coords (the crop space at the
@@ -177,6 +205,41 @@ public final class ThumbnailBuffer {
                 // existing slot (if any) already has a coherent (rgb, bbox)
                 // pair captured when the dims did match — better than
                 // overwriting with a mismatched pair.
+                continue;
+            }
+
+            // COHERENCE GATE — rgb and bbox MUST come from the same frame.
+            // We store THIS frame's rgb (captured at lastSeenWallMs) paired with
+            // a.peakBbox*, which was latched at a.peakSeverityWallMs. They depict
+            // the SAME moment only when peakBbox was (re)latched on this very
+            // frame — i.e. peakSeverityWallMs == lastSeenWallMs (both are the
+            // tracker's wallNowMs for the current observe()).
+            //
+            // The bug this closes: a person seen CLOSE on first sight is gated to
+            // NOTICE by the escalation window, so peakBbox latches at the close
+            // frame but the ThumbnailBuffer score stays low. As they recede to
+            // MID and the track confirms, toActor() re-derives ALERT from the
+            // lifetime peakProximity — the score jumps on a LATER frame whose rgb
+            // shows the actor at the frame edge, while peakBbox still points at
+            // the earlier close-approach position. Pairing them drew the orange
+            // box over the empty spot the actor had left — "the box misses the
+            // actor". (The dwell-refresh path is coherent by construction: it
+            // advances peakSeverityWallMs to the frame it re-points peakBbox on.)
+            boolean bboxIsThisFrame = (a.peakSeverityWallMs == a.lastSeenWallMs);
+            if (!bboxIsThisFrame) {
+                // Score improved but peakBbox is from an earlier frame. Do NOT
+                // overwrite the coherent pair with a mismatched rgb. If the
+                // existing slot already holds the SAME peak frame's (rgb, bbox),
+                // just refresh the score/label metadata so the hero's severity
+                // colour tracks the re-derived tier while its pixels + box stay
+                // coherent. Otherwise skip — the MP4-keyframe fallback produces
+                // the hero rather than a box drawn on the wrong pixels.
+                if (existing != null && existing.peakWallMs == a.peakSeverityWallMs) {
+                    existing.severity = a.peakSeverity;
+                    existing.confidence = a.peakConfidence;
+                    existing.proximity = a.peakProximity;
+                    existing.wallMs = now;
+                }
                 continue;
             }
 
@@ -228,9 +291,21 @@ public final class ThumbnailBuffer {
      * windowStartMs<=0 disables the gate (legacy behavior). windowEndMs<=0 means
      * "no upper bound" (open-ended, e.g. the still-growing current segment).
      *
-     * Fallback: if NO slot is in-window (e.g. every peak predates a very short
-     * pre-record window), return the best slot anyway — a slightly-stale hero
-     * beats no hero, and the caption/sidecar still describe the event.
+     * HARD GATE: when the window IS active (windowStartMs>0) and NO slot's peak
+     * lies inside it, return null — do NOT fall back to an out-of-window slot.
+     * The buffer is cleared only at recording STOP (not start), but observe()
+     * runs continuously during monitoring, so a slot captured minutes earlier
+     * (e.g. an animal that crossed the lot during a quiet gap) survives into the
+     * next, unrelated event. The old "stale hero beats no hero" fallback then
+     * stamped that phantom (e.g. "animal · far") onto an event whose MP4 never
+     * contains it — observed on-car as a dog hero on a car-only motion clip.
+     * Returning null instead routes the caller to its MP4-keyframe fallback
+     * (writeFallbackHeroFromMp4 / the /thumb endpoint), which extracts a REAL
+     * frame from the recorded clip. The pre-record ring is already inside the
+     * window (windowStartMs = recordingStart = trigger − preRecordMs), so a
+     * legitimate pre-roll peak is still in-window and kept; only genuinely
+     * evicted/stale peaks are dropped. windowStartMs<=0 keeps the legacy
+     * unconditional best-slot pick.
      */
     static Slot pickHero(List<Slot> snap, long windowStartMs, long windowEndMs) {
         Slot hero = null, heroAny = null;
@@ -243,6 +318,9 @@ public final class ThumbnailBuffer {
                         && (windowEndMs <= 0 || s.peakWallMs <= windowEndMs));
             if (inWindow && sc > heroScore) { heroScore = sc; hero = s; }
         }
+        // Gate active + nothing in-window → null (let the caller's MP4-keyframe
+        // fallback produce a real hero). Gate disabled → legacy best-slot pick.
+        if (hero == null && windowStartMs > 0) return null;
         return hero != null ? hero : heroAny;
     }
 

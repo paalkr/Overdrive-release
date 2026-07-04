@@ -777,10 +777,13 @@
     // installing before the daemon died — i.e. the install actually started, so
     // a successful reconnect means SUCCESS even if the version string is
     // unchanged. This matters for the braveheart rolling channel: it replaces
-    // the APK on the same tag and often keeps the same versionName, so
-    // appVersion (now BuildConfig-derived) does NOT change across a successful
-    // in-place update. Keying success on a version change would falsely report
-    // "install may have failed" on every braveheart update.
+    // the APK on the same tag, and if the re-uploaded asset filename keeps the
+    // same version label (or has no parseable version) the VERSION_FILE-derived
+    // appVersion does NOT change across a successful in-place update. (appVersion
+    // comes from getDisplayVersionFromFile() = VERSION_FILE-first, so it usually
+    // DOES advance when the asset filename version bumps — we just can't RELY on
+    // it.) Keying success on a version change would falsely report "install may
+    // have failed" on every same-label braveheart update, so we don't.
     function enterReconnectMode(installWasUnderway) {
         var disc = $('updDisconnect');
         if (disc) disc.style.display = 'block';

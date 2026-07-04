@@ -87,9 +87,33 @@ public final class GeoSnapshot {
             com.overdrive.app.monitor.GpsMonitor gps =
                     com.overdrive.app.monitor.GpsMonitor.getInstance();
             if (!gps.hasLocation()) return empty();
-            long lastUpdate = gps.getLastUpdate();
             long nowMs = System.currentTimeMillis();
-            long age = lastUpdate > 0 ? Math.max(0L, nowMs - lastUpdate) : -1L;
+            // AGE against the MONOTONIC since-boot fix timestamp vs the daemon's own
+            // elapsedRealtime() — NOT getLastUpdate() (= send-time, refreshed by the
+            // sidecar's 4s keep-alive even when the fix is unchanged, so a parked
+            // car's stale fix read age≈0 and tagged a last-known location). Both
+            // operands are the same device-wide monotonic clock, so the delta is the
+            // true fix age and is immune to the device RTC being wrong at cold boot
+            // (which a UTC getTime() vs currentTimeMillis() mix was NOT — that could
+            // drop a fresh fix's tag during the pre-GPS-correction window).
+            // Fallback: when no monotonic basis (older sidecar / cache-loaded fix),
+            // age the send-time against currentTimeMillis() — same-clock, skew-immune,
+            // = prior behavior; never worse than before.
+            long fixElapsed = gps.getFixElapsedMs();
+            long nowElapsed = android.os.SystemClock.elapsedRealtime();
+            long age;
+            // The monotonic basis is usable ONLY if it is not in the FUTURE relative
+            // to our own elapsedRealtime(). A future-dated value means a cross-boot /
+            // incomparable basis (e.g. a prior-boot getLastKnownLocation seed whose
+            // elapsedRealtimeNanos is from a longer past uptime). Clamping it to 0
+            // would read FRESH and tag a stale fix — instead fall back to send-time
+            // aging (same-device-RTC, skew-immune, = prior behavior).
+            if (fixElapsed > 0L && fixElapsed <= nowElapsed) {
+                age = nowElapsed - fixElapsed;
+            } else {
+                long lu = gps.getLastUpdate();
+                age = lu > 0 ? Math.max(0L, nowMs - lu) : -1L;
+            }
             // Reject cache-loaded or over-age fixes → no tag rather than a stale one.
             if (gps.isLoadedFromCache() || age < 0L || age > MAX_AGE_MS) {
                 return empty();

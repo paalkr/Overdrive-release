@@ -80,6 +80,37 @@ class SettingsFragment : Fragment() {
     /** Map from Section → its row view in the sub-rail (landscape only). */
     private val rowViews = mutableMapOf<Section, View>()
 
+    /** Semantic anchor targets the onboarding Expert tour can request, orientation-agnostic. */
+    enum class TourTarget { SURVEILLANCE, RESET, SECURITY, DAEMONS }
+
+    /**
+     * Resolve the best on-screen anchor for an Expert-tour step in EITHER orientation.
+     * Portrait: the section card on the hub. Landscape: the sub-rail row (also selects
+     * that section so its pane is shown). Returns null if not resolvable → caller centers.
+     */
+    fun tourAnchorFor(target: TourTarget): View? {
+        val root = view ?: return null
+        val landscape = root.findViewById<View>(R.id.settingsContent) != null
+        return if (landscape) {
+            val section = when (target) {
+                TourTarget.SURVEILLANCE -> Section.SURVEILLANCE
+                TourTarget.RESET -> Section.PRIVACY
+                TourTarget.SECURITY -> Section.SECURITY
+                TourTarget.DAEMONS -> Section.DAEMONS
+            }
+            selectSection(section, animate = true)
+            rowViews[section]
+        } else {
+            val id = when (target) {
+                TourTarget.SURVEILLANCE -> R.id.cardSectionSurveillance
+                TourTarget.RESET -> R.id.cardResetData
+                TourTarget.SECURITY -> R.id.cardSectionSecurity
+                TourTarget.DAEMONS -> R.id.cardSectionDaemons
+            }
+            root.findViewById(id)
+        }
+    }
+
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,

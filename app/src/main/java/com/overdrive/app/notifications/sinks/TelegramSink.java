@@ -22,8 +22,11 @@ import com.overdrive.app.telegram.TelegramNotifier;
  *   <li>Only <b>WARN</b> and <b>CRITICAL</b> severities are forwarded. Routine
  *       INFO events (charging started/stopped, door closed) would be Telegram
  *       spam — they stay Web-Push-only. WARN/CRITICAL (charging full/fault,
- *       door opened, tyre alarm/leak, SOH mismatch) are the ones worth a chat
- *       message.</li>
+ *       tyre alarm/leak, SOH mismatch) are the ones worth a chat message.</li>
+ *   <li><b>vehicle.security.door.*</b> is EXCLUDED — door open/close stays
+ *       Web-Push-only. It would otherwise ride the criticalAlerts toggle (a
+ *       blunt master switch shared with proximity/battery/tyre alerts), which
+ *       can't silence doors alone; a parked door edge is a push-tier event.</li>
  * </ul>
  *
  * <p>Delivery rides the {@code CRITICAL} Telegram category (the {@code
@@ -43,6 +46,16 @@ public final class TelegramSink implements NotificationBus.Sink {
         try {
             // Already delivered to Telegram via the direct path — don't dup.
             if (event.category != null && event.category.startsWith("surveillance.")) {
+                return;
+            }
+            // Door open/close stays Web-Push-only. This sink rides the
+            // criticalAlerts toggle, a blunt master switch (proximity,
+            // low-battery, tyre, charging faults all ride it too), so it can't
+            // silence ONLY doors — and a parked door edge is a push-tier event,
+            // not worth a Telegram buzz. Web Push still delivers it, gated by
+            // the door category's own per-device enable/mute. Mirrors the
+            // surveillance.* exclusion above.
+            if (event.category != null && event.category.startsWith("vehicle.security.door.")) {
                 return;
             }
             // INFO is Web-Push-only; only escalate WARN/CRITICAL to Telegram.

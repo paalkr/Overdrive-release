@@ -577,11 +577,15 @@ public class AppUpdater {
                     // even if the channel toggle flips mid-install.
                     pendingChannel = channel;
 
-                    // Extract version from APK filename, canonicalized to
-                    // "<channel>-v<semver>" so a filename missing the channel
-                    // prefix still persists a label the read-side shape guard
-                    // trusts (else About/web revert to the BuildConfig identity).
-                    remoteVersion = canonicalVersionLabel(extractVersion(apkName), channel);
+                    // Extract version, canonicalized to "<channel>-v<semver>" so a
+                    // filename missing the channel prefix still persists a label
+                    // the read-side shape guard trusts (else About/web revert to
+                    // the BuildConfig identity). resolveRemoteLabel falls back from
+                    // the APK filename to the release name/tag/body so a digit-less
+                    // braveheart asset filename doesn't strand the label at
+                    // "unknown" (which freezes the displayed version while the
+                    // baseline still advances).
+                    remoteVersion = resolveRemoteLabel(release, apkName, channel);
                     // Report what AppUpdater previously persisted so the
                     // user-facing "you're on version X" matches what
                     // SettingsAboutFragment shows. BuildConfig.VERSION_NAME
@@ -618,46 +622,83 @@ public class AppUpdater {
                     // this channel (cross-channel was handled+returned above).
                     // Genuine first run / fresh sideload of this channel's build:
                     // the user already has it → seed the baseline + suppress.
+                    // Capture the app's install/replace time (DEVICE clock). Used
+                    // only for device-vs-device comparisons below — never compared
+                    // against a GitHub server timestamp.
+                    long appInstallTime = 0L;
+                    try {
+                        appInstallTime = context.getPackageManager()
+                                .getPackageInfo(context.getPackageName(), 0).lastUpdateTime;
+                    } catch (Exception e) {
+                        Log.w(TAG, "Could not read lastUpdateTime: " + e.getMessage());
+                    }
+
                     if (lastInstalledTimestamp.isEmpty()) {
                         saveLastUpdateTimestamp(channel, updatedAt);
+                        // Seed the DEVICE-clock install-time baseline alongside the
+                        // server-timestamp baseline so the next check can detect an
+                        // out-of-band reinstall without crossing clock domains.
+                        saveInstallTimeBaseline(context, channel, appInstallTime);
                         // Display label is BuildConfig-derived (getInstalledVersion),
                         // so a check NEVER needs to seed it — just record the
-                        // per-channel timestamp baseline and report up-to-date.
+                        // per-channel baselines and report up-to-date.
                         Log.i(TAG, "First run — saved baseline timestamp: " + updatedAt + ", version: " + remoteVersion);
                         runCallback(() -> callback.onNoUpdate(currentVersion));
                         return;
                     }
 
-                    // Detect fresh install/deploy: if app's install time is more recent than
-                    // the stored timestamp, this is a new deploy (Android Studio or manual install).
-                    // Only suppress update prompt if the app was installed AFTER the remote APK was updated,
-                    // meaning the user already has this version (e.g. via Android Studio sideload).
-                    try {
-                        long appInstallTime = context.getPackageManager()
-                                .getPackageInfo(context.getPackageName(), 0).lastUpdateTime;
-
-                        // Parse the REMOTE asset timestamp (not the stored one)
-                        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
-                        sdf.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
-                        long remoteAssetTime = 0;
-                        try { remoteAssetTime = sdf.parse(updatedAt).getTime(); } catch (Exception ignored) {}
-
-                        // Parse the stored timestamp to detect if app was reinstalled since last check
-                        long storedTime = 0;
-                        try { storedTime = sdf.parse(lastInstalledTimestamp).getTime(); } catch (Exception ignored) {}
-
-                        // Fresh deploy: app was installed AFTER the remote APK was uploaded AND
-                        // app was also installed after the last update check (i.e. a sideload happened)
-                        if (appInstallTime > remoteAssetTime && appInstallTime > storedTime && apkUpdated) {
-                            saveLastUpdateTimestamp(channel, updatedAt);
-                            // Display label is BuildConfig-derived — no seed needed.
-                            Log.i(TAG, "Fresh deploy detected (app install " + appInstallTime +
-                                    " > remote asset " + remoteAssetTime + ") — updated baseline");
-                            runCallback(() -> callback.onNoUpdate(currentVersion));
-                            return;
-                        }
-                    } catch (Exception e) {
-                        Log.w(TAG, "Could not check install time: " + e.getMessage());
+                    // Out-of-band reinstall detection — DEVICE-CLOCK ONLY.
+                    //
+                    // The previous heuristic compared the device's lastUpdateTime
+                    // against GitHub's server updated_at. Those are two unrelated
+                    // clocks, so device-clock skew (BYD head units boot with a
+                    // wrong RTC until GPS/NTP corrects it) could make a genuinely
+                    // newer asset look like a "fresh deploy" and PERMANENTLY
+                    // suppress the update — the user silently stranded on an old
+                    // build. We now compare ONLY device-clock values: the app's
+                    // current lastUpdateTime vs the lastUpdateTime we recorded when
+                    // we last set a baseline for this channel. If it advanced, the
+                    // APK was (re)installed since our baseline — either our own
+                    // in-app update that just landed, or a manual/Studio sideload.
+                    // In every case the running bytes are what the user most
+                    // recently chose to install, so treat the device as current:
+                    // re-seed BOTH baselines and suppress THIS check only. The next
+                    // re-upload bumps updated_at again → apkUpdated=true → offered,
+                    // so a real later update is never missed. Worst case (user
+                    // manually sideloaded an OLD build while a newer one is live) is
+                    // one suppressed check that self-corrects on the next publish —
+                    // strictly safer than a clock-skew permanent strand.
+                    long installTimeBaseline = getInstallTimeBaseline(context, channel);
+                    // FAIL-OPEN on an UNKNOWN baseline (0). The install-time
+                    // baseline is SharedPreferences-only (per-UID) with NO
+                    // cross-UID file fallback — unlike getLastUpdateTimestamp,
+                    // which syncs through a world-readable /data/local/tmp file.
+                    // So the DAEMON process (UID 2000) reads 0 here even after the
+                    // APP process (UID 10xxx) has seeded it. Without the
+                    // `installTimeBaseline > 0` guard, the daemon's pre-install
+                    // re-check (SurveillanceIpcServer.handleInstallUpdate) sees
+                    // appInstallTime != 0 → fires this branch → onNoUpdate for
+                    // EVERY genuine update. Symptom: the app's own check offers the
+                    // update (Update button shows), the tap routes the install to
+                    // the daemon, and the user gets "Couldn't start the update: No
+                    // update available". Worse, the branch's saveLastUpdateTimestamp
+                    // below would poison the SHARED cross-UID timestamp file, making
+                    // the failure sticky across retries. A 0 baseline means "never
+                    // recorded for this UID" → fall through to the normal apkUpdated
+                    // check and offer it. This is the documented contract: an unseen
+                    // stamp can NEVER falsely suppress a genuine update; the daemon
+                    // simply degrades to timestamp-only detection (which IS cross-UID
+                    // correct). Out-of-band sideload suppression stays intact on the
+                    // app process, where the baseline is always seeded > 0.
+                    if (apkUpdated && appInstallTime > 0 && installTimeBaseline > 0
+                            && appInstallTime != installTimeBaseline) {
+                        saveLastUpdateTimestamp(channel, updatedAt);
+                        saveInstallTimeBaseline(context, channel, appInstallTime);
+                        Log.i(TAG, "Out-of-band (re)install detected (lastUpdateTime "
+                                + appInstallTime + " != baseline " + installTimeBaseline
+                                + ") — re-seeded baselines, suppressing one check");
+                        runCallback(() -> callback.onNoUpdate(currentVersion));
+                        return;
                     }
 
                     Log.i(TAG, "Channel: " + channel + ", Current: " + currentVersion +
@@ -838,9 +879,19 @@ public class AppUpdater {
                 final String priorDisplayVersion = getDisplayVersion(context);
                 // Set the just-updated MARKER. Only store remoteVersion as the
                 // label when it's canonical — a bare/version-less "unknown"
-                // must not clobber a prior valid label (persistVersionToFile
-                // guards the file half identically; the displayed value is
-                // getInstalledVersion() regardless).
+                // must not clobber a prior valid label.
+                //
+                // NOTE: VERSION_FILE (persistVersionToFile) is deliberately NOT
+                // written here. It is the user-visible "current version" on every
+                // surface, so it must only advance AFTER pm install returns rc==0
+                // — otherwise a failed install (or a kill between this write and
+                // the failed pm install) leaves About/status/toast showing a build
+                // that never landed. The advance now lives on the success paths:
+                // the sync onSuccess branch below, and the detached install
+                // script's pm-install-success branch (runDetachedInstall). The
+                // PREF_UPDATED_VERSION marker is safe to set pre-install because
+                // it's consumed once on the post-update launch and is explicitly
+                // rolled back on failure (consumeFailedUpdateError).
                 android.content.SharedPreferences.Editor ie =
                         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                                 .edit().putBoolean(PREF_JUST_UPDATED, true);
@@ -848,7 +899,6 @@ public class AppUpdater {
                     ie.putString(PREF_UPDATED_VERSION, remoteVersion);
                 }
                 ie.commit();
-                persistVersionToFile(remoteVersion);
                 saveLastUpdateTimestamp(channel, remoteUpdatedAt);
 
                 // Step 4 & 5: Stop daemons + install + relaunch. The control flow
@@ -967,6 +1017,12 @@ public class AppUpdater {
                             });
                     postInstallError(callback, "Install failed: " + output);
                 } else {
+                    // Install succeeded — NOW advance the persisted display label
+                    // (the pre-install write at step 3 was removed so a failed
+                    // install can never leave VERSION_FILE pointing at a build
+                    // that didn't land). Guarded out for the "unknown" sentinel
+                    // by persistVersionToFile itself.
+                    persistVersionToFile(remoteVersion);
                     postProgress(callback, "✅ Update installed! Restarting...");
                     runCallback(callback::onSuccess);
                 }
@@ -1220,6 +1276,13 @@ public class AppUpdater {
         script.append("rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null\n");
         script.append("rm -f /data/local/tmp/*_daemon.lock 2>/dev/null\n");
         script.append("rm -f /data/local/tmp/cam_watchdog.pid 2>/dev/null\n");
+        // Sweep ONLY the transient config staging siblings a daemon killed
+        // mid-write may orphan (overdrive_config.json.tmp.<pid> from the atomic
+        // write, and the .bak.tmp staging file). MUST NOT touch the live config,
+        // its .bak, or .bad — those are the recovery copies. Explicit suffixes,
+        // never a broad overdrive_config* / *.json glob.
+        script.append("rm -f /data/local/tmp/overdrive_config.json.tmp.* "
+                + "/data/local/tmp/overdrive_config.json.bak.tmp 2>/dev/null\n");
         // Clear ONLY the CORE disable sentinels (camera + acc-sentry) — we
         // needed them set above so any surviving watchdog exits, but the new
         // MainActivity must not see them on startup or it'll leave those CORE
@@ -1366,6 +1429,20 @@ public class AppUpdater {
         // the NEXT install's "queued" write, so delete it now — pure hygiene so
         // a fresh poll doesn't see a stale terminal record.
         script.append("  rm -f /data/local/tmp/overdrive_update_progress.json\n");
+        // Advance the persisted display label NOW — and ONLY here, on pm-install
+        // success. VERSION_FILE drives the user-visible "current version" on every
+        // surface (About / status / toast), so it must move only after the new
+        // bytes actually landed; the pre-install write was removed for exactly
+        // this reason. Mirror the failure-branch restore shape: echo the canonical
+        // label + chmod 644 so the OTHER UID can read it cross-process. Guarded
+        // against the "unknown" sentinel (a version-less filename) so we never
+        // clobber a valid prior label with junk the read-side rejects anyway.
+        if (remoteVersion != null && !remoteVersion.isEmpty()
+                && !"unknown".equals(remoteVersion)) {
+            script.append("  echo '").append(shellSafe(remoteVersion)).append("' > ")
+                  .append(VERSION_FILE).append("\n");
+            script.append("  chmod 644 ").append(VERSION_FILE).append(" 2>/dev/null\n");
+        }
         // Clear any stale FAILURE hint from a PRIOR failed install so the reborn
         // bot doesn't send a failure message on top of this success. (The
         // success hint is intentionally KEPT here so notifyTunnel frames the
@@ -1708,6 +1785,41 @@ public class AppUpdater {
     }
 
     /**
+     * Resolve a canonical "<channel>-v<semver>" label for a release, trying
+     * progressively weaker sources so a digit-less APK filename never freezes
+     * the displayed version at "unknown" (which then can't be persisted, so the
+     * baseline advances while About/toast show a stale older label forever).
+     *
+     * Order: APK asset filename → release {@code name} → release {@code tag_name}.
+     * The first that yields a parseable dotted version wins. Falls through to
+     * "unknown" only when NONE carry a version (truly unlabelled release) —
+     * callers keep their existing unknown-sentinel handling for that genuine edge.
+     *
+     * The release {@code body} is deliberately NOT consulted: it's free-text
+     * release notes, and extractVersion's bare-version regex would happily match
+     * a number inside prose ("fixes regression from v25.1") and surface a WRONG
+     * display label. The structured fields (filename / name / tag_name) cover
+     * every well-formed release; a release missing a version in all three is
+     * malformed and correctly stays "unknown".
+     */
+    static String resolveRemoteLabel(JSONObject release, String apkName, String channel) {
+        String label = canonicalVersionLabel(extractVersion(apkName), channel);
+        if (!"unknown".equals(label)) return label;
+        if (release != null) {
+            String[] fallbacks = {
+                    release.optString("name", ""),
+                    release.optString("tag_name", "")
+            };
+            for (String src : fallbacks) {
+                if (src == null || src.isEmpty()) continue;
+                String cand = canonicalVersionLabel(extractVersion(src), channel);
+                if (!"unknown".equals(cand)) return cand;
+            }
+        }
+        return "unknown";
+    }
+
+    /**
      * Channel a display label belongs to ("alpha-v25.4" → "alpha",
      * "braveheart-v26.0" → "braveheart"), or null when the label carries no
      * channel prefix (bare "v6.1", "unknown", or the "Manually Installed"
@@ -1795,6 +1907,35 @@ public class AppUpdater {
                         @Override public void onError(String e) {}
                     });
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * Per-channel DEVICE-CLOCK install-time baseline key. Stores the app's
+     * {@code PackageManager.lastUpdateTime} (a device-monotonic-ish ms value)
+     * captured the last time we recorded an update baseline for this channel.
+     * Used to detect an OUT-OF-BAND reinstall (Studio/manual sideload) WITHOUT
+     * comparing the device clock against GitHub's server clock — see
+     * checkForUpdate. SharedPreferences-only (per-UID): the app process gets the
+     * full correct behaviour; a daemon-process check that never sees the stamp
+     * simply degrades to "offer the sideloaded build once" — it can NEVER
+     * falsely suppress a genuine update.
+     */
+    private static String installTimePrefKey(String channel) {
+        return "install_time_baseline_" + channel;
+    }
+
+    /** Read the per-channel device-clock install-time baseline (0 if unset). */
+    private static long getInstallTimeBaseline(Context ctx, String channel) {
+        if (ctx == null) return 0L;
+        return ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getLong(installTimePrefKey(channel), 0L);
+    }
+
+    /** Persist the per-channel device-clock install-time baseline. */
+    private static void saveInstallTimeBaseline(Context ctx, String channel, long t) {
+        if (ctx == null || t <= 0) return;
+        ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putLong(installTimePrefKey(channel), t).commit();
     }
 
     private String getLastUpdateTimestamp(String channel) {
@@ -2385,13 +2526,13 @@ public class AppUpdater {
             remoteUpdatedAt = apk[2];
             // Canonicalize to "alpha-v<semver>" (this path is alpha-only) so a
             // filename missing the channel prefix still persists a label the
-            // read-side shape guard trusts.
-            remoteVersion = canonicalVersionLabel(extractVersion(apk[1]), CHANNEL_ALPHA);
-            // If the filename had no parseable version, try the TAG (e.g.
-            // "alpha-v6.1" → "alpha-v6.1"); a bare "alpha" tag canonicalizes to
-            // "unknown" and STAYS "unknown" — the established no-persist
-            // sentinel — rather than writing junk "alpha" that the read-side
-            // shape guard would just reject. Both forms are shell-safe.
+            // read-side shape guard trusts. resolveRemoteLabel walks
+            // filename → release name → tag_name → body before giving up.
+            remoteVersion = resolveRemoteLabel(release, apk[1], CHANNEL_ALPHA);
+            // Final guard: try the requested TAG explicitly (e.g. "alpha-v6.1").
+            // A bare "alpha" tag canonicalizes to "unknown" and STAYS "unknown" —
+            // the established no-persist sentinel — rather than writing junk
+            // "alpha" that the read-side shape guard would just reject.
             if ("unknown".equals(remoteVersion)) {
                 remoteVersion = canonicalVersionLabel(extractVersion(tag), CHANNEL_ALPHA);
             }

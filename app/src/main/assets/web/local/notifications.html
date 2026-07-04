@@ -10,7 +10,7 @@
     <title data-i18n="app.notifications_title">Notifications - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js"></script>
+    <script src="../shared/app-shell.js?v=2"></script>
     <!--
       WebView detection MUST run before app-tabs.js builds the tab bar so
       we can filter OT_TABS to the Telegram-only flow on the head unit.
@@ -43,17 +43,22 @@
       SurvSettings bindings in shared/surveillance.js keep firing.
     -->
     <script>
+        var __OT_LOG_TAB = { id: 'log', label: 'Log', i18n: 'notif.tab_log', svg: '<line x1="8" y1="7" x2="18" y2="7"/><line x1="8" y1="12" x2="18" y2="12"/><line x1="8" y1="17" x2="14" y2="17"/><circle cx="4.5" cy="7" r="1"/><circle cx="4.5" cy="12" r="1"/><circle cx="4.5" cy="17" r="1"/>' };
         var __OT_ALL_TABS = [
+            __OT_LOG_TAB,
             { id: 'push',     label: 'Push',     i18n: 'notif.tab_push',     svg: '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>' },
             { id: 'telegram', label: 'Telegram', i18n: 'notif.tab_telegram', svg: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>' },
             { id: 'devices',  label: 'Devices',  i18n: 'notif.tab_devices',  svg: '<rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/>', readOnly: true }
         ];
+        // The Log tab reads persisted history (no tunnel needed) so it is useful
+        // in the head-unit WebView too — keep it alongside Telegram there. Push
+        // and Devices still make no sense in-car and are filtered out.
         window.OT_TABS = (typeof window.AndroidBridge !== 'undefined')
-            ? __OT_ALL_TABS.filter(function (t) { return t.id === 'telegram'; })
+            ? __OT_ALL_TABS.filter(function (t) { return t.id === 'telegram' || t.id === 'log'; })
             : __OT_ALL_TABS;
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=16">
+    <link rel="stylesheet" href="../shared/styles.css?v=17">
     <link rel="manifest" href="/manifest.json">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -353,6 +358,209 @@
         #driveSideCard .notif-row:hover .notif-radio:not(.on) {
             border-color: #00E5FF;
         }
+
+        /* ============================================================
+           NOTIFICATION LOG TAB (data-tab="log")
+           Ported filter/calendar CSS from charging.html + event-style
+           pagination. Chrome-58 safe: no flex gap (sibling margins), no
+           inset:0, explicit calendar-day height.
+           ============================================================ */
+        .nl-wrap { max-width: 100%; }
+
+        /* ---- Header: count (left) + icon actions (right) ---- */
+        .nl-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+        .nl-count { font-size: 15px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.01em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .nl-actions { display: flex; flex: 0 0 auto; }
+        .nl-actions > * + * { margin-left: 8px; }
+        .nl-icon-btn {
+            width: 38px; height: 38px; display: inline-flex; align-items: center; justify-content: center;
+            border-radius: var(--radius-full); background: var(--bg-surface); border: 1px solid var(--border-subtle);
+            color: var(--text-secondary); cursor: pointer; transition: background .2s, color .2s, border-color .2s;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .nl-icon-btn svg { width: 18px; height: 18px; }
+        .nl-icon-btn:hover { background: var(--bg-elevated); color: var(--text-primary); }
+        .nl-icon-btn.active { background: var(--brand-primary); color: var(--bg-base); border-color: var(--brand-primary); }
+        .nl-icon-btn.danger:hover { background: rgba(255,180,171,0.14); color: var(--status-danger); border-color: var(--status-danger); }
+
+        /* ---- Filter bar: one row of dropdown chips ---- */
+        .nl-filterbar { display: flex; flex-wrap: nowrap; align-items: center; margin-bottom: 16px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+        .nl-filterbar::-webkit-scrollbar { display: none; }
+        .nl-filterbar > * + * { margin-left: 8px; }
+        /* The 3 dimension chips shrink to share the row (label ellipsizes);
+           the reset chip is fixed-size and never wraps to a new line. */
+        .nl-filterbar .nl-fchip:not(.nl-fchip-reset) { flex: 0 1 auto; min-width: 0; }
+        .nl-fchip {
+            display: inline-flex; align-items: center; height: 36px; padding: 0 12px;
+            border-radius: var(--radius-full); background: var(--bg-surface); border: 1px solid var(--border-subtle);
+            color: var(--text-secondary); font-size: 13px; font-weight: 600; cursor: pointer;
+            transition: background .2s, color .2s, border-color .2s; white-space: nowrap; max-width: 46vw;
+            -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+        }
+        .nl-fchip > svg:first-child { width: 15px; height: 15px; flex: 0 0 auto; margin-right: 7px; opacity: .85; }
+        .nl-fchip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .nl-fchip-caret { width: 15px; height: 15px; flex: 0 0 auto; margin-left: 5px; opacity: .7; transition: transform .2s; }
+        .nl-fchip:hover { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-default); }
+        .nl-fchip.is-active { background: var(--brand-primary); color: var(--bg-base); border-color: var(--brand-primary); }
+        .nl-fchip.is-active > svg { opacity: 1; }
+        .nl-fchip.is-open .nl-fchip-caret { transform: rotate(180deg); }
+        .nl-fchip-reset { width: 36px; flex: 0 0 auto; padding: 0; justify-content: center; }
+        .nl-fchip-reset > svg:first-child { margin-right: 0; }
+        /* Narrow phones: tighten chips so all three + reset fit the row. */
+        @media (max-width: 400px) {
+            .nl-fchip { padding: 0 10px; height: 34px; font-size: 12px; }
+            .nl-fchip > svg:first-child { margin-right: 5px; width: 14px; height: 14px; }
+            .nl-fchip-caret { margin-left: 3px; }
+            .nl-filterbar > * + * { margin-left: 6px; }
+        }
+
+        /* ---- Filter menu bottom-sheet (reuses .calendar-popup overlay) ---- */
+        .nl-menu-header { display: flex; align-items: center; justify-content: space-between; }
+        .nl-menu-title { font-size: 17px; font-weight: 700; color: var(--text-primary); }
+        .nl-menu-close { width: 32px; height: 32px; border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-secondary); display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        .nl-menu-close svg { width: 16px; height: 16px; }
+        .nl-menu-list { display: flex; flex-direction: column; }
+        .nl-menu-item {
+            display: flex; align-items: center; padding: 13px 12px; border-radius: var(--radius-md);
+            background: transparent; color: var(--text-primary); font-size: 15px; font-weight: 500;
+            cursor: pointer; text-align: left; transition: background .15s; -webkit-tap-highlight-color: transparent;
+        }
+        .nl-menu-item + .nl-menu-item { margin-top: 2px; }
+        .nl-menu-item:hover { background: var(--bg-elevated); }
+        .nl-menu-item .nl-menu-dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; margin-right: 11px; background: var(--text-muted); }
+        .nl-menu-item .nl-menu-check { width: 18px; height: 18px; flex: 0 0 auto; margin-left: auto; color: var(--brand-primary); opacity: 0; }
+        .nl-menu-item.selected { background: var(--bg-elevated); font-weight: 600; }
+        .nl-menu-item.selected .nl-menu-check { opacity: 1; }
+        .nl-menu-dot.sev-critical { background: var(--status-danger); }
+        .nl-menu-dot.sev-warn { background: var(--status-warning); }
+        .nl-menu-dot.sev-info { background: var(--status-info); }
+
+        /* ---- Custom From -> To range row (revealed inside the date menu) ---- */
+
+        /* Custom From -> To range row + calendar popup (ported from charging). */
+        .calendar-popup { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--panel-overlay-bg-deep); z-index: 500; display: none; align-items: flex-end; justify-content: center; -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); }
+        .calendar-popup.active { display: flex; }
+        .calendar-panel { background: var(--bg-surface); border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: 20px; padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)); width: 100%; max-width: 100%; max-height: 85vh; overflow-y: auto; display: flex; flex-direction: column; box-shadow: var(--shadow-lg); animation: nlSlideUp .3s ease; }
+        .calendar-panel > * + * { margin-top: 16px; }
+        @keyframes nlSlideUp { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @media (min-width: 480px) { .calendar-popup { align-items: center; padding: 20px; } .calendar-panel { border-radius: var(--radius-lg); max-width: 340px; max-height: none; padding-bottom: 20px; animation: nlPopIn .2s ease; } }
+        @keyframes nlPopIn { from { transform: scale(.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .calendar-header { display: flex; justify-content: space-between; align-items: center; }
+        .calendar-title { font-size: 18px; font-weight: 600; }
+        .calendar-nav { display: flex; }
+        .calendar-nav button + button { margin-left: 8px; }
+        .calendar-nav button { width: 32px; height: 32px; border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-secondary); display: flex; align-items: center; justify-content: center; transition: all .2s; }
+        .calendar-nav button:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+        .calendar-weekday { text-align: center; font-size: 11px; font-weight: 600; color: var(--text-muted); padding: 8px 0; text-transform: uppercase; }
+        .calendar-day { aspect-ratio: 1; height: 40px; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; color: var(--text-secondary); cursor: pointer; position: relative; transition: all .2s; min-height: 40px; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+        .calendar-day:hover { background: var(--bg-hover); }
+        .calendar-day:active { background: var(--bg-elevated); transform: scale(.95); }
+        .calendar-day.other-month { color: var(--text-muted); opacity: .5; }
+        .calendar-day.today { background: var(--bg-elevated); color: var(--text-primary); font-weight: 600; }
+        .calendar-day.selected { background: var(--brand-primary); color: var(--bg-base); }
+        .calendar-day.in-range { background: rgba(93,219,182,0.16); color: var(--text-primary); }
+        .calendar-day.disabled { color: var(--text-muted); opacity: .3; cursor: not-allowed; pointer-events: none; }
+
+        /* ---- Date sheet (presets + inline range calendar) ---- */
+        .nl-date-presets { display: flex; margin-bottom: 4px; }
+        .nl-date-presets > * + * { margin-left: 8px; }
+        .nl-date-preset {
+            flex: 1 1 0; height: 40px; border-radius: var(--radius-md);
+            background: var(--bg-elevated); border: 1px solid transparent;
+            color: var(--text-secondary); font-size: 14px; font-weight: 600; cursor: pointer;
+            transition: background .15s, color .15s, border-color .15s; -webkit-tap-highlight-color: transparent;
+        }
+        .nl-date-preset:hover { color: var(--text-primary); }
+        .nl-date-preset.active { background: var(--brand-primary); color: var(--bg-base); border-color: var(--brand-primary); }
+        .nl-date-divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+        .nl-date-divider::before, .nl-date-divider::after { content: ''; flex: 1 1 auto; height: 1px; background: var(--border-subtle); }
+        .nl-date-divider span { padding: 0 10px; }
+        .nl-date-summary { text-align: center; font-size: 14px; font-weight: 600; color: var(--text-primary); padding: 6px 0; }
+        .nl-date-apply { width: 100%; padding: 12px; color: var(--on-primary, #000); }
+        .nl-date-apply:disabled { opacity: .45; cursor: not-allowed; }
+
+        /* Bulk-select action bar (sticky above the list when selecting). */
+        .nl-bulk-bar { display: none; align-items: center; justify-content: space-between; padding: 10px 14px; margin-bottom: 12px; border-radius: var(--radius-md); background: var(--bg-elevated); border: 1px solid var(--border-default); position: sticky; top: 0; z-index: 6; }
+        .nl-bulk-left { display: flex; align-items: center; }
+        .nl-bulk-left > * + * { margin-left: 10px; }
+        .nl-bulk-count { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+        .nl-bulk-link { font-size: 12px; font-weight: 600; color: var(--text-secondary); cursor: pointer; background: none; }
+        .nl-bulk-link:hover { color: var(--text-primary); }
+
+        /* ---- The cards ---- */
+        #nlList { display: flex; flex-direction: column; }
+        #nlList > * + * { margin-top: 10px; }
+        .nl-card {
+            display: flex; align-items: flex-start; padding: 14px;
+            border-radius: var(--radius-lg); background: var(--bg-surface);
+            border: 1px solid var(--border-subtle); position: relative; transition: background .2s, border-color .2s, transform .12s;
+        }
+        .nl-card > * + * { margin-left: 12px; }
+        .nl-card.nl-clickable { cursor: pointer; }
+        .nl-card.nl-clickable:hover { background: var(--bg-elevated); border-color: var(--border-default); }
+        .nl-card.nl-clickable:active { transform: scale(.995); }
+        /* Severity accent — left inset bar (matches events.html sev cards). */
+        .nl-card.sev-warn { box-shadow: inset 3px 0 0 var(--status-warning); }
+        .nl-card.sev-critical { box-shadow: inset 3px 0 0 var(--status-danger); }
+
+        .nl-icon { flex: 0 0 auto; width: 40px; height: 40px; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; background: var(--bg-elevated); color: var(--text-secondary); margin-top: 1px; }
+        .nl-icon svg { width: 20px; height: 20px; }
+        .nl-icon.sev-warn { color: var(--status-warning); }
+        .nl-icon.sev-critical { color: var(--status-danger); }
+        .nl-icon.sev-info { color: var(--status-info); }
+
+        .nl-thumb { flex: 0 0 auto; width: 64px; height: 48px; border-radius: var(--radius-sm); overflow: hidden; background: var(--bg-elevated); }
+        .nl-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+        .nl-body { flex: 1 1 auto; min-width: 0; }
+        .nl-line1 { display: flex; align-items: center; }
+        .nl-title { font-size: 15px; font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .nl-jump { margin-left: 8px; color: var(--text-muted); flex: 0 0 auto; }
+        .nl-jump svg { width: 15px; height: 15px; vertical-align: middle; }
+        .nl-text { font-size: 13px; color: var(--text-secondary); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+        .nl-meta { display: flex; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+        .nl-meta > * { margin-right: 8px; margin-top: 4px; }
+        .nl-time { font-size: 12px; color: var(--text-muted); margin-left: auto; margin-right: 0; }
+
+        .nl-sev-pill { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: var(--radius-full); text-transform: uppercase; letter-spacing: .03em; }
+        .nl-sev-pill.sev-info { background: rgba(133,207,255,0.16); color: var(--status-info); }
+        .nl-sev-pill.sev-warn { background: rgba(255,184,112,0.16); color: var(--status-warning); }
+        .nl-sev-pill.sev-critical { background: rgba(255,180,171,0.16); color: var(--status-danger); }
+        .nl-group-pill { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: var(--radius-full); background: var(--bg-elevated); color: var(--text-secondary); }
+        .nl-place { font-size: 12px; color: var(--text-secondary); }
+        .nl-chip { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-secondary); }
+        .nl-chip.prox-veryclose { background: rgba(255,180,171,0.18); color: var(--status-danger); }
+        .nl-chip.prox-close { background: rgba(255,184,112,0.18); color: var(--status-warning); }
+
+        .nl-del { flex: 0 0 auto; width: 34px; height: 34px; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all .2s; }
+        .nl-del svg { width: 17px; height: 17px; }
+        .nl-del:hover { background: rgba(255,180,171,0.14); color: var(--status-danger); }
+
+        /* Selection checkbox */
+        .nl-check { flex: 0 0 auto; display: inline-flex; align-items: center; cursor: pointer; margin-top: 4px; }
+        .nl-check input { position: absolute; opacity: 0; width: 0; height: 0; }
+        .nl-check-box { width: 22px; height: 22px; border-radius: var(--radius-sm); border: 2px solid var(--border-default); display: inline-block; position: relative; transition: all .2s; }
+        .nl-check input:checked + .nl-check-box { background: var(--brand-primary); border-color: var(--brand-primary); }
+        .nl-check input:checked + .nl-check-box:after { content: ''; position: absolute; left: 7px; top: 3px; width: 5px; height: 10px; border: solid var(--bg-base); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+
+        /* Pagination (events-style Prev / Next). */
+        .nl-pagination { display: none; justify-content: center; align-items: center; padding: 16px; margin-top: 8px; border-top: 1px solid var(--border-subtle); }
+        .nl-pagination > * + * { margin-left: 8px; }
+        .pagination-btn { padding: 8px 16px; background: var(--bg-elevated); border-radius: var(--radius-sm); color: var(--text-secondary); font-size: 13px; font-weight: 500; transition: all .2s; display: flex; align-items: center; cursor: pointer; }
+        .pagination-btn svg { width: 14px; height: 14px; }
+        .pagination-btn.prev svg { margin-right: 6px; }
+        .pagination-btn.next svg { margin-left: 6px; }
+        .pagination-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+        .pagination-btn:disabled { opacity: .4; cursor: not-allowed; }
+        .pagination-info { font-size: 13px; color: var(--text-muted); padding: 0 12px; }
+
+        /* Skeleton + empty */
+        .nl-skel-card { height: 76px; border-radius: var(--radius-lg); background: var(--bg-surface); opacity: .5; animation: nlPulse 1.3s ease-in-out infinite; }
+        .nl-skel-card + .nl-skel-card { margin-top: 10px; }
+        @keyframes nlPulse { 0%,100% { opacity: .35; } 50% { opacity: .6; } }
+        .nl-empty { text-align: center; padding: 48px 16px; color: var(--text-muted); }
+        .nl-empty svg { width: 56px; height: 56px; opacity: .4; margin-bottom: 12px; }
     </style>
 </head>
 <body>
@@ -386,6 +594,95 @@
                          status message (kept outside the tab system so it
                          can survive a tab switch during a save). -->
                     <div id="status" class="notif-status" style="display:none;"></div>
+
+                    <!-- ============================================================
+                         NOTIFICATION LOG (data-tab="log")
+                         Chronological history of every emitted notification.
+                         Calendar date filter (charging-page parity) + group /
+                         severity chips + event-style pagination + per-card and
+                         bulk delete. Tapping an event card jumps to the clip.
+                         ============================================================ -->
+                    <div class="notif-section" data-tab="log">
+                        <div class="nl-wrap">
+                            <!-- Header: count (left) + icon actions (right) -->
+                            <div class="nl-header">
+                                <span class="nl-count" id="nlCount" data-i18n="notiflog.empty">No notifications yet</span>
+                                <div class="nl-actions">
+                                    <button class="nl-icon-btn" id="nlSelectToggle" onclick="NOTIFLOG.toggleSelectMode()" title="Select" aria-label="Select">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                                    </button>
+                                    <button class="nl-icon-btn danger" id="nlClearAllBtn" onclick="NOTIFLOG.clearAll()" title="Clear all" aria-label="Clear all">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Bulk action bar (shown only in select mode) -->
+                            <div class="nl-bulk-bar" id="nlBulkBar">
+                                <div class="nl-bulk-left">
+                                    <span class="nl-bulk-count" id="nlBulkCount" data-i18n="notiflog.none_selected">0 selected</span>
+                                    <button class="nl-bulk-link" onclick="NOTIFLOG.selectAllOnPage()" data-i18n="notiflog.select_all">Select all</button>
+                                    <button class="nl-bulk-link" onclick="NOTIFLOG.clearSelection()" data-i18n="notiflog.clear_selection">Clear</button>
+                                </div>
+                                <button class="btn btn-danger" id="nlBulkDeleteBtn" onclick="NOTIFLOG.deleteSelected()" disabled data-i18n="notiflog.delete">Delete</button>
+                            </div>
+
+                            <!-- SOTA filter bar: one row of dropdown chips. Each opens
+                                 a bottom-sheet menu (reuses the calendar-popup pattern).
+                                 The chip label reflects the active selection; a chip with
+                                 a non-default value gets the .is-active accent. -->
+                            <div class="nl-filterbar" id="nlFilterBar">
+                                <button class="nl-fchip" id="nlDateChip" onclick="NOTIFLOG.openFilterMenu('date')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                                    <span class="nl-fchip-label" id="nlDateChipLabel" data-i18n="notiflog.filter_all">All time</span>
+                                    <svg class="nl-fchip-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                                </button>
+                                <button class="nl-fchip" id="nlCatChip" onclick="NOTIFLOG.openFilterMenu('cat')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+                                    <span class="nl-fchip-label" id="nlCatChipLabel" data-i18n="notiflog.filter_category">Category</span>
+                                    <svg class="nl-fchip-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                                </button>
+                                <button class="nl-fchip" id="nlSevChip" onclick="NOTIFLOG.openFilterMenu('sev')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                                    <span class="nl-fchip-label" id="nlSevChipLabel" data-i18n="notiflog.filter_severity">Severity</span>
+                                    <svg class="nl-fchip-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                                </button>
+                                <button class="nl-fchip nl-fchip-reset" id="nlResetChip" onclick="NOTIFLOG.resetFilters()" style="display:none;" title="Reset filters" aria-label="Reset filters">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9 9 0 0 0-6.36 2.64L3 8"/><path d="M3 3v5h5"/></svg>
+                                </button>
+                            </div>
+
+                            <!-- Skeleton (first load) -->
+                            <div id="nlSkeleton" style="display:none;margin-top:14px;">
+                                <div class="nl-skel-card"></div>
+                                <div class="nl-skel-card"></div>
+                                <div class="nl-skel-card"></div>
+                            </div>
+
+                            <!-- The list -->
+                            <div id="nlList" style="margin-top:14px;"></div>
+
+                            <!-- Empty state -->
+                            <div class="nl-empty" id="nlEmpty" style="display:none;">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+                                <div data-i18n="notiflog.empty">No notifications yet</div>
+                                <div style="font-size:13px;margin-top:6px;" data-i18n="notiflog.empty_hint">Alerts you receive appear here so you can review them any time.</div>
+                            </div>
+
+                            <!-- Pagination -->
+                            <div class="nl-pagination" id="nlPagination">
+                                <button class="pagination-btn prev" id="nlPrevBtn" onclick="NOTIFLOG.prevPage()" disabled>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+                                    <span data-i18n="notiflog.prev">Prev</span>
+                                </button>
+                                <span class="pagination-info" id="nlPageInfo">Page 1 of 1</span>
+                                <button class="pagination-btn next" id="nlNextBtn" onclick="NOTIFLOG.nextPage()" disabled>
+                                    <span data-i18n="notiflog.next">Next</span>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
 
                     <!-- ===== Vehicle layout (LHD / RHD) =====
                          Cross-cuts every tab: door notifications fire from the
@@ -605,6 +902,51 @@
         </main>
     </div>
 
+    <!-- Filter menu bottom-sheet for the Category / Severity chips. Its list is
+         rebuilt fresh each open (no shared/relocated nodes), so innerHTML reuse
+         is safe. The Date chip uses its own self-contained sheet below. -->
+    <div class="calendar-popup nl-menu-popup" id="nlMenuPopup">
+        <div class="calendar-panel nl-menu-panel">
+            <div class="nl-menu-header">
+                <span class="nl-menu-title" id="nlMenuTitle"></span>
+                <button class="nl-menu-close" onclick="NOTIFLOG.closeFilterMenu()" aria-label="Close">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <div class="nl-menu-list" id="nlMenuList"></div>
+        </div>
+    </div>
+
+    <!-- Date sheet: presets + an ALWAYS-PRESENT inline calendar (tap-tap range
+         selection). Fully self-contained — nothing is relocated or wiped, so it
+         reopens reliably every time. -->
+    <div class="calendar-popup nl-date-popup" id="nlDatePopup">
+        <div class="calendar-panel nl-date-panel">
+            <div class="nl-menu-header">
+                <span class="nl-menu-title" data-i18n="notiflog.filter_date">Date</span>
+                <button class="nl-menu-close" onclick="NOTIFLOG.closeDateMenu()" aria-label="Close">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <div class="nl-date-presets" id="nlDatePresets">
+                <button class="nl-date-preset" data-days="0" onclick="NOTIFLOG.pickDatePreset(0)" data-i18n="notiflog.filter_all">All time</button>
+                <button class="nl-date-preset" data-days="7" onclick="NOTIFLOG.pickDatePreset(7)" data-i18n="notiflog.filter_7d">7 days</button>
+                <button class="nl-date-preset" data-days="30" onclick="NOTIFLOG.pickDatePreset(30)" data-i18n="notiflog.filter_30d">30 days</button>
+            </div>
+            <div class="nl-date-divider"><span data-i18n="notiflog.filter_custom">Custom range</span></div>
+            <div class="nl-date-summary" id="nlDateSummary" data-i18n="notiflog.range_pick">Pick a start or end date</div>
+            <div class="calendar-header">
+                <span class="calendar-title" id="nlCalendarTitle">Calendar</span>
+                <div class="calendar-nav">
+                    <button onclick="NOTIFLOG.calPrevMonth()" aria-label="Previous month"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg></button>
+                    <button onclick="NOTIFLOG.calNextMonth()" aria-label="Next month"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></button>
+                </div>
+            </div>
+            <div class="calendar-grid" id="nlCalendarGrid"></div>
+            <button class="btn btn-primary nl-date-apply" id="nlDateApply" onclick="NOTIFLOG.applyCustomRange()" disabled data-i18n="notiflog.range_apply">Apply</button>
+        </div>
+    </div>
+
     <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
     <div id="toastContainer" class="toast-container"></div>
 
@@ -617,6 +959,7 @@
          v2TelegramTierGroup controls hooked into surveillance.js wiring
          keep firing without a per-page bridge. -->
     <script src="../shared/surveillance.js?v=index1"></script>
+    <script src="../shared/notif-log.js?v=3"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
@@ -1563,6 +1906,53 @@
                 .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
         function escapeAttr(s) { return escapeHtml(s); }
+
+        // ===== Notification Log tab wiring =====
+        // The Log tab reads persisted history via NOTIFLOG (notif-log.js). Two
+        // hooks: (1) lazy-load the log the first time the tab becomes active so
+        // the page's first paint stays cheap; (2) hide the always-visible
+        // Vehicle-layout picker while the Log tab is active (it's untagged so
+        // app-tabs keeps it on every tab otherwise). Also refresh the log's
+        // relative timestamps whenever the user returns to it.
+        function nlSyncChrome(activeId) {
+            var drive = document.getElementById('driveSideSection');
+            if (drive) drive.style.display = (activeId === 'log') ? 'none' : '';
+            if (activeId === 'log' && window.NOTIFLOG) {
+                if (!NOTIFLOG.loaded) NOTIFLOG.ensureLoaded();
+                else NOTIFLOG.load();
+            }
+        }
+        document.addEventListener('ot-tabs:active-changed', function (ev) {
+            var id = (ev && ev.detail) ? ev.detail.id : null;
+            if (id) nlSyncChrome(id);
+        });
+
+        // Resolve the active tab on load and sync chrome SYNCHRONOUSLY (no
+        // awaits) so the untagged Vehicle-layout picker can never paint on — or
+        // get stuck on — the Log tab if the async bootstrap below stalls or
+        // throws. Mirrors app-tabs' EXACT resolution: #hash wins, then the
+        // saved tab (key "ot-active-tab-<basename>"), then the first manifest
+        // tab. app-tabs fires no event on its initial mount, so we resolve it
+        // ourselves. Runs again on DOMContentLoaded in case the DOM/app-tabs
+        // bar isn't ready yet when this inline script executes.
+        function nlResolveInitialTab() {
+            try {
+                var tabs = window.OT_TABS || [];
+                function tabExists(id) { for (var i = 0; i < tabs.length; i++) { if (tabs[i].id === id) return true; } return false; }
+                var basename = (location.pathname || '').split('/').pop() || 'index';
+                var hash = (location.hash || '').replace(/^#/, '');
+                var saved = null;
+                try { saved = localStorage.getItem('ot-active-tab-' + basename); } catch (e) {}
+                var activeNow = (hash && tabExists(hash)) ? hash
+                    : (saved && tabExists(saved)) ? saved
+                    : (tabs.length ? tabs[0].id : null);
+                if (activeNow) nlSyncChrome(activeNow);
+            } catch (e) { /* ignore */ }
+        }
+        nlResolveInitialTab();
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', nlResolveInitialTab);
+        }
 
         (async function () {
             // Languages might not be available yet

@@ -213,8 +213,11 @@ public class AbrpTelemetryService {
                     powerSet = true;
                 }
                 if (!powerSet) {
-                    // For charging power, we have two sources:
-                    // - externalChargingPowerKw (InstrumentDevice): charger-reported power
+                    // For charging power, sources in preference order:
+                    // - chargePowerKw (InstrumentDevice.getChargePower): real DC rate INTO the
+                    //   pack — matches the BYD app/cloud. Preferred above all: on PHEV the
+                    //   AC-side getters read high (onboard-charger loss) or sentinel.
+                    // - externalChargingPowerKw (InstrumentDevice): charger-reported (AC-side)
                     // - chargingPowerKw (ChargingDevice): BMS-reported power
                     //
                     // On BEVs, externalChargingPower is preferred (more accurate, real-time).
@@ -222,15 +225,32 @@ public class AbrpTelemetryService {
                     // which is higher than the actual DC battery charging power due to conversion
                     // losses in the onboard charger. The ChargingDevice value is the battery-side power.
                     //
-                    // Strategy: if both sources report > 0, use the LOWER value (battery-side).
-                    // If only one source is available, use it.
+                    // Strategy: if the DC charge rate is present, use it directly. Otherwise, if
+                    // both AC-side sources report > 0, use the LOWER value (battery-side); if only
+                    // one is available, use it.
                     double chargingPower = 0;
-                    double extPower = (vd != null && !Double.isNaN(vd.externalChargingPowerKw) && vd.externalChargingPowerKw > 0.15)
+
+                    // PHEV: the raw AC-side getters are unreliable here —
+                    // externalChargingPower reports the EVSE's RATED capacity (a flat
+                    // ~7 kW), not the real draw. So on PHEV we defer entirely to the
+                    // resolved getChargingState().chargingPowerKW (SOC-derived ring
+                    // estimator), the SAME value the app UI shows — keeping ABRP, the
+                    // UI and MQTT consistent. Falls through to the shared fallback
+                    // below (which reads getChargingState) by leaving chargingPower 0.
+                    boolean isPhevVeh = false;
+                    try { isPhevVeh = vehicleDataMonitor.isPhev(); } catch (Throwable ignored) {}
+
+                    double dcPower = (vd != null && !Double.isNaN(vd.chargePowerKw) && vd.chargePowerKw > 0.15 && vd.chargePowerKw <= 300)
+                            ? vd.chargePowerKw : 0;
+                    double extPower = (!isPhevVeh && vd != null && !Double.isNaN(vd.externalChargingPowerKw) && vd.externalChargingPowerKw > 0.15)
                             ? vd.externalChargingPowerKw : 0;
-                    double chgDevPower = (vd != null && !Double.isNaN(vd.chargingPowerKw) && vd.chargingPowerKw > 0.15)
+                    double chgDevPower = (!isPhevVeh && vd != null && !Double.isNaN(vd.chargingPowerKw) && vd.chargingPowerKw > 0.15)
                             ? vd.chargingPowerKw : 0;
-                    
-                    if (extPower > 0 && chgDevPower > 0) {
+
+                    if (dcPower > 0) {
+                        // Real DC pack-side rate — authoritative, skip the AC-side heuristic.
+                        chargingPower = dcPower;
+                    } else if (extPower > 0 && chgDevPower > 0) {
                         // Both available — use the lower value (battery-side DC power).
                         // The higher value is likely the AC input power (includes charger losses).
                         // Exception: if they're within 15% of each other, prefer externalPower
@@ -248,12 +268,29 @@ public class AbrpTelemetryService {
                     } else if (chgDevPower > 0) {
                         chargingPower = chgDevPower;
                     }
-                    
+
                     // Check charging state
                     ChargingStateData chargingData = vehicleDataMonitor.getChargingState();
+
+                    // FALLBACK: on models where BOTH raw charger getters are dead
+                    // (BEVs whose getExternalChargingPower/getChargingPower return
+                    // 0/UNAVAILABLE under uid-2000), the cascade above leaves
+                    // chargingPower at 0, so ABRP was sending power=0 while
+                    // is_charging=1 — a contradictory "charging at 0 kW". Reuse the
+                    // SAME resolved magnitude the app's charging UI shows
+                    // (getChargingState() → engine/ring-buffer-estimator), so the
+                    // two surfaces agree. Only used when the raw getters gave
+                    // nothing, so PHEVs that DO report a real getter are unaffected.
+                    if (chargingPower <= 0.15 && chargingData != null
+                            && chargingData.status == ChargingStateData.ChargingStatus.CHARGING
+                            && !Double.isNaN(chargingData.chargingPowerKW)
+                            && chargingData.chargingPowerKW > 0.15) {
+                        chargingPower = chargingData.chargingPowerKW;
+                    }
+
                     boolean isChg = (chargingData != null && chargingData.status == ChargingStateData.ChargingStatus.CHARGING)
                                     || chargingPower > 0.15;
-                    
+
                     payload.put("power", isChg && chargingPower > 0.15 ? -chargingPower : 0);
                 }
             } catch (Exception e) {
@@ -290,7 +327,10 @@ public class AbrpTelemetryService {
             // is_dcfc — gun state from collector
             if (vd != null && vd.chargingGunState != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) {
                 payload.put("is_dcfc", vd.chargingGunState == 3 ? 1 : 0);
-                if (vd.chargingGunState == 4) payload.put("is_charging", 0); // V2L
+                // V2L is gun state 5 (VTOL), not 4 (=AC_DC, a real charging gun). The
+                // old `== 4` zeroed is_charging during genuine AC_DC charging. Matches
+                // BydDataCollector isVtol / ChargingDetector, which treat 5 as V2L.
+                if (vd.chargingGunState == 5) payload.put("is_charging", 0); // V2L (VTOL)
             }
 
             // is_parked — gear from collector

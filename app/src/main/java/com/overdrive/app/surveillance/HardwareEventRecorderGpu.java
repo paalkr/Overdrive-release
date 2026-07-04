@@ -84,15 +84,33 @@ public class HardwareEventRecorderGpu {
     private int bitrate;
     private String codecMimeType = MediaFormat.MIMETYPE_VIDEO_AVC;  // Default H.264
 
-    // KEY_OPERATING_RATE pin policy. Default true (legacy pano behaviour —
-    // pin at fps so the SoC governor can't downclock the encoder mid-segment
-    // and stall eglSwap). When two encoders run concurrently on the single
+    // ── A/B TEST TOGGLE ──────────────────────────────────────────────────
+    // KEY_OPERATING_RATE pin master switch. Currently FALSE to address the
+    // "recorded video smooth but whole head unit laggy" symptom: when pinned,
+    // the encoder holds the Venus / GPU clock at full frequency for the entire
+    // recording (no DVFS-down between frames), which raises sustained SoC
+    // temperature and can make the thermal governor throttle the cores the BYD
+    // UI runs on — our pinned encode stays smooth while the un-pinned OEM UI
+    // loses the clock lottery.
+    //   false = (current) let Venus DVFS down between frames — cooler SoC, less
+    //           thermal throttling of the OEM UI. Risk: may reintroduce the
+    //           100-200ms eglSwap stalls in OUR recording the pin was added to
+    //           prevent (v18.1). Watch recorded clips for freeze-and-skip; if
+    //           it returns, flip back to true.
+    //   true  = pin at fps (legacy behaviour, added v18.1) — smoother OUR video,
+    //           hotter SoC.
+    // Affects the PRIMARY recorder only; secondary encoders (OEM dashcam, live
+    // stream) already force this off via setPinOperatingRate(false).
+    private static final boolean PIN_OPERATING_RATE = false;
+
+    // KEY_OPERATING_RATE pin policy. Initialised from the PIN_OPERATING_RATE
+    // master switch above. When two encoders run concurrently on the single
     // SDM665 Venus H.264 block, both pinning at fps over-subscribes the
     // firmware's frequency budget and produces the exact stalls the pin was
     // meant to prevent. Secondary encoders (e.g. OEM dashcam alongside pano)
-    // should call setPinOperatingRate(false) before init() so only the
-    // primary encoder claims the frequency lock.
-    private boolean pinOperatingRate = true;
+    // call setPinOperatingRate(false) before init() so only the primary
+    // encoder claims the frequency lock.
+    private boolean pinOperatingRate = PIN_OPERATING_RATE;
     
     // Encoder
     // Volatile because release() (lifecycle thread) nulls this while the
@@ -467,6 +485,59 @@ public class HardwareEventRecorderGpu {
         // written packet arrives — the cursor flush enqueues in PTS order
         // so it shouldn't, but the defense costs nothing.
         if (rebasedPts < 0) rebasedPts = 0;
+        // PER-TRACK MONOTONICITY GUARD (video). Mirrors the audio guard below
+        // (writeAudioRebased). MediaMuxer requires each track's samples to be
+        // strictly PTS-increasing; MediaCodec's HEVC bitstream likewise needs
+        // monotonic DTS or the decoder's reference-picture-set breaks
+        // ("Could not find ref with POC N / First slice in a frame missing" →
+        // visible corruption from the offending frame onward). Two ways this
+        // bites the VIDEO track specifically at the pre-record splice:
+        //   1. The <0 clamp above collapses several early pre-record packets
+        //      onto rebasedPts==0 — duplicates.
+        //   2. The pre-record cursor flush interleaves with live capture in the
+        //      disk-writer queue (enqueue order, NOT PTS order), so an out-of-
+        //      order older pre-record frame can arrive after a newer one AND
+        //      re-trigger the clock-domain re-anchor above (sourceGap<0), which
+        //      shifts ptsOriginUs and produces colliding/backward rebased PTS.
+        //      (Field-observed: event_20260701_172035 — ffprobe showed
+        //      "non monotonically increasing dts 7>=7, 15>=15…" then HEVC RPS
+        //      errors; corruption began right after the ~7s pre-record region.
+        //      The very next clip, which did NOT re-anchor, was clean.)
+        // NUDGE the offending packet (never drop it). This encoder emits a
+        // no-B, reference-P (IPPP) stream — HEVCProfileMain with KEY_MAX_B_FRAMES
+        // unset / KEY_LATENCY=0, or AVCProfileBaseline which forbids B-frames.
+        // In such a stream every kept P references the most-recent coded picture
+        // in decode order, so DROPPING a colliding P-frame does NOT fix the
+        // corruption — it MOVES it from the muxer-DTS layer to the decoder-RPS
+        // layer: the next kept P (the resumed live frame, still a P since
+        // triggerEventRecording forces no IDR) references a reconstructed
+        // picture now absent from the decoder DPB ("Could not find ref with
+        // POC N / First slice in a frame missing"), corrupting every frame
+        // until the next IDR (~2s). Container PTS is independent of the HEVC
+        // slice POC, so a 1µs nudge keeps the frame AND its reference chain,
+        // giving strictly-increasing DTS with NO RPS break — strictly safer
+        // than DROP for this stream. The keyframe path always nudged for the
+        // same monotonicity reason; the P-frame path now matches it.
+        // Consecutive collisions stay strictly increasing because each nudge
+        // advances lastFramePtsUs by 1 (a burst of N collisions rebases to
+        // last+1, last+2, … last+N). firstFramePtsUs<0 (first frame of a
+        // segment) skips the guard, so the leading frame is never mangled.
+        if (firstFramePtsUs >= 0 && rebasedPts <= lastFramePtsUs) {
+            boolean isKeyframe =
+                (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+            // NUDGE PTS one microsecond past the last written frame so it stays
+            // strictly monotonic and playable. A 1µs shift on a ~66ms frame
+            // interval is imperceptible and keeps the moov duration honest.
+            // Applies to keyframes (never drop an IDR) AND P-frames (dropping a
+            // reference-P strands the next P's RPS to the next IDR).
+            rebasedPts = lastFramePtsUs + 1;
+            long n = videoNonMonotonicNudgeCount.incrementAndGet();
+            if (n % 50 == 1) {
+                logger.warn("Video PTS not monotonic (rebased " + rebasedPts
+                    + "us <= last " + lastFramePtsUs + "us) — nudged +1µs, #" + n
+                    + " (isKey=" + isKeyframe + "); pre-record splice / re-anchor collision");
+            }
+        }
         // Mutate the BufferInfo for the muxer call. After write, restore
         // the absolute PTS so any caller that read info.presentationTimeUs
         // for stats/PTS-tracking sees the original encoder timestamp.
@@ -598,6 +669,14 @@ public class HardwareEventRecorderGpu {
     }
 
     private final java.util.concurrent.atomic.AtomicLong audioWriteFailureCount =
+        new java.util.concurrent.atomic.AtomicLong(0);
+    // Count of video packets NUDGED (+1µs) by the per-track monotonicity guard
+    // in writeRebased (pre-record splice / clock-domain re-anchor collisions).
+    // These frames are kept, not dropped — dropping a reference-P in this no-B
+    // IPPP stream would strand the next P's RPS until the next IDR. A handful
+    // per event at the splice is expected and harmless; a flood would indicate
+    // a deeper PTS problem worth investigating.
+    private final java.util.concurrent.atomic.AtomicLong videoNonMonotonicNudgeCount =
         new java.util.concurrent.atomic.AtomicLong(0);
     // Last successfully-written audio PTS (rebased, microseconds). Used
     // to enforce per-track monotonicity in writeRebasedAudio. Reset on
@@ -1019,7 +1098,7 @@ public class HardwareEventRecorderGpu {
     private final java.util.concurrent.atomic.AtomicLong ptsReanchorCount =
         new java.util.concurrent.atomic.AtomicLong(0);
     // Largest plausible inter-frame gap for a real recording. Clips rotate
-    // every 2 minutes (SEGMENT_DURATION_MS) and the GL watchdog force-restarts
+    // every segmentDurationMs (2/5/10 min) and the GL watchdog force-restarts
     // the pipeline after a 3 s frame stall, so no legitimate gap between two
     // consecutive written video frames approaches this value even at the low
     // fps floor. A larger gap is a clock-domain jump (the BYD DiLink HAL
@@ -1058,6 +1137,11 @@ public class HardwareEventRecorderGpu {
     
     // Segment rotation
     private long segmentStartTime = 0;
+    // Live, per-instance clip segment length. Seeded from the shared default
+    // (2 min) and overridden via setSegmentDurationMs() — both recording axes
+    // read recording.segmentDurationMinutes and push it here at encoder init,
+    // and the API handler pushes live changes. volatile so the API thread's
+    // write is visible to the drainer thread's rotation check without a lock.
     private volatile long segmentDurationMs = com.overdrive.app.util.Constants.SEGMENT_DURATION_MS;
     // Debounce window for forceSegmentRotation: if the current segment was
     // started less than this many ms ago, a force-rotation is treated as a
@@ -1615,14 +1699,34 @@ public class HardwareEventRecorderGpu {
         }
     }
 
+    /**
+     * Sets the live clip segment length in milliseconds. Both recording axes
+     * push the shared recording.segmentDurationMinutes value here at encoder
+     * init, and the quality API pushes live edits. Safe to call at any time:
+     * volatile field, read by the drainer thread's rotation check. A change
+     * takes effect on the NEXT rotation — the in-progress segment keeps its
+     * original length (no mid-segment retiming, no muxer disturbance).
+     *
+     * Ignores non-positive values defensively so a corrupt config can never
+     * disable rotation (which would let a single .mp4.tmp grow unbounded and
+     * stay unfinalized/unplayable).
+     */
     public void setSegmentDurationMs(long durationMs) {
-        if (durationMs > 0) {
-            this.segmentDurationMs = durationMs;
+        if (durationMs <= 0) {
+            logger.warn("Ignoring non-positive segmentDurationMs=" + durationMs
+                + " (keeping " + segmentDurationMs + "ms)");
+            return;
+        }
+        if (durationMs != segmentDurationMs) {
+            segmentDurationMs = durationMs;
+            logger.info("Clip segment duration set to " + (durationMs / 1000) + "s "
+                + "(applies on next rotation)");
         }
     }
 
+    /** Current live clip segment length in milliseconds. */
     public long getSegmentDurationMs() {
-        return this.segmentDurationMs;
+        return segmentDurationMs;
     }
 
     /**
@@ -2463,6 +2567,24 @@ public class HardwareEventRecorderGpu {
             isWritingToFile = true;
             recording = true;  // Keep for compatibility
 
+            // SPLICE IDR: force the encoder to emit a keyframe on the next LIVE
+            // frame, so the first packet after the pre-record flush is a
+            // self-contained IDR. The pre-record ring holds already-encoded
+            // H.265 packets whose bitstream POC references pictures from the
+            // PRE-TRIGGER clock domain; when live capture resumes at the splice,
+            // those references are gone and the decoder throws "Could not find
+            // ref with POC N / Error constructing frame RPS / First slice
+            // missing", FREEZING the last pre-record frame until the encoder's
+            // natural ~2s I-frame interval (observed: a ~0.68s stall at the
+            // pre-record→live boundary). writeRebased's PTS re-anchor + nudge
+            // fix the CONTAINER timeline but cannot repair the bitstream RPS —
+            // only a fresh IDR at the resume point restarts the reference chain
+            // cleanly. Same rationale as the segment-rotation requestSyncFrame()
+            // (which the "triggerEventRecording forces no IDR" comment in
+            // writeRebased flagged as the gap). Cost: one extra keyframe
+            // (~tens of KB) per event — negligible vs. a visible freeze.
+            requestSyncFrame();
+
             logger.info(String.format("Event recording started: %s (codec=%s, bitrate=%d Mbps, post-record=%dms)",
                 tempFile.getName(),
                 codecMimeType.equals(MediaFormat.MIMETYPE_VIDEO_HEVC) ? "H.265" : "H.264",
@@ -2537,9 +2659,27 @@ public class HardwareEventRecorderGpu {
             // recording sidecars) inherits the guarantee — leaving the fields NaN means
             // the sidecar writer omits the geo block entirely (no wrong pin), and
             // EventTimelineCollector's own fallback re-poll then governs the cold-start case.
-            long lastUpdate = gps.getLastUpdate();
+            // AGE against the MONOTONIC since-boot fix timestamp vs the daemon's own
+            // elapsedRealtime() — NOT getLastUpdate() (= send-time, refreshed by the
+            // sidecar's 4s keep-alive even when the fix is unchanged, so a parked
+            // car's stale fix read age≈0 and tagged the last drive's destination).
+            // Same device-wide monotonic clock on both sides → skew-immune, so the
+            // device RTC being wrong at cold boot can't drop a fresh fix's tag.
+            // Fallback when no monotonic basis (older sidecar / cache-loaded): age
+            // send-time vs currentTimeMillis() = prior behavior, never worse.
             long nowMs = System.currentTimeMillis();
-            long ageMs = lastUpdate > 0 ? Math.max(0L, nowMs - lastUpdate) : -1L;
+            long fixElapsed = gps.getFixElapsedMs();
+            long nowElapsed = android.os.SystemClock.elapsedRealtime();
+            long ageMs;
+            // Future-dated fixElapsed = cross-boot/incomparable basis (prior-boot
+            // last-known seed) → fall back to send-time aging, NOT clamp-to-fresh
+            // (which would tag a stale fix). Same fix as GeoSnapshot.capture.
+            if (fixElapsed > 0L && fixElapsed <= nowElapsed) {
+                ageMs = nowElapsed - fixElapsed;
+            } else {
+                long lu = gps.getLastUpdate();
+                ageMs = lu > 0 ? Math.max(0L, nowMs - lu) : -1L;
+            }
             boolean fresh = !gps.isLoadedFromCache()
                     && ageMs >= 0L
                     && ageMs <= GEO_FIX_MAX_AGE_MS;
@@ -3724,7 +3864,8 @@ public class HardwareEventRecorderGpu {
         if (isWritingToFile && segmentStartTime > 0 && drainerRunning && diskWriterRunning
                 && !writerAbortedCorrupt) {
             long elapsed = System.currentTimeMillis() - segmentStartTime;
-            if (elapsed >= segmentDurationMs) {
+            long cachedDuration = segmentDurationMs;
+            if (elapsed >= cachedDuration) {
                 if (savedFormat == null) {
                     // Encoder hasn't published its format yet — no frames have
                     // been encoded since segment start. Rotation would bail
@@ -3741,7 +3882,7 @@ public class HardwareEventRecorderGpu {
                             + "s) but encoder has not published format — frames are not flowing");
                         lastNoFormatRotationLogMs = now;
                     }
-                    segmentStartTime = now - segmentDurationMs + 5_000;
+                    segmentStartTime = now - cachedDuration + 5_000;
                 } else {
                     logger.info("Segment duration reached (" + (elapsed / 1000) + "s), rotating to new file...");
                     rotateSegment();

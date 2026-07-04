@@ -160,9 +160,17 @@ public class MotionPipelineV2 {
         //   instantaneous ratio (slow but steady real approach). 1.5 default.
         // coherenceMinFrames: flow history required before the signal is
         //   trusted; until then flowCoherence is reported as -1 (fail-open).
+        //   MUST be <= V2_FLOW_NET_WINDOW (10, motion_pipeline_v2.h): the native
+        //   publish gate is `netRingCount >= coherenceMinFrames` and netRingCount
+        //   is capped at V2_FLOW_NET_WINDOW, so a value of 12 was UNSATISFIABLE —
+        //   flowCoherence stayed pinned at the -1 sentinel forever, which made the
+        //   Stage-5b incoherent-loiter demotion, cachedIncoherentLoiter, and
+        //   highThreatIsTrusted path (b) all permanently inert. 8 gives ~0.8s of
+        //   flow history (at 10 FPS) before the signal is trusted while staying
+        //   within the window, so coherence actually publishes on-device.
         public float coherenceRatioMin = 0.35f;
         public float coherenceNetMin = 1.5f;
-        public int coherenceMinFrames = 12;
+        public int coherenceMinFrames = 8;
 
         /**
          * Java-side gate values for a sensitivity level. Used by per-quadrant

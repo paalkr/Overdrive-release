@@ -1,0 +1,2038 @@
+/**
+ * OverDrive - Charging Analytics Module
+ *
+ * Mirrors the Trips pattern (trips.js): a session-card list + a per-session
+ * detail drill-in, plus a stats tab with hand-rolled Canvas2D charts.
+ *
+ * WebView compatibility (head-unit is Chrome 58 on some pages):
+ *   - No optional chaining (?.) / nullish (??) — both are Chrome 80+.
+ *   - No ctx.roundRect direct calls — _roundRectPath() polyfills it (Chrome 99+).
+ *   - No Array.flat()/flatMap() (Chrome 69+).
+ *   - POST/DELETE bodies go through fetch() (the in-app WebView drops XHR write
+ *     bodies — see project memory "WebView XHR POST dropped").
+ * All charts are pure Canvas2D, DPR-scaled, and re-painted on theme flip.
+ */
+
+var CHARGING = {
+    // ---- State ----
+    currentOffset: 0,
+    currentDays: 30,
+    // Custom date range (epoch-ms). When _rangeFrom != null the session list +
+    // period summary query by range instead of currentDays. _rangeFrom/_rangeTo
+    // null = use currentDays (0 = all time).
+    _rangeFrom: null,
+    _rangeTo: null,
+    // Calendar range-picker state.
+    _calTarget: 'from',       // which endpoint the open calendar edits
+    _calMonth: null,          // Date pinned to the 1st of the displayed month
+    _calFromKey: null,        // "YYYY-MM-DD" selected From, or null
+    _calToKey: null,          // "YYYY-MM-DD" selected To, or null
+    pageSize: 20,
+    sessions: [],
+    currentSessionId: null,
+    samplesCache: null,       // samples for the open detail session
+    socHistoryCache: null,    // SoC-over-time series
+    summaryCache: null,
+    _liveSession: null,       // the open in-progress session row, if any
+    electricityRate: 0,
+    currency: '$',
+    dcRate: 0,
+    fastSampleSec: 12,
+    isPhev: false,
+    nominalKwh: 0,
+    _writing: false,          // true while a settings save is in-flight (gates revisit refresh)
+    _socGeom: null,           // cached SoC-chart geometry for hover hit-testing
+    _socHoverIdx: null,       // active hovered sample index (null = no crosshair)
+    // Per-session detail-chart hover (power / ramp / temp) keeps its state on
+    // each canvas element (canvas._chgHoverSpec / _chgHoverIdx), so no shared
+    // field here — multiple detail charts hover independently.
+    socHours: 168,            // SoC chart window in hours (period selector; default 7d)
+
+    // Canvas palette — dark defaults, replaced by _refreshPalette() reading the
+    // --chart-* CSS variables on theme flip (same pattern as trips.js).
+    colors: {
+        brand: '#0EA5E9',
+        brandRgba: 'rgba(14, 165, 233, 0.22)',
+        accent: '#00D4AA',
+        amber: '#F59E0B',
+        danger: '#EF4444',
+        good: '#22C55E',
+        text: 'rgba(255, 255, 255, 0.7)',
+        textMuted: 'rgba(255, 255, 255, 0.5)',
+        textStrong: '#FFFFFF',
+        grid: 'rgba(255, 255, 255, 0.08)',
+        dotStroke: '#0F0F12',
+        arcTrack: 'rgba(255, 255, 255, 0.06)'
+    },
+
+    // ==================== INIT / THEME ====================
+
+    init: function () {
+        this._refreshPalette();
+        this._setupThemeObserver();
+
+        // Hide the detail view when the tab bar switches (mirrors trips).
+        var self = this;
+        document.addEventListener('ot-tabs:active-changed', function (ev) {
+            self.hideDetail();
+            // Canvas charts on a display:none tab render at a degenerate size
+            // (offsetParent is null → _renderSummaryCharts skips them). They were
+            // painted once on first load while the Stats tab was hidden, so the
+            // SOH/cost/energy charts stayed blank until a reload landed ON Stats.
+            // Repaint when Stats becomes active. Defer a tick so layout settles.
+            var id = (ev && ev.detail) ? ev.detail.id : null;
+            if (id === 'stats') {
+                setTimeout(function () {
+                    if (self.summaryCache) self._renderSummaryCharts(self.summaryCache);
+                    if (self.socHistoryCache) {
+                        var c = document.getElementById('socChart');
+                        if (c) self.renderSocOverTime(c, self.socHistoryCache);
+                    }
+                }, 0);
+            }
+        });
+
+        // Close the calendar popup when its backdrop is tapped (mirrors events).
+        var calPop = document.getElementById('chargeCalendarPopup');
+        if (calPop) calPop.addEventListener('click', function (e) {
+            if (e.target === calPop) self.closeCalendar();
+        });
+
+        // Re-sync when the user navigates back to this page. The native shell
+        // (WebViewFragment) keeps the page ALIVE across tab switches — it does
+        // NOT reload — so without this, a rate/currency saved on the Trips page
+        // (shared value) or a toggle saved here never re-loads and the settings
+        // show stale first-paint values. Mirrors core.js/road-sense.js. Guarded
+        // by _writing so it can't clobber an in-flight save.
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible' && !self._writing) {
+                self.bootstrap();
+            }
+        });
+
+        this._showSkeleton();
+        this.bootstrap();
+    },
+
+    _refreshPalette: function () {
+        try {
+            var s = getComputedStyle(document.documentElement);
+            var pick = function (name, fallback) {
+                var v = (s.getPropertyValue(name) || '').trim();
+                return v || fallback;
+            };
+            this.colors.text       = pick('--chart-text',        this.colors.text);
+            this.colors.textStrong = pick('--chart-text-strong', this.colors.textStrong);
+            this.colors.grid       = pick('--chart-grid',        this.colors.grid);
+            this.colors.dotStroke  = pick('--bg-base',           this.colors.dotStroke);
+            this.colors.arcTrack   = pick('--border-subtle',     this.colors.arcTrack);
+            this.colors.textMuted  = this.colors.text;
+        } catch (e) { /* keep dark defaults */ }
+    },
+
+    _setupThemeObserver: function () {
+        if (this._themeObserver) return;
+        var self = this;
+        try {
+            this._themeObserver = new MutationObserver(function () {
+                self._refreshPalette();
+                self._repaintAll();
+            });
+            this._themeObserver.observe(document.documentElement, {
+                attributes: true,
+                attributeFilter: ['data-theme']
+            });
+        } catch (e) { /* MutationObserver unsupported — skip live repaint */ }
+    },
+
+    _repaintAll: function () {
+        var self = this;
+        var tryPaint = function (fn) { try { fn(); } catch (e) {} };
+        tryPaint(function () {
+            if (self.socHistoryCache) {
+                var c = document.getElementById('socChart');
+                if (c) self.renderSocOverTime(c, self.socHistoryCache);
+            }
+        });
+        tryPaint(function () {
+            if (self.summaryCache) self._renderSummaryCharts(self.summaryCache);
+        });
+        tryPaint(function () {
+            if (self.currentSessionId && self.samplesCache) self._renderDetailCharts(self.samplesCache);
+        });
+    },
+
+    // ==================== DATA LOADING ====================
+
+    bootstrap: function () {
+        var self = this;
+        // Single composite call; fall back to the sequential loaders if the
+        // bootstrap endpoint is unavailable (older daemon).
+        fetch('/api/charging/bootstrap').then(function (r) {
+            if (!r.ok) throw new Error('bootstrap ' + r.status);
+            return r.json();
+        }).then(function (data) {
+            var b = (data && data.bootstrap) ? data.bootstrap : null;
+            if (!b) throw new Error('no bootstrap payload');
+            // Each bootstrap section keeps its own named wrapper (the server
+            // builds them from the same per-section handlers used by the
+            // sequential loaders, stripping only success/_status). So unwrap the
+            // same way the loaders do — b.config = {config:{...}}, etc. Passing
+            // the wrapper straight to _applyConfig left cfg.enabled/rate
+            // undefined, which is why the rate + toggle never loaded.
+            if (b.config)   self._applyConfig(b.config.config || b.config);
+            if (b.summary)  self._applySummary(b.summary.summary || b.summary);
+            if (b.soc)      self._applySoc(b.soc.soc || b.soc);
+            if (b.sessions) self._applySessions((b.sessions.sessions || b.sessions), 0);
+        }).catch(function () {
+            // Sequential fallback.
+            self.loadConfig();
+            self.loadSummary();
+            self.loadSoc();
+            self.loadSessions(0);
+        });
+    },
+
+    loadConfig: function () {
+        var self = this;
+        fetch('/api/charging/config').then(function (r) { return r.json(); })
+            .then(function (d) { self._applyConfig(d.config || d); })
+            .catch(function () {});
+    },
+
+    // Period query params: a custom from/to range when set, else days (0 = all
+    // time, which the daemon treats as a 0-epoch lower bound).
+    _periodQuery: function () {
+        if (this._rangeFrom != null) {
+            var q = 'from=' + this._rangeFrom;
+            if (this._rangeTo != null) q += '&to=' + this._rangeTo;
+            return q;
+        }
+        return 'days=' + (this.currentDays || 0);
+    },
+
+    loadSummary: function () {
+        var self = this;
+        fetch('/api/charging/summary?' + this._periodQuery()).then(function (r) { return r.json(); })
+            .then(function (d) { self._applySummary(d.summary || d); })
+            .catch(function () {});
+    },
+
+    loadSoc: function () {
+        var self = this;
+        var hours = this.socHours || 168;
+        fetch('/api/charging/soc?hours=' + hours + '&points=300').then(function (r) { return r.json(); })
+            .then(function (d) { self._applySoc(d.soc || d); })
+            .catch(function () {});
+    },
+
+    // Stats-tab SoC chart period selector (24h / 7d / 30d).
+    socPeriod: function (hours, btn) {
+        this.socHours = hours;
+        var btns = document.querySelectorAll('#socPeriodTabs .filter-tab');
+        for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
+        if (btn) btn.classList.add('active');
+        this._socHoverIdx = null;
+        this.loadSoc();
+    },
+
+    loadSessions: function (offset) {
+        var self = this;
+        var url = '/api/charging?' + this._periodQuery() + '&limit=' + this.pageSize + '&offset=' + offset;
+        fetch(url).then(function (r) { return r.json(); })
+            .then(function (d) { self._applySessions(d.sessions || [], offset); })
+            .catch(function () { self._hideSkeleton(); });
+    },
+
+    // ==================== APPLY PAYLOADS ====================
+
+    _applyConfig: function (cfg) {
+        if (!cfg) return;
+        if (cfg.electricityRate !== undefined) this.electricityRate = cfg.electricityRate || 0;
+        if (cfg.currency) this.currency = cfg.currency || '$';
+        if (cfg.dcRate !== undefined) this.dcRate = cfg.dcRate || 0;
+        if (cfg.fastSampleSec !== undefined) this.fastSampleSec = cfg.fastSampleSec || 12;
+        if (cfg.isPhev !== undefined) this.isPhev = !!cfg.isPhev;
+        if (cfg.nominalKwh) this.nominalKwh = cfg.nominalKwh;
+
+        this._setVal('chargingEnabled', cfg.enabled, true);
+        this._setInput('rateInput', this.electricityRate > 0 ? this.electricityRate : '');
+        this._setInput('dcRateInput', this.dcRate > 0 ? this.dcRate : '');
+        this._setInput('currencySelect', this.currency);
+
+        // Programmatic input population doesn't fire onchange, so the Apply
+        // button stays disabled until the user actually edits something.
+        this.resetApplyButton();
+
+        // If summary arrived before config (sequential fallback can race),
+        // re-render the hero so the cost/kWh fallback picks up the rate.
+        if (this.summaryCache) this._applySummary(this.summaryCache);
+    },
+
+    _applySummary: function (s) {
+        if (!s) return;
+        this.summaryCache = s;
+
+        // Hero gauges.
+        var live = s.live || {};
+        var soc = (live.socPercent !== undefined && live.socPercent !== null) ? live.socPercent : 0;
+        this.renderCircleGauge('socCircleCanvas', soc, this.colors.brand);
+        this._setText('socCircleValue', soc > 0 ? Math.round(soc) + '%' : '--');
+
+        var isCharging = live.charging === true;
+        var liveKwh = (live.sessionKwh != null && live.sessionKwh > 0) ? live.sessionKwh : 0;
+
+        // Energy hero. While a charge is in progress, show the LIVE session
+        // energy (period rollup only counts COMPLETED sessions, so it would read
+        // "--" mid-charge — exactly the "Added this period stays empty" report).
+        var energy = s.periodEnergyKwh || 0;
+        if (isCharging && liveKwh > 0) {
+            this._setText('kwhHeroValue', liveKwh.toFixed(1));
+            this._setText('kwhHeroLabel', this._t('charge.hero_energy_live', 'Added this session'));
+        } else {
+            this._setText('kwhHeroValue', energy > 0 ? energy.toFixed(1) : '--');
+            this._setText('kwhHeroLabel', this._t('charge.hero_energy', 'Added this period'));
+        }
+
+        // Cost hero. A flat "cost per kWh" (just the configured rate) carried no
+        // information. Show the running COST OF THIS SESSION while charging
+        // (sessionKwh × rate), else this period's total cost, else the rate.
+        var measured = (s.avgCostPerKwh !== undefined && s.avgCostPerKwh !== null) ? s.avgCostPerKwh : 0;
+        if (isCharging && liveKwh > 0 && this.electricityRate > 0) {
+            this._setText('costHeroLabel', this._t('charge.hero_cost_session', 'Cost this session'));
+            this._setText('costHeroValue', this._money(liveKwh * this.electricityRate));
+            this._setText('costHeroSub', this._t('charge.cost_estimated', 'estimated'));
+        } else if (s.periodCost && s.periodCost > 0) {
+            this._setText('costHeroLabel', this._t('charge.hero_cost_period', 'Cost this period'));
+            this._setText('costHeroValue', this._money(s.periodCost));
+            this._setText('costHeroSub', measured > 0 ? (this._money(measured) + this._t('charge.per_kwh', '/kWh')) : '');
+        } else if (this.electricityRate > 0) {
+            this._setText('costHeroLabel', this._t('charge.hero_cost', 'Cost per kWh'));
+            this._setText('costHeroValue', this._money(this.electricityRate));
+            this._setText('costHeroSub', this._t('charge.cost_configured', 'set rate'));
+        } else {
+            this._setText('costHeroLabel', this._t('charge.hero_cost', 'Cost per kWh'));
+            this._setText('costHeroValue', '--');
+            this._setText('costHeroSub', '');
+        }
+
+        // Period summary tiles.
+        // Period tiles count COMPLETED sessions (from the daily rollup). The
+        // open in-progress session isn't in that rollup yet, so add it live so
+        // the tiles aren't "0 / -- / --" during your very first charge. No
+        // double-count risk: it only lands in the rollup once it closes.
+        var liveCost = (isCharging && liveKwh > 0 && this.electricityRate > 0) ? liveKwh * this.electricityRate : 0;
+        var pSessions = (s.periodSessions || 0) + (isCharging ? 1 : 0);
+        var pEnergy = energy + (isCharging ? liveKwh : 0);
+        var pCost = (s.periodCost || 0) + liveCost;
+        this._setText('summarySessions', pSessions > 0 ? pSessions : '--');
+        this._setText('summaryEnergy', pEnergy > 0 ? pEnergy.toFixed(1) + ' kWh' : '--');
+        this._setText('summaryCost', pCost > 0 ? this._money(pCost) : '--');
+        // DC/AC: the live session's tier is known from its peak-power class.
+        var liveDc = 0, liveAc = 0;
+        if (isCharging && this._liveSession) {
+            var k = this._typeKind(this._liveSession);
+            if (k === 'dc') liveDc = 1; else if (k === 'fast' || k === 'slow') liveAc = 1;
+        }
+        this._setText('summaryDcAc', ((s.periodDcCount || 0) + liveDc) + ' / ' + ((s.periodAcCount || 0) + liveAc));
+        // Range added: period rollup + the live session's gain so far.
+        var liveRange = (isCharging && this._liveSession && this._liveSession.rangeGained > 0)
+            ? this._liveSession.rangeGained : 0;
+        var pRange = (s.periodRangeGained || 0) + liveRange;
+        this._setText('summaryRangeGained', pRange > 0 ? this._dist(pRange) : '--');
+
+        // Lifetime tiles.
+        this._setText('lifetimeSessions', s.lifetimeSessions != null ? s.lifetimeSessions : '--');
+        this._setText('lifetimeEnergy', (s.lifetimeEnergyKwh && s.lifetimeEnergyKwh > 0)
+            ? s.lifetimeEnergyKwh.toFixed(0) + ' kWh' : '--');
+        this._setText('lifetimeCost', (s.lifetimeCost && s.lifetimeCost > 0) ? this._money(s.lifetimeCost) : '--');
+
+        // Show the session-derived cards ONLY when there's data to fill them —
+        // empty chart frames are noise. The SoC chart + hero always render
+        // (they have soc_history data even with zero charging sessions).
+        var hasSessions = (s.lifetimeSessions || 0) > 0;
+        var hasSohTrend = !!(s.sohTrend && s.sohTrend.length > 1);
+        var hasCost = !!(s.daily && s.daily.length > 0 && s.periodCost > 0);
+        var hasEfficiency = this._energyBars(this.sessions).length > 0;
+        this._showCard('sohTrendCard', hasSohTrend);
+        this._showCard('monthlyCostCard', hasCost);
+        this._showCard('efficiencyCard', hasEfficiency);
+        this._showCard('lifetimeCard', hasSessions);
+
+        // Stats-tab empty state: nothing session-derived to show yet. Tailor the
+        // hint to whether recording is even enabled. NOTE: a charge in progress
+        // counts as "have data" — otherwise the very first charge shows "No
+        // charging data yet" even while the hero is live (no COMPLETED session
+        // exists yet, so lifetimeSessions is still 0).
+        var anyStatsCard = hasSessions || hasSohTrend || hasCost || hasEfficiency || isCharging;
+        this._showCard('statsEmptyState', !anyStatsCard);
+        if (!anyStatsCard) {
+            var enabled = this._getChecked('chargingEnabled');
+            this._setText('statsEmptyMsg', enabled
+                ? this._t('charge.no_data_yet', 'No charging data yet')
+                : this._t('charge.disabled_hint', 'Enable charging analytics in Settings to start recording'));
+        }
+
+        this._renderSummaryCharts(s);
+    },
+
+    _showCard: function (id, show) {
+        var el = document.getElementById(id);
+        if (el) el.style.display = show ? '' : 'none';
+    },
+
+    _applySoc: function (soc) {
+        if (!soc) return;
+        this.socHistoryCache = soc;
+        var c = document.getElementById('socChart');
+        if (c) this.renderSocOverTime(c, soc);
+    },
+
+    _applySessions: function (sessions, offset) {
+        this._hideSkeleton();
+        if (offset === 0) this.sessions = sessions || [];
+        else this.sessions = this.sessions.concat(sessions || []);
+        this.currentOffset = offset;
+
+        // Track the open in-progress session (if any) so the stats period tiles
+        // can classify its DC/AC tier without re-querying.
+        this._liveSession = null;
+        for (var li = 0; li < this.sessions.length; li++) {
+            if (this.sessions[li] && this.sessions[li].inProgress === true) { this._liveSession = this.sessions[li]; break; }
+        }
+        // If the session list arrived after the summary, re-apply the summary so
+        // the live-augmented period tiles pick up _liveSession.
+        if (this.summaryCache) this._applySummary(this.summaryCache);
+
+        this._renderSessionCards();
+
+        // "Load more" visible only when the last page was full.
+        var more = document.getElementById('loadMoreBtn');
+        if (more) more.style.display = (sessions && sessions.length >= this.pageSize) ? '' : 'none';
+
+        var empty = document.getElementById('sessionEmptyState');
+        if (empty) empty.style.display = (this.sessions.length === 0) ? '' : 'none';
+    },
+
+    // ==================== SESSION LIST ====================
+
+    _renderSessionCards: function () {
+        var grid = document.getElementById('sessionList');
+        if (!grid) return;
+        grid.innerHTML = '';
+        var self = this;
+        for (var i = 0; i < this.sessions.length; i++) {
+            (function (s) {
+                var card = document.createElement('article');
+                card.className = 'session-card';
+                card.setAttribute('role', 'button');
+                card.setAttribute('tabindex', '0');
+
+                var kind = self._typeKind(s);
+                var typeLabel = self._typeLabel(s);
+                // Power chip: live measured power while charging (the stored peak
+                // can be a stale estimate), else the session peak. 1-decimal so a
+                // 6.1 kW charge doesn't round up to a misleading "6 kW" / "7 kW".
+                var chipKw = (s.inProgress === true && s.livePowerKw > 0) ? s.livePowerKw
+                           : (s.peakPower != null && s.peakPower > 0 ? s.peakPower : 0);
+                var peakStr = chipKw > 0 ? chipKw.toFixed(1) + ' kW' : '';
+                var energy = (s.energyAdded && s.energyAdded > 0) ? '+' + s.energyAdded.toFixed(1) + ' kWh' : '--';
+                var socRange = (s.startSoc != null && s.endSoc != null && s.endSoc > 0)
+                    ? Math.round(s.startSoc) + '% → ' + Math.round(s.endSoc) + '%'
+                    : '';
+                var dur = (s.durationMinutes != null) ? self._fmtDuration(s.durationMinutes) : '';
+                var costStr = (s.cost != null && s.cost > 0) ? self._money(s.cost) : '';
+                var locStr = self._locationLabel(s);   // place name, else coords, else ''
+                var inProgress = s.inProgress === true;
+
+                // Time range: "start → end" (clock times), or "start → now" while
+                // charging. Shown in the meta row alongside duration.
+                var startClock = self._fmtClock(s.startTime);
+                var endClock = inProgress
+                    ? self._t('charge.now', 'now')
+                    : (s.endTime && s.endTime > s.startTime ? self._fmtClock(s.endTime) : '');
+                var timeRange = startClock + (endClock ? ' → ' + endClock : '');
+
+                // Always show the power chip in the pill (peak for finished, live
+                // for in-progress) — the user wants kW visible regardless of state.
+                var powerChip = peakStr;
+                card.innerHTML =
+                    '<div class="session-card-top">' +
+                        '<span class="session-type session-type-' + kind + '">' +
+                            self._typeIcon(kind) + '<span>' + typeLabel + '</span>' +
+                            (powerChip ? '<span class="session-type-peak">' + powerChip + '</span>' : '') +
+                        '</span>' +
+                        (inProgress
+                            ? '<span class="session-live"><span class="session-live-dot"></span>' + self._esc(self._t('charge.in_progress', 'Charging now')) + '</span>'
+                            : '<span class="session-date">' + self._fmtDate(s.startTime) + '</span>') +
+                    '</div>' +
+                    // Headline figures: energy added + cost, side by side and prominent.
+                    '<div class="session-figures">' +
+                        '<div class="session-energy">' + energy + '</div>' +
+                        (costStr ? '<div class="session-cost">' + costStr + '</div>' : '') +
+                    '</div>' +
+                    // Location chip (pin + place / coords) — only when known.
+                    (locStr
+                        ? '<div class="session-loc">' + self._pinIcon() + '<span>' + self._esc(locStr) + '</span></div>'
+                        : '') +
+                    '<div class="session-meta">' +
+                        (socRange ? '<span>' + socRange + '</span>' : '') +
+                        (timeRange ? '<span>' + self._esc(timeRange) + '</span>' : '') +
+                        (dur ? '<span>' + dur + '</span>' : '') +
+                    '</div>' +
+                    '<button class="session-delete-btn" title="' + self._t('charge.delete_session_title', 'Delete session') + '">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
+                    '</button>';
+
+                card.addEventListener('click', function () { self.showDetail(s.id); });
+                card.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); self.showDetail(s.id); }
+                });
+                var delBtn = card.querySelector('.session-delete-btn');
+                if (delBtn) delBtn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    self.deleteSession(s.id);
+                });
+                grid.appendChild(card);
+            })(this.sessions[i]);
+        }
+    },
+
+    quickFilter: function (days, btn) {
+        this.currentDays = days;          // 0 = all time
+        this._rangeFrom = null;           // leaving custom-range mode
+        this._rangeTo = null;
+        var btns = document.querySelectorAll('#sessionFilters .filter-tab');
+        for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
+        if (btn) btn.classList.add('active');
+        var row = document.getElementById('chargeRangeRow');
+        if (row) row.classList.remove('open');
+        this.currentOffset = 0;
+        this._showSkeleton();
+        this.loadSessions(0);
+        this.loadSummary();
+    },
+
+    // Reveal/hide the custom From → To range row (height+fade via the .open
+    // class). Defaults to the last ~30 days the first time. Mirrors events.
+    toggleCustomRange: function (btn) {
+        var row = document.getElementById('chargeRangeRow');
+        if (!row) return;
+        if (row.classList.contains('open')) { row.classList.remove('open'); return; }
+        row.classList.add('open');
+        if (this._calFromKey == null) this._calFromKey = this._dateKey(new Date(Date.now() - 30 * 86400000));
+        if (this._calToKey == null) this._calToKey = this._dateKey(new Date());
+        this._updateRangeButtons();
+        // Mark the Custom chip active.
+        var btns = document.querySelectorAll('#sessionFilters .filter-tab');
+        for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
+        if (btn) btn.classList.add('active');
+    },
+
+    // Apply the picked From/To range (epoch-ms; From=start of day, To=end of day
+    // inclusive). Either side may be unset → open-ended.
+    applyCustomRange: function () {
+        var fromMs = this._calFromKey ? this._keyToMs(this._calFromKey, false) : null;
+        var toMs = this._calToKey ? this._keyToMs(this._calToKey, true) : null;
+        if (fromMs == null && toMs == null) {
+            this._toast(this._t('charge.range_pick', 'Pick a start or end date'), 'error');
+            return;
+        }
+        if (fromMs != null && toMs != null && fromMs > toMs) {
+            this._toast(this._t('charge.range_order', 'Start date must be before end date'), 'error');
+            return;
+        }
+        this._rangeFrom = fromMs != null ? fromMs : 0;
+        this._rangeTo = toMs;   // null = open-ended (daemon treats as no upper bound)
+        this.currentOffset = 0;
+        this._showSkeleton();
+        this.loadSessions(0);
+        this.loadSummary();
+    },
+
+    // ---- Shared calendar (range picker) — ported from events.js ----------
+
+    // Open the calendar to pick the 'from' or 'to' endpoint.
+    openCalendar: function (which) {
+        this._calTarget = which;   // 'from' | 'to'
+        var seed = (which === 'to' ? this._calToKey : this._calFromKey);
+        this._calMonth = seed ? new Date(seed + 'T00:00:00') : new Date();
+        this._calMonth.setDate(1);
+        this._renderCalendar();
+        var pop = document.getElementById('chargeCalendarPopup');
+        if (pop) pop.classList.add('active');
+    },
+    closeCalendar: function () {
+        var pop = document.getElementById('chargeCalendarPopup');
+        if (pop) pop.classList.remove('active');
+    },
+    calPrevMonth: function () { this._calMonth.setMonth(this._calMonth.getMonth() - 1); this._renderCalendar(); },
+    calNextMonth: function () { this._calMonth.setMonth(this._calMonth.getMonth() + 1); this._renderCalendar(); },
+
+    _renderCalendar: function () {
+        var grid = document.getElementById('chargeCalendarGrid');
+        var title = document.getElementById('chargeCalendarTitle');
+        if (!grid || !this._calMonth) return;
+        var lang = (window.BYD && BYD.i18n && BYD.i18n.getLang) ? BYD.i18n.getLang() : undefined;
+        var year = this._calMonth.getFullYear(), month = this._calMonth.getMonth();
+        var monthDate = new Date(year, month, 1);
+        try { title.textContent = new Intl.DateTimeFormat(lang, { month: 'long' }).format(monthDate) + ' ' + year; }
+        catch (e) { title.textContent = monthDate.toLocaleDateString(lang, { month: 'long' }) + ' ' + year; }
+        grid.innerHTML = '';
+
+        var wkFmt; try { wkFmt = new Intl.DateTimeFormat(lang, { weekday: 'short' }); } catch (e) { wkFmt = null; }
+        for (var w = 0; w < 7; w++) {
+            var dd = new Date(2024, 0, 7 + w);
+            var el = document.createElement('div');
+            el.className = 'calendar-weekday';
+            el.textContent = wkFmt ? wkFmt.format(dd) : dd.toLocaleDateString(lang, { weekday: 'short' });
+            grid.appendChild(el);
+        }
+        var firstDay = new Date(year, month, 1).getDay();
+        var daysInMonth = new Date(year, month + 1, 0).getDate();
+        var daysInPrev = new Date(year, month, 0).getDate();
+        var todayKey = this._dateKey(new Date());
+        for (var i = firstDay - 1; i >= 0; i--) this._calDayCell(grid, daysInPrev - i, this._dateKey(new Date(year, month - 1, daysInPrev - i)), true, todayKey);
+        for (var day = 1; day <= daysInMonth; day++) this._calDayCell(grid, day, this._dateKey(new Date(year, month, day)), false, todayKey);
+        for (var d2 = 1; grid.children.length - 7 + d2 <= 42; d2++) this._calDayCell(grid, d2, this._dateKey(new Date(year, month + 1, d2)), true, todayKey);
+    },
+
+    _calDayCell: function (grid, day, dateKey, otherMonth, todayKey) {
+        var self = this;
+        var el = document.createElement('div');
+        el.className = 'calendar-day';
+        el.textContent = day;
+        el.dataset.date = dateKey;
+        if (otherMonth) el.classList.add('other-month');
+        if (dateKey === todayKey) el.classList.add('today');
+        if (dateKey === this._calFromKey || dateKey === this._calToKey) el.classList.add('selected');
+        else if (this._calFromKey && this._calToKey && dateKey > this._calFromKey && dateKey < this._calToKey) el.classList.add('in-range');
+        // Disable future dates.
+        var today = new Date(); today.setHours(0, 0, 0, 0);
+        if (new Date(dateKey + 'T00:00:00') > today) el.classList.add('disabled');
+        else el.addEventListener('click', function () { self._calPick(dateKey); });
+        grid.appendChild(el);
+    },
+
+    _calPick: function (dateKey) {
+        if (this._calTarget === 'to') {
+            this._calToKey = dateKey;
+            // Keep order sane: if To precedes From, pull From back.
+            if (this._calFromKey && this._calToKey < this._calFromKey) this._calFromKey = dateKey;
+        } else {
+            this._calFromKey = dateKey;
+            if (this._calToKey && this._calFromKey > this._calToKey) this._calToKey = dateKey;
+        }
+        this._updateRangeButtons();
+        this.closeCalendar();
+    },
+
+    _updateRangeButtons: function () {
+        var lang = (window.BYD && BYD.i18n && BYD.i18n.getLang) ? BYD.i18n.getLang() : undefined;
+        var fromTxt = document.getElementById('chargeFromText');
+        var toTxt = document.getElementById('chargeToText');
+        var fmt = function (key) {
+            try { return new Date(key + 'T00:00:00').toLocaleDateString(lang, { month: 'short', day: 'numeric', year: 'numeric' }); }
+            catch (e) { return key; }
+        };
+        // Show "From: <date>" / "To: <date>" so the field's role stays clear once
+        // a date is chosen. Do NOT add the .has-date brand fill — two full-width
+        // solid-green pills + a green Apply read as a "sea of green"; keep them as
+        // outlined pills (the active selection shows via the calendar highlight).
+        var fromLabel = this._t('charge.range_from', 'From');
+        var toLabel = this._t('charge.range_to', 'To');
+        if (fromTxt) fromTxt.textContent = this._calFromKey ? (fromLabel + ': ' + fmt(this._calFromKey)) : fromLabel;
+        if (toTxt) toTxt.textContent = this._calToKey ? (toLabel + ': ' + fmt(this._calToKey)) : toLabel;
+    },
+
+    // "YYYY-MM-DD" local date key.
+    _dateKey: function (d) {
+        var m = d.getMonth() + 1, day = d.getDate();
+        return d.getFullYear() + '-' + (m < 10 ? '0' + m : m) + '-' + (day < 10 ? '0' + day : day);
+    },
+    // date key → epoch-ms at local 00:00 (or 23:59:59.999 when endOfDay).
+    _keyToMs: function (key, endOfDay) {
+        var p = key.split('-');
+        if (p.length !== 3) return null;
+        var y = parseInt(p[0], 10), mo = parseInt(p[1], 10) - 1, da = parseInt(p[2], 10);
+        if (isNaN(y) || isNaN(mo) || isNaN(da)) return null;
+        return (endOfDay ? new Date(y, mo, da, 23, 59, 59, 999) : new Date(y, mo, da, 0, 0, 0, 0)).getTime();
+    },
+
+    loadMore: function () {
+        this.loadSessions(this.currentOffset + this.pageSize);
+    },
+
+    // ==================== DETAIL DRILL-IN ====================
+
+    showDetail: function (id) {
+        var self = this;
+        this.currentSessionId = id;
+        // Clear any crosshair carried from a prior session's detail charts.
+        this._clearDetailHoverState();
+
+        var list = document.getElementById('sessionListView');
+        var detail = document.getElementById('chargingDetail');
+        if (list) list.classList.add('hidden');
+        if (detail) { detail.classList.remove('hidden'); detail.classList.add('active'); }
+
+        // Find the row we already have for the header; fetch full + samples.
+        var row = null;
+        for (var i = 0; i < this.sessions.length; i++) {
+            if (this.sessions[i].id === id) { row = this.sessions[i]; break; }
+        }
+        if (row) this._fillDetailHeader(row);
+
+        fetch('/api/charging/' + id).then(function (r) { return r.json(); })
+            .then(function (d) { if (d && d.session) self._fillDetailHeader(d.session); })
+            .catch(function () {});
+
+        fetch('/api/charging/' + id + '/samples').then(function (r) { return r.json(); })
+            .then(function (d) {
+                self.samplesCache = (d && d.samples) ? d.samples : [];
+                self._renderDetailCharts(self.samplesCache);
+            })
+            .catch(function () { self.samplesCache = []; self._renderDetailCharts([]); });
+    },
+
+    hideDetail: function () {
+        var list = document.getElementById('sessionListView');
+        var detail = document.getElementById('chargingDetail');
+        if (detail) { detail.classList.add('hidden'); detail.classList.remove('active'); }
+        if (list) list.classList.remove('hidden');
+        this.currentSessionId = null;
+        this.samplesCache = null;
+        this._clearDetailHoverState();
+    },
+
+    // Reset the per-canvas hover index on the three detail charts so a crosshair
+    // doesn't carry between sessions.
+    _clearDetailHoverState: function () {
+        var ids = ['detailPowerChart', 'detailTempChart'];
+        for (var i = 0; i < ids.length; i++) {
+            var c = document.getElementById(ids[i]);
+            if (c) { c._chgHoverIdx = null; }
+        }
+    },
+
+    _fillDetailHeader: function (s) {
+        var inProgress = s.inProgress === true;
+        this._setText('detailTitle', this._typeLabel(s) + ' · ' + this._fmtDate(s.startTime));
+        var sub = [];
+        if (inProgress) sub.push(this._t('charge.in_progress', 'Charging now'));
+        // While charging, endSoc is the LIVE soc (filled server-side); show the
+        // ramp as "start% → live%". A completed session shows start → end.
+        if (s.startSoc != null && s.endSoc != null && s.endSoc > 0) sub.push(Math.round(s.startSoc) + '% → ' + Math.round(s.endSoc) + '%');
+        else if (s.startSoc != null) sub.push(Math.round(s.startSoc) + '%');
+        if (s.durationMinutes != null) sub.push(this._fmtDuration(s.durationMinutes));
+        this._setText('detailSubtitle', sub.join('  ·  '));
+
+        this._setText('detailEnergy', (s.energyAdded && s.energyAdded > 0) ? '+' + s.energyAdded.toFixed(1) + ' kWh' : '--');
+        this._setText('detailAvgPower', (s.avgPower != null && s.avgPower > 0) ? s.avgPower.toFixed(1) + ' kW' : '--');
+        this._setText('detailPeakPower', (s.peakPower != null && s.peakPower > 0) ? s.peakPower.toFixed(1) + ' kW' : '--');
+        this._setText('detailRangeGained', (s.rangeGained != null && s.rangeGained > 0) ? this._dist(s.rangeGained) : '--');
+        this._setText('detailCost', (s.cost != null && s.cost > 0) ? this._money(s.cost) : '--');
+        this._setText('detailType', this._typeLabel(s));
+        this._setText('detailTimeToFull', (s.timeToFullMin != null && s.timeToFullMin > 0)
+            ? this._fmtDuration(s.timeToFullMin) : '--');
+        var temp = (s.tempAvg != null) ? s.tempAvg
+                 : (s.tempHigh != null ? s.tempHigh : null);
+        this._setText('detailTemp', (temp != null) ? Math.round(temp) + '°C' : '--');
+
+        // Location row: place name (or coords) + a "view on map" button when we
+        // have coordinates. Hidden entirely when no location was captured.
+        // Remember coords for openSessionMap (the button routes through the
+        // native shouldOverrideUrlLoading Intent path, which has a clipboard
+        // fallback on ROMs with no browser — same as the dashboard directions).
+        this._detailLat = (s.lat != null) ? s.lat : null;
+        this._detailLng = (s.lng != null) ? s.lng : null;
+        var locRow = document.getElementById('detailLocRow');
+        var locStr = this._locationLabel(s);
+        if (locRow) {
+            if (locStr) {
+                locRow.style.display = '';
+                this._setText('detailLocLabel', locStr);
+                var mapBtn = document.getElementById('detailMapLink');
+                if (mapBtn) mapBtn.style.display = (this._detailLat != null && this._detailLng != null) ? '' : 'none';
+            } else {
+                locRow.style.display = 'none';
+            }
+        }
+    },
+
+    // Open the session's location in the system maps app. Uses window.open so
+    // the native WebView shouldOverrideUrlLoading handles it (ACTION_VIEW Intent
+    // with a copy-to-clipboard fallback on locked-down ROMs) — NOT the daemon
+    // proxy, and NOT a raw anchor that would silently fail with no browser.
+    openSessionMap: function () {
+        if (this._detailLat == null || this._detailLng == null) {
+            this._toast(this._t('charge.no_location', 'No location for this session'), 'error');
+            return;
+        }
+        var url = 'https://www.google.com/maps/search/?api=1&query=' + this._detailLat + ',' + this._detailLng;
+        window.open(url, '_blank');
+    },
+
+    _renderDetailCharts: function (samples) {
+        var power = document.getElementById('detailPowerChart');
+        var temp = document.getElementById('detailTempChart');
+        var hasSamples = samples && samples.length > 1;
+
+        var note = document.getElementById('detailNoSamples');
+        if (note) note.style.display = hasSamples ? 'none' : '';
+
+        if (hasSamples) {
+            // Combined power+SoC curve; SoC ramp now lives on the right axis here
+            // (the standalone "Charge curve" card was removed).
+            if (power) this.renderPowerCurve(power, samples);
+            if (temp) this.renderTempBand(temp, samples);
+        } else {
+            this._clearCanvas('detailPowerChart');
+            this._clearCanvas('detailTempChart');
+        }
+    },
+
+    // ==================== SETTINGS ====================
+
+    // Enable the Apply button when any setting changes (mirrors trips' dirty
+    // flag so it doesn't sit always-active / misaligned).
+    showApplyNeeded: function () {
+        var btn = document.getElementById('chargingApplyBtn');
+        if (btn) { btn.disabled = false; btn.textContent = this._t('common.apply_changes', 'Apply Changes'); }
+    },
+    resetApplyButton: function () {
+        var btn = document.getElementById('chargingApplyBtn');
+        if (btn) { btn.disabled = true; btn.textContent = this._t('common.apply_changes', 'Apply Changes'); }
+    },
+
+    saveSettings: function () {
+        var self = this;
+        var btn = document.getElementById('chargingApplyBtn');
+        if (btn) { btn.disabled = true; btn.textContent = self._t('charge.applying', 'Applying…'); }
+        self._writing = true;  // block the visibilitychange refresh mid-save
+        var body = {
+            enabled: this._getChecked('chargingEnabled'),
+            electricityRate: this._getNum('rateInput'),
+            dcRate: this._getNum('dcRateInput'),
+            currency: this._getStr('currencySelect') || '$'
+            // fastSampleSec is an internal tuning knob (not user-facing); the
+            // daemon keeps its default. Omitted here intentionally.
+        };
+        fetch('/api/charging/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        }).then(function (r) { return r.json(); })
+          .then(function (d) {
+              if (d && d.success) self._toast(self._t('charge.saved', 'Charging settings saved'));
+              else self._toast(self._t('charge.save_failed', 'Could not save charging settings'), 'error');
+              self._writing = false;
+              self.resetApplyButton();
+              self.loadConfig();
+              self.loadSummary();
+          })
+          .catch(function () {
+              self._writing = false;
+              self._toast(self._t('charge.save_failed', 'Could not save charging settings'), 'error');
+              self.showApplyNeeded();
+          });
+    },
+
+    deleteCurrent: function () {
+        if (this.currentSessionId != null) this.deleteSession(this.currentSessionId);
+    },
+
+    deleteSession: function (id) {
+        var self = this;
+        var msg = this._t('charge.delete_confirm', 'Delete this charging session?');
+        if (!window.confirm(msg)) return;
+        // POST fallback path — the in-app WebView can drop DELETE bodies/methods.
+        fetch('/api/charging/' + id + '/delete', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d && d.success) {
+                    self._toast(self._t('charge.deleted', 'Charging session deleted'));
+                    // If we were viewing this session's detail, pop back to the list.
+                    if (self.currentSessionId === id) self.hideDetail();
+                    // Remove locally for an instant update, then refresh totals.
+                    var kept = [];
+                    for (var i = 0; i < self.sessions.length; i++) {
+                        if (self.sessions[i].id !== id) kept.push(self.sessions[i]);
+                    }
+                    self.sessions = kept;
+                    self._renderSessionCards();
+                    var empty = document.getElementById('sessionEmptyState');
+                    if (empty) empty.style.display = (self.sessions.length === 0) ? '' : 'none';
+                    self.loadSummary();
+                } else {
+                    self._toast(self._t('charge.delete_failed', 'Could not delete session'), 'error');
+                }
+            })
+            .catch(function () { self._toast(self._t('charge.delete_failed', 'Could not delete session'), 'error'); });
+    },
+
+    clearHistory: function () {
+        var self = this;
+        var msg = this._t('charge.settings_clear_confirm', 'Delete all charging history? This cannot be undone.');
+        if (!window.confirm(msg)) return;
+        // POST variant (some WebViews drop DELETE) — the daemon accepts both.
+        fetch('/api/charging/history/clear', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function () {
+                self._toast(self._t('charge.cleared', 'Charging history cleared'));
+                self.currentOffset = 0;
+                self.bootstrap();
+            })
+            .catch(function () {});
+    },
+
+    // ==================== CHART RENDERERS (Canvas2D, DPR-scaled) ====================
+
+    _setupCanvas: function (canvas, h) {
+        var dpr = window.devicePixelRatio || 1;
+        var w = canvas.clientWidth || canvas.parentNode.clientWidth || 320;
+        var height = h || 180;
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(height * dpr);
+        canvas.style.height = height + 'px';
+        var ctx = canvas.getContext('2d');
+        if (!ctx) return { ctx: null, w: w, h: height };
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, height);
+        return { ctx: ctx, w: w, h: height };
+    },
+
+    _clearCanvas: function (id) {
+        var c = document.getElementById(id);
+        if (!c) return;
+        var ctx = c.getContext('2d');
+        if (ctx) ctx.clearRect(0, 0, c.width, c.height);
+    },
+
+    renderCircleGauge: function (canvasId, percent, color) {
+        var canvas = document.getElementById(canvasId);
+        if (!canvas) return;
+        var dpr = window.devicePixelRatio || 1;
+        var size = 120;
+        canvas.width = size * dpr;
+        canvas.height = size * dpr;
+        canvas.style.width = size + 'px';
+        canvas.style.height = size + 'px';
+        var ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        var cx = size / 2, cy = size / 2, radius = 48, lineWidth = 8;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.strokeStyle = this.colors.arcTrack;
+        ctx.lineWidth = lineWidth;
+        ctx.stroke();
+
+        if (percent > 0) {
+            var startAngle = -Math.PI / 2;
+            var endAngle = startAngle + (Math.min(percent, 100) / 100) * Math.PI * 2;
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, startAngle, endAngle);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = lineWidth;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+    },
+
+    // SoC over time, with charging regions shaded. history: [{t,soc,charging}].
+    renderSocOverTime: function (canvas, history) {
+        if (!canvas || !history || !history.length) { return; }
+        var dims = this._setupCanvas(canvas, 200);
+        var ctx = dims.ctx, w = dims.w, h = dims.h;
+        var pad = { l: 34, r: 12, t: 12, b: 22 };
+        var plotW = w - pad.l - pad.r, plotH = h - pad.t - pad.b;
+
+        var pts = this._normalizePoints(history, 'soc');
+        if (pts.list.length < 2) { this._clearCanvas(canvas.id); return; }
+        var t0 = pts.tMin, tSpan = (pts.tMax - pts.tMin) || 1;
+        var x = function (t) { return pad.l + ((t - t0) / tSpan) * plotW; };
+        var y = function (v) { return pad.t + (1 - (v / 100)) * plotH; };
+
+        this._drawGrid(ctx, pad, plotW, plotH, [0, 25, 50, 75, 100], function (v) { return v + '%'; }, 100, 0);
+
+        // Charging-region bands.
+        ctx.fillStyle = this.colors.brandRgba;
+        var bandStart = null;
+        for (var i = 0; i < pts.list.length; i++) {
+            var charging = !!pts.list[i].charging;
+            if (charging && bandStart === null) bandStart = pts.list[i].t;
+            if ((!charging || i === pts.list.length - 1) && bandStart !== null) {
+                var bx0 = x(bandStart), bx1 = x(pts.list[i].t);
+                ctx.fillRect(bx0, pad.t, Math.max(bx1 - bx0, 1), plotH);
+                bandStart = null;
+            }
+        }
+
+        // Area fill under the SoC line.
+        var grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + plotH);
+        grad.addColorStop(0, this._rgba(this.colors.brand, 0.28));
+        grad.addColorStop(1, this._rgba(this.colors.brand, 0.02));
+        ctx.beginPath();
+        ctx.moveTo(x(pts.list[0].t), pad.t + plotH);
+        for (var j = 0; j < pts.list.length; j++) ctx.lineTo(x(pts.list[j].t), y(pts.list[j].soc));
+        ctx.lineTo(x(pts.list[pts.list.length - 1].t), pad.t + plotH);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        // SoC line.
+        ctx.beginPath();
+        for (var k = 0; k < pts.list.length; k++) {
+            var px = x(pts.list[k].t), py = y(pts.list[k].soc);
+            if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.strokeStyle = this.colors.brand;
+        ctx.lineWidth = 2;
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+
+        this._drawTimeLabels(ctx, pts, pad, plotW, plotH);
+
+        // Cache geometry so the hover handler can map a pointer x back to the
+        // nearest sample and redraw a crosshair + tooltip without recomputing.
+        this._socGeom = {
+            canvas: canvas, list: pts.list, t0: t0, tSpan: tSpan,
+            pad: pad, plotW: plotW, plotH: plotH, w: w, h: h
+        };
+        this._setupSocHover(canvas);
+        // Repaint any active crosshair (e.g. after a theme flip re-render).
+        if (this._socHoverIdx != null) this._drawSocHover(this._socHoverIdx);
+    },
+
+    // Attach pointer handlers ONCE per canvas (idempotent via a flag) so a
+    // re-render doesn't stack listeners. Mirrors performance.js interaction.
+    _setupSocHover: function (canvas) {
+        if (!canvas || canvas._socHoverBound) return;
+        canvas._socHoverBound = true;
+        var self = this;
+        var onMove = function (clientX) {
+            var g = self._socGeom;
+            if (!g) return;
+            var rect = g.canvas.getBoundingClientRect();
+            var px = clientX - rect.left;
+            // Find nearest sample by x.
+            var best = -1, bestDx = 1e9;
+            for (var i = 0; i < g.list.length; i++) {
+                var sx = g.pad.l + ((g.list[i].t - g.t0) / g.tSpan) * g.plotW;
+                var dx = Math.abs(sx - px);
+                if (dx < bestDx) { bestDx = dx; best = i; }
+            }
+            if (best >= 0) { self._socHoverIdx = best; self._drawSocHover(best); }
+        };
+        canvas.addEventListener('mousemove', function (e) { onMove(e.clientX); });
+        canvas.addEventListener('mouseleave', function () {
+            self._socHoverIdx = null;
+            if (self.socHistoryCache) self.renderSocOverTime(canvas, self.socHistoryCache);
+        });
+        canvas.addEventListener('touchstart', function (e) {
+            if (e.touches && e.touches[0]) { e.preventDefault(); onMove(e.touches[0].clientX); }
+        }, { passive: false });
+        canvas.addEventListener('touchmove', function (e) {
+            if (e.touches && e.touches[0]) { e.preventDefault(); onMove(e.touches[0].clientX); }
+        }, { passive: false });
+        canvas.addEventListener('touchend', function () {
+            setTimeout(function () {
+                self._socHoverIdx = null;
+                if (self.socHistoryCache) self.renderSocOverTime(canvas, self.socHistoryCache);
+            }, 1500);
+        });
+    },
+
+    // Draw the crosshair + dot + tooltip for the sample at index `idx`. Repaints
+    // the base chart first (cheap) so the overlay doesn't accumulate.
+    _drawSocHover: function (idx) {
+        var g = this._socGeom;
+        if (!g || !g.list || idx == null || idx < 0 || idx >= g.list.length) return;
+        // Repaint base, but guard against recursion (renderSocOverTime calls
+        // _drawSocHover at the end — so temporarily clear the index).
+        var saved = this._socHoverIdx;
+        this._socHoverIdx = null;
+        this.renderSocOverTime(g.canvas, this.socHistoryCache);
+        this._socHoverIdx = saved;
+
+        var ctx = g.canvas.getContext('2d');
+        if (!ctx) return;
+        var p = g.list[idx];
+        var px = g.pad.l + ((p.t - g.t0) / g.tSpan) * g.plotW;
+        var py = g.pad.t + (1 - (p.soc / 100)) * g.plotH;
+
+        // Crosshair line.
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(px, g.pad.t);
+        ctx.lineTo(px, g.pad.t + g.plotH);
+        ctx.strokeStyle = this._rgba(this.colors.text, 0.35);
+        ctx.lineWidth = 1;
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([4, 4]);
+        ctx.stroke();
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([]);
+
+        // Point marker.
+        ctx.beginPath();
+        ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = this.colors.brand;
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = this.colors.dotStroke;
+        ctx.stroke();
+
+        // Tooltip box: time + SoC% (+ "charging" marker when applicable).
+        var socTxt = Math.round(p.soc) + '%';
+        var timeTxt = this._fmtDate(p.t);
+        ctx.font = '11px Inter, sans-serif';
+        var tw = Math.max(ctx.measureText(socTxt).width, ctx.measureText(timeTxt).width) + 16;
+        var th = 34;
+        var bx = px + 10; if (bx + tw > g.w - 4) bx = px - tw - 10;
+        if (bx < 4) bx = 4;
+        var by = g.pad.t + 4;
+        ctx.beginPath();
+        this._roundRectPath(ctx, bx, by, tw, th, 6);
+        ctx.fillStyle = this._rgba(this.colors.dotStroke, 0.95);
+        ctx.fill();
+        ctx.strokeStyle = this._rgba(this.colors.text, 0.2);
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.fillStyle = this.colors.textStrong;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.font = '600 12px Inter, sans-serif';
+        ctx.fillText(socTxt, bx + 8, by + 5);
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.font = '10px Inter, sans-serif';
+        ctx.fillText(timeTxt, bx + 8, by + 19);
+        ctx.restore();
+    },
+
+    // Combined per-session chart: power kW (left axis, filled line) + SoC%
+    // (right axis, dashed) on a shared time axis. Replaces the former separate
+    // "Charge power" + "Charge curve" cards.
+    renderPowerCurve: function (canvas, samples) {
+        if (!canvas || !samples || samples.length < 2) return;
+        var dims = this._setupCanvas(canvas, 210);
+        var ctx = dims.ctx, w = dims.w, h = dims.h;
+        var pad = { l: 38, r: 40, t: 18, b: 22 };
+        var plotW = w - pad.l - pad.r, plotH = h - pad.t - pad.b;
+
+        // Validate all samples have .t defined before drawing (an undefined .t
+        // produces NaN canvas coordinates that break the path).
+        for (var v = 0; v < samples.length; v++) {
+            if (samples[v] == null || samples[v].t == null) {
+                this._clearCanvas(canvas.id);
+                return;
+            }
+        }
+        var t0 = samples[0].t, tSpan = (samples[samples.length - 1].t - t0) || 1;
+        var maxP = 1;
+        for (var i = 0; i < samples.length; i++) if (samples[i] && samples[i].power > maxP) maxP = samples[i].power;
+        maxP = Math.ceil(maxP / 10) * 10;
+        var x = function (t) { return pad.l + ((t - t0) / tSpan) * plotW; };
+        var yP = function (v) { return pad.t + (1 - (v / maxP)) * plotH; };
+        var yS = function (v) { return pad.t + (1 - (v / 100)) * plotH; };
+
+        this._drawGrid(ctx, pad, plotW, plotH,
+            [0, maxP * 0.25, maxP * 0.5, maxP * 0.75, maxP],
+            function (v) { return Math.round(v); }, maxP, 0);
+
+        // Power area + line.
+        var grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + plotH);
+        grad.addColorStop(0, this._rgba(this.colors.brand, 0.30));
+        grad.addColorStop(1, this._rgba(this.colors.brand, 0.02));
+        ctx.beginPath();
+        ctx.moveTo(x(samples[0].t), pad.t + plotH);
+        for (var j = 0; j < samples.length; j++) { if (samples[j] != null && samples[j].power != null) ctx.lineTo(x(samples[j].t), yP(samples[j].power)); }
+        ctx.lineTo(x(samples[samples.length - 1].t), pad.t + plotH);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        ctx.beginPath();
+        for (var k = 0; k < samples.length; k++) {
+            if (samples[k] == null || samples[k].power == null) continue;
+            var px = x(samples[k].t), py = yP(samples[k].power);
+            if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.strokeStyle = this.colors.brand;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // SoC dashed line on the right axis.
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        var drew = false;
+        for (var m = 0; m < samples.length; m++) {
+            if (samples[m].soc == null) continue;
+            var sx = x(samples[m].t), sy = yS(samples[m].soc);
+            if (!drew) { ctx.moveTo(sx, sy); drew = true; } else ctx.lineTo(sx, sy);
+        }
+        ctx.strokeStyle = this._rgba(this.colors.amber, 0.85);
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([]);
+
+        // Right axis = SoC% (0/50/100), to match the dashed SoC line. The left
+        // axis (drawn by _drawGrid) is power kW. This is the combined "power +
+        // charge curve" chart — both series on shared time, dual y-axes.
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        var socTicks = [0, 50, 100];
+        for (var st = 0; st < socTicks.length; st++) {
+            ctx.fillText(socTicks[st] + '%', pad.l + plotW + 4, yS(socTicks[st]));
+        }
+        ctx.textAlign = 'left';
+
+        // Legend: kW (brand) + SoC% (amber dashed).
+        this._drawDualLegend(ctx, pad.l, pad.t - 2, plotW,
+            this._t('charge.legend_power', 'kW'),
+            this._t('charge.legend_soc', 'SoC %'));
+
+        // Real wall-clock time axis (was relative "0m/Nm"). Shared across all
+        // three detail charts so they line up on the same time scale.
+        this._drawClockAxis(ctx, t0, samples[samples.length - 1].t, pad, plotW, plotH);
+
+        // Register geometry for the shared detail-chart hover. The tooltip shows
+        // power kW + SoC% + clock time at the nearest sample.
+        var selfP = this;
+        this._registerDetailHover(canvas, {
+            samples: samples, t0: t0, tSpan: tSpan, pad: pad, plotW: plotW, plotH: plotH, w: w, h: h,
+            render: function () { selfP.renderPowerCurve(canvas, selfP.samplesCache); },
+            dot: function (c, p, px) {
+                if (p.power == null) return;
+                var py = yP(p.power);
+                c.beginPath(); c.arc(px, py, 3.5, 0, Math.PI * 2);
+                c.fillStyle = selfP.colors.brand; c.fill();
+                c.lineWidth = 2; c.strokeStyle = selfP.colors.dotStroke; c.stroke();
+            },
+            lines: function (p) {
+                var L = [];
+                if (p.power != null) L.push(p.power.toFixed(1) + ' kW');
+                if (p.soc != null) L.push(Math.round(p.soc) + '%');
+                L.push(selfP._fmtClock(p.t));
+                return L;
+            }
+        });
+    },
+
+    // Battery temperature: high–low band + average line. samples carry
+    // temp (avg), tempHigh, tempLow — the pack reports a SPREAD of cell temps,
+    // not one number, so we draw the band and label the avg.
+    renderTempBand: function (canvas, samples) {
+        if (!canvas) return;
+        var pts = [];
+        for (var i = 0; i < samples.length; i++) {
+            var s = samples[i];
+            if (s == null || s.t == null) continue;
+            var avg = (s.temp != null) ? s.temp : null;
+            var hi = (s.tempHigh != null) ? s.tempHigh : avg;
+            var lo = (s.tempLow != null) ? s.tempLow : avg;
+            if (avg == null && hi == null && lo == null) continue;
+            pts.push({ t: s.t, avg: avg, hi: hi, lo: lo });
+        }
+        if (pts.length < 2) { this._clearCanvas(canvas.id); return; }
+        var dims = this._setupCanvas(canvas, 180);
+        var ctx = dims.ctx, w = dims.w, h = dims.h;
+        var pad = { l: 36, r: 12, t: 12, b: 22 };
+        var plotW = w - pad.l - pad.r, plotH = h - pad.t - pad.b;
+
+        var minV = 1e9, maxV = -1e9;
+        for (var j = 0; j < pts.length; j++) {
+            var lo = (pts[j].lo != null) ? pts[j].lo : pts[j].avg;
+            var hi = (pts[j].hi != null) ? pts[j].hi : pts[j].avg;
+            if (lo != null && lo < minV) minV = lo;
+            if (hi != null && hi > maxV) maxV = hi;
+        }
+        if (maxV - minV < 4) { minV -= 2; maxV += 2; }
+        var t0 = pts[0].t, tSpan = (pts[pts.length - 1].t - t0) || 1;
+        var x = function (t) { return pad.l + ((t - t0) / tSpan) * plotW; };
+        var y = function (v) { return pad.t + (1 - (v - minV) / (maxV - minV)) * plotH; };
+
+        this._drawGrid(ctx, pad, plotW, plotH,
+            [minV, (minV + maxV) / 2, maxV],
+            function (v) { return Math.round(v) + '°'; }, maxV, minV);
+
+        // High–low band (filled) — only when we actually have a spread.
+        var hasBand = false;
+        for (var b = 0; b < pts.length; b++) { if (pts[b].hi != null && pts[b].lo != null && pts[b].hi !== pts[b].lo) { hasBand = true; break; } }
+        if (hasBand) {
+            ctx.beginPath();
+            ctx.moveTo(x(pts[0].t), y(pts[0].hi));
+            for (var u = 1; u < pts.length; u++) ctx.lineTo(x(pts[u].t), y(pts[u].hi));
+            for (var d = pts.length - 1; d >= 0; d--) ctx.lineTo(x(pts[d].t), y(pts[d].lo));
+            ctx.closePath();
+            ctx.fillStyle = this._rgba(this.colors.amber, 0.16);
+            ctx.fill();
+        }
+
+        // Average line.
+        ctx.beginPath();
+        var drewA = false;
+        for (var k = 0; k < pts.length; k++) {
+            if (pts[k].avg == null) continue;
+            var px = x(pts[k].t), py = y(pts[k].avg);
+            if (!drewA) { ctx.moveTo(px, py); drewA = true; } else ctx.lineTo(px, py);
+        }
+        ctx.strokeStyle = this.colors.amber;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        this._drawClockAxis(ctx, t0, pts[pts.length - 1].t, pad, plotW, plotH);
+
+        var selfT = this;
+        this._registerDetailHover(canvas, {
+            samples: pts, t0: t0, tSpan: tSpan, pad: pad, plotW: plotW, plotH: plotH, w: w, h: h,
+            render: function () { selfT.renderTempBand(canvas, selfT.samplesCache); },
+            dot: function (c, p, px) {
+                if (p.avg == null) return;
+                var py = y(p.avg);
+                c.beginPath(); c.arc(px, py, 3.5, 0, Math.PI * 2);
+                c.fillStyle = selfT.colors.amber; c.fill();
+                c.lineWidth = 2; c.strokeStyle = selfT.colors.dotStroke; c.stroke();
+            },
+            lines: function (p) {
+                var L = [];
+                if (p.avg != null) L.push(Math.round(p.avg) + '° avg');
+                if (p.hi != null && p.lo != null && p.hi !== p.lo) L.push(Math.round(p.lo) + '–' + Math.round(p.hi) + '°');
+                L.push(selfT._fmtClock(p.t));
+                return L;
+            }
+        });
+    },
+
+    // ---- Shared detail-chart hover --------------------------------------
+    // One implementation drives the power / ramp / temp charts. `spec` carries
+    // the chart's geometry + sample array plus three callbacks: render() to
+    // repaint the base chart, dot(ctx,p,px) to mark the hovered point, and
+    // lines(p) -> [strings] for the tooltip. State lives on the canvas element
+    // so multiple detail charts hover independently.
+    _registerDetailHover: function (canvas, spec) {
+        if (!canvas) return;
+        canvas._chgHoverSpec = spec;
+        var self = this;
+        if (canvas._chgHoverBound) {
+            // Re-paint an active crosshair after a re-render (theme flip / poll).
+            if (canvas._chgHoverIdx != null) this._drawDetailHover(canvas);
+            return;
+        }
+        canvas._chgHoverBound = true;
+        var onMove = function (clientX) {
+            var g = canvas._chgHoverSpec;
+            if (!g) return;
+            var rect = canvas.getBoundingClientRect();
+            var px = clientX - rect.left;
+            var best = -1, bestDx = 1e9;
+            for (var i = 0; i < g.samples.length; i++) {
+                if (g.samples[i] == null || g.samples[i].t == null) continue;
+                var sx = g.pad.l + ((g.samples[i].t - g.t0) / g.tSpan) * g.plotW;
+                var dx = Math.abs(sx - px);
+                if (dx < bestDx) { bestDx = dx; best = i; }
+            }
+            if (best >= 0) { canvas._chgHoverIdx = best; self._drawDetailHover(canvas); }
+        };
+        var clear = function () {
+            canvas._chgHoverIdx = null;
+            var g = canvas._chgHoverSpec;
+            if (g && g.render) g.render();
+        };
+        canvas.addEventListener('mousemove', function (e) { onMove(e.clientX); });
+        canvas.addEventListener('mouseleave', clear);
+        canvas.addEventListener('touchstart', function (e) {
+            if (e.touches && e.touches[0]) { e.preventDefault(); onMove(e.touches[0].clientX); }
+        }, { passive: false });
+        canvas.addEventListener('touchmove', function (e) {
+            if (e.touches && e.touches[0]) { e.preventDefault(); onMove(e.touches[0].clientX); }
+        }, { passive: false });
+        canvas.addEventListener('touchend', function () { setTimeout(clear, 1500); });
+        if (canvas._chgHoverIdx != null) this._drawDetailHover(canvas);
+    },
+
+    _drawDetailHover: function (canvas) {
+        var g = canvas._chgHoverSpec;
+        var idx = canvas._chgHoverIdx;
+        if (!g || idx == null || idx < 0 || idx >= g.samples.length) return;
+        var p = g.samples[idx];
+        if (p == null || p.t == null) return;
+        // Repaint base first (guard recursion: render() re-enters this via
+        // _registerDetailHover, so clear the index across the repaint).
+        var saved = canvas._chgHoverIdx;
+        canvas._chgHoverIdx = null;
+        if (g.render) g.render();
+        canvas._chgHoverIdx = saved;
+        // render() rebuilds the spec (new closures) — re-read it.
+        g = canvas._chgHoverSpec;
+
+        var ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        var px = g.pad.l + ((p.t - g.t0) / g.tSpan) * g.plotW;
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(px, g.pad.t);
+        ctx.lineTo(px, g.pad.t + g.plotH);
+        ctx.strokeStyle = this._rgba(this.colors.text, 0.35);
+        ctx.lineWidth = 1;
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([4, 4]);
+        ctx.stroke();
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([]);
+
+        if (g.dot) { try { g.dot(ctx, p, px); } catch (e) {} }
+
+        var lines = g.lines ? g.lines(p) : [];
+        if (lines && lines.length) {
+            ctx.font = '600 12px Inter, sans-serif';
+            var tw = 0;
+            for (var i = 0; i < lines.length; i++) tw = Math.max(tw, ctx.measureText(lines[i]).width);
+            tw += 16;
+            var th = 12 + lines.length * 15;
+            var bx = px + 10; if (bx + tw > g.w - 4) bx = px - tw - 10;
+            if (bx < 4) bx = 4;
+            var by = g.pad.t + 4;
+            ctx.beginPath();
+            this._roundRectPath(ctx, bx, by, tw, th, 6);
+            ctx.fillStyle = this._rgba(this.colors.dotStroke, 0.95);
+            ctx.fill();
+            ctx.strokeStyle = this._rgba(this.colors.text, 0.2);
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            var ty = by + 6;
+            for (var k = 0; k < lines.length; k++) {
+                ctx.fillStyle = (k === 0) ? this.colors.textStrong : this.colors.textMuted;
+                ctx.font = (k === 0) ? '600 12px Inter, sans-serif' : '10px Inter, sans-serif';
+                ctx.fillText(lines[k], bx + 8, ty);
+                ty += 15;
+            }
+        }
+        ctx.restore();
+    },
+
+    // Bar hover: nearest bar by pointer x within the plot. `spec` =
+    // { rects:[{bx,by,bw,bh,p}], w, h, pad, render(), lines(p) }. State on the
+    // canvas element so it composes with the other charts.
+    _registerBarHover: function (canvas, spec) {
+        if (!canvas) return;
+        canvas._barSpec = spec;
+        var self = this;
+        if (canvas._barBound) {
+            if (canvas._barIdx != null) this._drawBarHover(canvas);
+            return;
+        }
+        canvas._barBound = true;
+        var onMove = function (clientX) {
+            var g = canvas._barSpec;
+            if (!g) return;
+            var rect = canvas.getBoundingClientRect();
+            var px = clientX - rect.left;
+            var best = -1, bestDx = 1e9;
+            for (var i = 0; i < g.rects.length; i++) {
+                var cx = g.rects[i].bx + g.rects[i].bw / 2;
+                var dx = Math.abs(cx - px);
+                if (dx < bestDx) { bestDx = dx; best = i; }
+            }
+            if (best >= 0) { canvas._barIdx = best; self._drawBarHover(canvas); }
+        };
+        var clear = function () {
+            canvas._barIdx = null;
+            var g = canvas._barSpec;
+            if (g && g.render) g.render();
+        };
+        canvas.addEventListener('mousemove', function (e) { onMove(e.clientX); });
+        canvas.addEventListener('mouseleave', clear);
+        canvas.addEventListener('touchstart', function (e) {
+            if (e.touches && e.touches[0]) { e.preventDefault(); onMove(e.touches[0].clientX); }
+        }, { passive: false });
+        canvas.addEventListener('touchmove', function (e) {
+            if (e.touches && e.touches[0]) { e.preventDefault(); onMove(e.touches[0].clientX); }
+        }, { passive: false });
+        canvas.addEventListener('touchend', function () { setTimeout(clear, 1500); });
+        if (canvas._barIdx != null) this._drawBarHover(canvas);
+    },
+
+    _drawBarHover: function (canvas) {
+        var g = canvas._barSpec;
+        var idx = canvas._barIdx;
+        if (!g || idx == null || idx < 0 || idx >= g.rects.length) return;
+        var r = g.rects[idx];
+        var saved = canvas._barIdx;
+        canvas._barIdx = null;
+        if (g.render) g.render();
+        canvas._barIdx = saved;
+        g = canvas._barSpec;
+        r = g.rects[idx];
+
+        var ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.save();
+        // Highlight the hovered bar with an outline.
+        ctx.beginPath();
+        this._roundRectPath(ctx, r.bx, r.by, r.bw, r.bh, 3);
+        ctx.strokeStyle = this.colors.textStrong;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        var lines = g.lines ? g.lines(r.p) : [];
+        if (lines && lines.length) {
+            ctx.font = '600 12px Inter, sans-serif';
+            var tw = 0;
+            for (var i = 0; i < lines.length; i++) tw = Math.max(tw, ctx.measureText(lines[i]).width);
+            tw += 16;
+            var th = 12 + lines.length * 15;
+            var cx = r.bx + r.bw / 2;
+            var bx = cx + 10; if (bx + tw > g.w - 4) bx = cx - tw - 10;
+            if (bx < 4) bx = 4;
+            var by = r.by - th - 6; if (by < g.pad.t) by = g.pad.t + 2;
+            ctx.beginPath();
+            this._roundRectPath(ctx, bx, by, tw, th, 6);
+            ctx.fillStyle = this._rgba(this.colors.dotStroke, 0.95);
+            ctx.fill();
+            ctx.strokeStyle = this._rgba(this.colors.text, 0.2);
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            var ty = by + 6;
+            for (var k = 0; k < lines.length; k++) {
+                ctx.fillStyle = (k === 0) ? this.colors.textStrong : this.colors.textMuted;
+                ctx.font = (k === 0) ? '600 12px Inter, sans-serif' : '10px Inter, sans-serif';
+                ctx.fillText(lines[k], bx + 8, ty);
+                ty += 15;
+            }
+        }
+        ctx.restore();
+    },
+
+    // Two-series legend drawn at the top-right of a chart's plot area: a solid
+    // brand swatch + label, then a dashed amber swatch + label.
+    _drawDualLegend: function (ctx, plotLeft, y, plotW, label1, label2) {
+        ctx.save();
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        var w2 = ctx.measureText(label2).width;
+        var w1 = ctx.measureText(label1).width;
+        var swatch = 14, gapTxt = 4, gapItem = 12;
+        var totalW = swatch + gapTxt + w1 + gapItem + swatch + gapTxt + w2;
+        var x = plotLeft + plotW - totalW;
+        // Series 1: solid brand line.
+        ctx.strokeStyle = this.colors.brand; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + swatch, y); ctx.stroke();
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.fillText(label1, x + swatch + gapTxt, y);
+        // Series 2: dashed amber line.
+        var x2 = x + swatch + gapTxt + w1 + gapItem;
+        ctx.strokeStyle = this._rgba(this.colors.amber, 0.85); ctx.lineWidth = 1.6;
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(x2, y); ctx.lineTo(x2 + swatch, y); ctx.stroke();
+        if (this._supportsLineDash(ctx)) ctx.setLineDash([]);
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.fillText(label2, x2 + swatch + gapTxt, y);
+        ctx.restore();
+    },
+
+    // Wall-clock time axis for the per-session detail charts (HH:MM at both
+    // ends). Replaces the relative "0m / Nm" axis so the x is a real timestamp.
+    _drawClockAxis: function (ctx, t0, tMax, pad, plotW, plotH) {
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textBaseline = 'top';
+        ctx.textAlign = 'left';
+        ctx.fillText(this._fmtClock(t0), pad.l, pad.t + plotH + 6);
+        ctx.textAlign = 'right';
+        ctx.fillText(this._fmtClock(tMax), pad.l + plotW, pad.t + plotH + 6);
+        // Mid label when the span is wide enough to be useful.
+        if (plotW > 160) {
+            ctx.textAlign = 'center';
+            ctx.fillText(this._fmtClock(t0 + (tMax - t0) / 2), pad.l + plotW / 2, pad.t + plotH + 6);
+        }
+        ctx.textAlign = 'left';
+    },
+
+    // Date x-axis (MMM D at both ends + middle) for the day-scale stats charts.
+    _drawDateAxis: function (ctx, t0, tMax, pad, plotW, plotH) {
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textBaseline = 'top';
+        var fmt = this._fmtDay ? this._fmtDay : function (ts) { return ''; };
+        ctx.textAlign = 'left';
+        ctx.fillText(fmt(t0), pad.l, pad.t + plotH + 6);
+        ctx.textAlign = 'right';
+        ctx.fillText(fmt(tMax), pad.l + plotW, pad.t + plotH + 6);
+        if (plotW > 160 && tMax > t0) {
+            ctx.textAlign = 'center';
+            ctx.fillText(fmt(t0 + (tMax - t0) / 2), pad.l + plotW / 2, pad.t + plotH + 6);
+        }
+        ctx.textAlign = 'left';
+    },
+
+    // SOH degradation trend (line + dots). trend: [{day,soh}].
+    renderSohTrend: function (canvas, trend) {
+        if (!canvas || !trend || trend.length < 2) { if (canvas) this._clearCanvas(canvas.id); return; }
+        var dims = this._setupCanvas(canvas, 170);
+        var ctx = dims.ctx, w = dims.w, h = dims.h;
+        var pad = { l: 38, r: 12, t: 12, b: 22 };
+        var plotW = w - pad.l - pad.r, plotH = h - pad.t - pad.b;
+
+        var minV = 1e9, maxV = -1e9;
+        for (var i = 0; i < trend.length; i++) { if (trend[i] != null && trend[i].soh < minV) minV = trend[i].soh; if (trend[i] != null && trend[i].soh > maxV) maxV = trend[i].soh; }
+        minV = Math.floor(minV - 1); maxV = Math.ceil(maxV + 1);
+        if (maxV > 100) maxV = 100;
+        if (minV >= maxV) maxV = minV + 1;
+        var t0 = trend[0].day, tSpan = (trend[trend.length - 1].day - t0) || 1;
+        var x = function (t) { return pad.l + ((t - t0) / tSpan) * plotW; };
+        var y = function (v) { return pad.t + (1 - (v - minV) / (maxV - minV)) * plotH; };
+
+        this._drawGrid(ctx, pad, plotW, plotH, [minV, (minV + maxV) / 2, maxV], function (v) { return Math.round(v) + '%'; }, maxV, minV);
+
+        ctx.beginPath();
+        for (var k = 0; k < trend.length; k++) {
+            if (trend[k] == null) continue;
+            var px = x(trend[k].day), py = y(trend[k].soh);
+            if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.strokeStyle = this.colors.good;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        for (var m = 0; m < trend.length; m++) {
+            if (trend[m] == null) continue;
+            ctx.beginPath();
+            ctx.arc(x(trend[m].day), y(trend[m].soh), 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = this.colors.good;
+            ctx.fill();
+        }
+
+        this._drawDateAxis(ctx, t0, trend[trend.length - 1].day, pad, plotW, plotH);
+
+        // Hover: SOH% + date at the nearest day. Map the {day,soh} series into
+        // the {t,...} shape the generic hover expects.
+        var selfS = this;
+        var pts = [];
+        for (var z = 0; z < trend.length; z++) { if (trend[z] != null) pts.push({ t: trend[z].day, soh: trend[z].soh }); }
+        this._registerDetailHover(canvas, {
+            samples: pts, t0: t0, tSpan: tSpan, pad: pad, plotW: plotW, plotH: plotH, w: w, h: h,
+            render: function () { selfS.renderSohTrend(canvas, selfS.summaryCache ? selfS.summaryCache.sohTrend : trend); },
+            dot: function (c, p, px) {
+                var py = y(p.soh);
+                c.beginPath(); c.arc(px, py, 3.5, 0, Math.PI * 2);
+                c.fillStyle = selfS.colors.good; c.fill();
+                c.lineWidth = 2; c.strokeStyle = selfS.colors.dotStroke; c.stroke();
+            },
+            lines: function (p) { return [p.soh.toFixed(1) + '%', selfS._fmtDay(p.t)]; }
+        });
+    },
+
+    // Per-day cost bars. daily: [{day,cost,energy}].
+    renderCostBars: function (canvas, daily) {
+        if (!canvas || !daily || !daily.length) { if (canvas) this._clearCanvas(canvas.id); return; }
+        var dims = this._setupCanvas(canvas, 170);
+        var ctx = dims.ctx, w = dims.w, h = dims.h;
+        var pad = { l: 38, r: 12, t: 12, b: 22 };
+        var plotW = w - pad.l - pad.r, plotH = h - pad.t - pad.b;
+
+        var maxC = 0;
+        for (var i = 0; i < daily.length; i++) if (daily[i].cost > maxC) maxC = daily[i].cost;
+        if (maxC <= 0) { this._clearCanvas(canvas.id); return; }
+        maxC = maxC * 1.1;
+
+        if (plotW <= 0) { this._clearCanvas(canvas.id); return; }
+
+        this._drawGrid(ctx, pad, plotW, plotH, [0, maxC / 2, maxC], (function (self) {
+            return function (v) { return self._money(v); };
+        })(this), maxC, 0);
+
+        var n = daily.length;
+        var slot = plotW / n;
+        var barW = Math.max(Math.min(slot * 0.6, 26), 3);
+        var rects = [];
+        for (var j = 0; j < n; j++) {
+            var cost = daily[j].cost || 0;
+            var barH = (cost / maxC) * plotH;
+            var bx = pad.l + slot * j + (slot - barW) / 2;
+            var by = pad.t + plotH - barH;
+            ctx.beginPath();
+            this._roundRectPath(ctx, bx, by, barW, Math.max(barH, 1), 3);
+            ctx.fillStyle = this.colors.brand;
+            ctx.fill();
+            rects.push({ bx: bx, by: by, bw: barW, bh: Math.max(barH, 1), p: daily[j] });
+        }
+
+        // Date x-axis (first/last day) so bars are anchored in time.
+        if (n > 0) this._drawDateAxis(ctx, daily[0].day, daily[n - 1].day, pad, plotW, plotH);
+
+        // Bar hover → cost + energy + date.
+        var selfC = this;
+        this._registerBarHover(canvas, {
+            rects: rects, w: w, h: h, pad: pad,
+            render: function () { selfC.renderCostBars(canvas, selfC.summaryCache ? (selfC.summaryCache.daily || []) : daily); },
+            lines: function (p) {
+                var L = [selfC._money(p.cost || 0)];
+                if (p.energy != null && p.energy > 0) L.push((Math.round(p.energy * 10) / 10) + ' kWh');
+                L.push(selfC._fmtDay(p.day));
+                return L;
+            }
+        });
+    },
+
+    // Per-session energy points from COMPLETED sessions (newest first in the
+    // list → reversed to chronological). Shared by the card-visibility gate and
+    // the bar renderer. Range-derived efficiency was dropped (range is now
+    // energy×const, so a range-vs-energy scatter was a meaningless straight line).
+    _energyBars: function (sessions) {
+        var pts = [];
+        if (!sessions) return pts;
+        for (var i = 0; i < sessions.length; i++) {
+            var s = sessions[i];
+            if (!s || s.inProgress === true) continue;
+            if (s.energyAdded > 0) {
+                pts.push({ t: s.startTime, kwh: s.energyAdded, dc: s.isDc === true, cost: s.cost });
+            }
+        }
+        pts.reverse();   // chronological (sessions arrive newest-first)
+        return pts;
+    },
+
+    // Per-session energy-added bars (one bar per completed charge). DC bars
+    // brand-coloured, AC accent. Replaces the old range-vs-energy scatter.
+    renderEfficiency: function (canvas, sessions) {
+        if (!canvas) return;
+        var pts = this._energyBars(sessions);
+        if (pts.length < 1) { this._clearCanvas(canvas.id); return; }
+        var dims = this._setupCanvas(canvas, 180);
+        var ctx = dims.ctx, w = dims.w, h = dims.h;
+        var pad = { l: 40, r: 12, t: 14, b: 24 };
+        var plotW = w - pad.l - pad.r, plotH = h - pad.t - pad.b;
+        if (plotW <= 0) { this._clearCanvas(canvas.id); return; }
+
+        var maxK = 0;
+        for (var i = 0; i < pts.length; i++) if (pts[i].kwh > maxK) maxK = pts[i].kwh;
+        if (maxK <= 0) { this._clearCanvas(canvas.id); return; }
+        maxK *= 1.1;
+
+        var fmtNum = function (v) { return v >= 10 ? v.toFixed(0) : (Math.round(v * 10) / 10).toString(); };
+        this._drawGrid(ctx, pad, plotW, plotH, [0, maxK / 2, maxK],
+            function (v) { return fmtNum(v); }, maxK, 0);
+
+        var n = pts.length;
+        var slot = plotW / n;
+        var barW = Math.max(Math.min(slot * 0.6, 28), 3);
+        var rects = [];
+        for (var j = 0; j < n; j++) {
+            var barH = (pts[j].kwh / maxK) * plotH;
+            var bx = pad.l + slot * j + (slot - barW) / 2;
+            var by = pad.t + plotH - barH;
+            ctx.beginPath();
+            this._roundRectPath(ctx, bx, by, barW, Math.max(barH, 1), 3);
+            ctx.fillStyle = pts[j].dc ? this.colors.brand : this.colors.accent;
+            ctx.fill();
+            rects.push({ bx: bx, by: by, bw: barW, bh: Math.max(barH, 1), p: pts[j] });
+        }
+
+        // Y-axis title (kWh per session).
+        ctx.save();
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.font = '10px Inter, sans-serif';
+        ctx.translate(10, pad.t + plotH / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText(this._t('charge.energy_bar_y', 'kWh per charge'), 0, 0);
+        ctx.restore();
+
+        // Bar hover → date + kWh (+ cost).
+        var selfE = this;
+        this._registerBarHover(canvas, {
+            rects: rects, w: w, h: h, pad: pad,
+            render: function () { selfE.renderEfficiency(canvas, selfE.sessions); },
+            lines: function (p) {
+                var L = [fmtNum(p.kwh) + ' kWh'];
+                if (p.cost != null && p.cost > 0) L.push(selfE._money(p.cost));
+                L.push(selfE._fmtDay(p.t));
+                return L;
+            }
+        });
+    },
+
+    _renderSummaryCharts: function (s) {
+        // Only paint a chart whose card is actually visible — a display:none
+        // canvas has offsetParent null (hidden from layout flow), so guard on
+        // that rather than risk rendering at a degenerate size.
+        var vis = function (c) { return c && c.offsetParent !== null; };
+        var soh = document.getElementById('sohTrendChart');
+        if (vis(soh)) this.renderSohTrend(soh, s.sohTrend || []);
+        var cost = document.getElementById('monthlyCostChart');
+        if (vis(cost)) this.renderCostBars(cost, s.daily || []);
+        var eff = document.getElementById('efficiencyChart');
+        if (vis(eff)) this.renderEfficiency(eff, this.sessions || []);
+    },
+
+    // ==================== CANVAS HELPERS ====================
+
+    _roundRectPath: function (ctx, x, y, w, h, r) {
+        if (typeof ctx.roundRect === 'function') { ctx.roundRect(x, y, w, h, r); return; }
+        var rr = Math.min(r, w / 2, h / 2);
+        if (rr < 0) rr = 0;
+        ctx.moveTo(x + rr, y);
+        ctx.lineTo(x + w - rr, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+        ctx.lineTo(x + w, y + h - rr);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+        ctx.lineTo(x + rr, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+        ctx.lineTo(x, y + rr);
+        ctx.quadraticCurveTo(x, y, x + rr, y);
+        ctx.closePath();
+    },
+
+    _supportsLineDash: function (ctx) {
+        return typeof ctx.setLineDash === 'function';
+    },
+
+    _drawGrid: function (ctx, pad, plotW, plotH, ticks, fmt, maxV, minV) {
+        ctx.strokeStyle = this.colors.grid;
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.lineWidth = 1;
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        var range = (maxV - minV) || 1;
+        for (var i = 0; i < ticks.length; i++) {
+            var v = ticks[i];
+            var gy = pad.t + (1 - (v - minV) / range) * plotH;
+            ctx.beginPath();
+            ctx.moveTo(pad.l, gy);
+            ctx.lineTo(pad.l + plotW, gy);
+            ctx.stroke();
+            ctx.fillText(fmt(v), pad.l - 4, gy);
+        }
+        ctx.textAlign = 'left';
+    },
+
+    _drawTimeLabels: function (ctx, pts, pad, plotW, plotH) {
+        ctx.fillStyle = this.colors.textMuted;
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textBaseline = 'top';
+        ctx.textAlign = 'left';
+        ctx.fillText(this._fmtClock(pts.tMin), pad.l, pad.t + plotH + 6);
+        ctx.textAlign = 'right';
+        ctx.fillText(this._fmtClock(pts.tMax), pad.l + plotW, pad.t + plotH + 6);
+        ctx.textAlign = 'left';
+    },
+
+    _normalizePoints: function (history, key) {
+        var list = [];
+        var tMin = 1e18, tMax = -1e18;
+        for (var i = 0; i < history.length; i++) {
+            var row = history[i];
+            if (!row) continue;
+            var t = row.t != null ? row.t : (row.timestamp != null ? row.timestamp : i);
+            var v = row[key];
+            if (v == null && key === 'soc') v = row.socPercent;
+            if (v == null) continue;
+            list.push({ t: t, soc: v, charging: row.charging || row.is_charging || row.isCharging });
+            if (t < tMin) tMin = t;
+            if (t > tMax) tMax = t;
+        }
+        return { list: list, tMin: tMin, tMax: tMax };
+    },
+
+    // ==================== FORMAT / DOM HELPERS ====================
+
+    _money: function (v) {
+        if (v == null) return '--';
+        var sym = this.currency || '$';
+        return sym + v.toFixed(2);
+    },
+
+    _dist: function (km) {
+        if (window.BYD && BYD.units && typeof BYD.units.dist === 'function') return BYD.units.dist(km);
+        return Math.round(km) + ' km';
+    },
+
+    _fmtDuration: function (minutes) {
+        if (minutes == null) return '--';
+        var m = Math.round(minutes);
+        if (m < 60) return m + ' min';
+        var h = Math.floor(m / 60);
+        return h + 'h ' + (m % 60) + 'm';
+    },
+
+    _fmtDate: function (ts) {
+        if (!ts) return '';
+        try {
+            var d = new Date(ts);
+            return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+                   d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        } catch (e) { return ''; }
+    },
+
+    _fmtClock: function (ts) {
+        try {
+            var d = new Date(ts);
+            return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        } catch (e) { return ''; }
+    },
+
+    // Date-only label (MMM D) for day-scale stats charts (SOH trend, cost bars).
+    _fmtDay: function (ts) {
+        if (!ts) return '';
+        try {
+            return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        } catch (e) { return ''; }
+    },
+
+    // Classify a session into a SOTA charge tier: 'dc' (DC fast), 'fast'
+    // (AC wallbox), 'slow' (AC trickle), or 'unk'. DC is normally authoritative
+    // from the gun state; AC is split by peak power. The AC fast/slow cut is 7.2 kW
+    // (NOT 7.0): a 7.4 kW single-phase wallbox under load reads ~7 kW and should be
+    // "fast", but a 6-7 kW charge should stay "slow" — a hard 7.0 boundary made
+    // a 6.x kW charge flicker to "fast" on a transient peak.
+    AC_FAST_KW: 7.2,
+    DC_KW: 25,
+    // Minimum peak a real DC-fast session must reach. DC fast-charging is
+    // fundamentally a high-power process (BYD DC ramps well past 25 kW); a session
+    // whose measured peak never got near this is physically NOT DC fast, whatever
+    // the gun-state flag says. Guards against a HAL gun-state misread (observed:
+    // a PHEV AC charge at ~1.7 kW / ~7 kW peak recorded gun=3 → is_dc=1 → labelled
+    // "DC fast"). We require peak ≥ 15 kW to honour a DC flag — comfortably above
+    // any AC wallbox (≤22 kW 3-phase, but a PHEV/single-phase tops out ~7-11) yet
+    // well below a genuine DC session's sustained rate, so a real DC charge that
+    // momentarily reads low at the very start isn't misdemoted once it ramps.
+    DC_MIN_PEAK_KW: 15,
+    _typeKind: function (s) {
+        if (!s) return 'unk';
+        var peak = (s.peakPower != null && s.peakPower > 0) ? s.peakPower : 0;
+        // Honour a DC gun flag ONLY if the peak is physically consistent with DC.
+        // A DC flag with a sub-DC peak is a gun-state misread — fall through to the
+        // power-based AC split instead of blindly showing "DC fast".
+        if ((s.isDc === true && peak >= this.DC_MIN_PEAK_KW) || peak >= this.DC_KW) return 'dc';
+        if (s.isDc === false) return peak >= this.AC_FAST_KW ? 'fast' : 'slow';
+        // DC flag but implausibly-low peak, or unknown gun state — bucket by power
+        // so old/partial rows and misread-gun rows still classify sensibly.
+        if (peak >= this.DC_KW) return 'dc';
+        if (peak >= this.AC_FAST_KW) return 'fast';
+        if (peak > 0) return 'slow';
+        return 'unk';
+    },
+
+    _typeLabel: function (s) {
+        var k = this._typeKind(s);
+        if (k === 'dc')   return this._t('charge.type_dc', 'DC fast');
+        if (k === 'fast') return this._t('charge.type_fast', 'AC fast');
+        if (k === 'slow') return this._t('charge.type_slow', 'AC slow');
+        return this._t('charge.type_unknown', 'Charge');
+    },
+
+    // SOTA per-tier glyph (inline SVG paths, stroke-based to match the app icons).
+    _typeIcon: function (kind) {
+        if (kind === 'dc') {
+            // Double bolt = DC fast.
+            return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2 L3 13 h5 l-1 9 6-11 H8 z"/><path d="M19 2 l-4 7"/><path d="M21 11 l-3 5"/></svg>';
+        }
+        if (kind === 'fast') {
+            // Single bolt = AC fast (wallbox).
+            return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/></svg>';
+        }
+        if (kind === 'slow') {
+            // Plug = AC slow (trickle).
+            return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v5M15 2v5"/><path d="M6 7h12v3a6 6 0 0 1-12 0z"/><path d="M12 16v6"/></svg>';
+        }
+        return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/></svg>';
+    },
+
+    // Map-pin glyph for the location chip.
+    _pinIcon: function () {
+        return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-6-5.5-6-10a6 6 0 0 1 12 0c0 4.5-6 10-6 10z"/><circle cx="12" cy="11" r="2"/></svg>';
+    },
+
+    // Human location label for a session: place name if the geocoder resolved
+    // one, else rounded coordinates, else '' (chip hidden).
+    _locationLabel: function (s) {
+        if (s.placeLabel) return s.placeLabel;
+        if (s.lat != null && s.lng != null) {
+            return s.lat.toFixed(3) + ', ' + s.lng.toFixed(3);
+        }
+        return '';
+    },
+
+    // Minimal HTML escape for interpolated text (place names can contain & < >).
+    _esc: function (str) {
+        if (str == null) return '';
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    },
+
+    _rgba: function (color, alpha) {
+        // Accepts #rrggbb or rgb()/rgba(); returns rgba with the given alpha.
+        if (!color) return 'rgba(14,165,233,' + alpha + ')';
+        if (color.charAt(0) === '#') {
+            var hex = color.substring(1);
+            if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+            var r = parseInt(hex.substring(0, 2), 16);
+            var g = parseInt(hex.substring(2, 4), 16);
+            var b = parseInt(hex.substring(4, 6), 16);
+            if (isNaN(r) || isNaN(g) || isNaN(b)) return 'rgba(14,165,233,' + alpha + ')';
+            return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+        }
+        if (color.indexOf('rgba') === 0) return color.replace(/[\d.]+\s*\)$/, alpha + ')');
+        if (color.indexOf('rgb') === 0) return color.replace('rgb', 'rgba').replace(')', ',' + alpha + ')');
+        return color;
+    },
+
+    _t: function (key, fallback) {
+        if (window.BYD && BYD.i18n && typeof BYD.i18n.t === 'function') {
+            var v = BYD.i18n.t(key);
+            if (v) return v;
+        }
+        return fallback;
+    },
+
+    _toast: function (msg, type) {
+        if (window.BYD && BYD.utils && typeof BYD.utils.toast === 'function') BYD.utils.toast(msg, type || 'success');
+    },
+
+    _showSkeleton: function () {
+        var skel = document.getElementById('sessionListSkeleton');
+        if (skel) skel.style.display = '';
+    },
+    _hideSkeleton: function () {
+        var skel = document.getElementById('sessionListSkeleton');
+        if (skel) skel.style.display = 'none';
+    },
+
+    _setText: function (id, value) {
+        var el = document.getElementById(id);
+        if (el) el.textContent = (value == null ? '--' : value);
+    },
+    _setInput: function (id, value) {
+        var el = document.getElementById(id);
+        if (el) el.value = (value == null ? '' : value);
+    },
+    _setVal: function (id, value, isCheckbox) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        if (isCheckbox) el.checked = !!value;
+        else el.value = value;
+    },
+    _getChecked: function (id) {
+        var el = document.getElementById(id);
+        return el ? !!el.checked : false;
+    },
+    _getNum: function (id) {
+        var el = document.getElementById(id);
+        if (!el) return 0;
+        var n = parseFloat(el.value);
+        return isNaN(n) ? 0 : n;
+    },
+    _getStr: function (id) {
+        var el = document.getElementById(id);
+        return el ? (el.value || '') : '';
+    }
+};
+// CHARGING.init() is called from charging.html after BYD.i18n.init() resolves
+// (mirrors the trips.html boot order so the shared core/i18n are ready).

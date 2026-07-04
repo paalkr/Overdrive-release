@@ -332,6 +332,15 @@ class WebViewFragment : Fragment() {
     // with either the selected URIs or null on cancel.
     private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
 
+    // Single-flight guard for openEventByFilename: a deep-link tap that resolves
+    // slowly (the scan is a sync HTTP round-trip to a warming daemon) invites a
+    // second tap; without this each tap spawns a thread that navigates, pushing
+    // two player fragments or firing navigate() after the destination already
+    // moved. Set true on entry, cleared once navigation resolves. @Volatile:
+    // set on the worker's UI post, read on the UI thread in shouldOverride.
+    @Volatile
+    private var deepLinkInFlight = false
+
     // Picker launcher — registered in onCreate so it survives config changes.
     //
     // We use ACTION_GET_CONTENT (via ActivityResultContracts.GetContent) instead
@@ -847,15 +856,21 @@ class WebViewFragment : Fragment() {
                             val uri = android.net.Uri.parse(url)
                             val filter = uri.getQueryParameter("filter")
                             val file = uri.getQueryParameter("file")
-                            val bundle = android.os.Bundle().apply {
-                                if (filter != null) putString("filter", filter)
-                                if (file != null) putString("file", file)
+                            // A `file=` deep link (from a notification or the Log tab)
+                            // means "open THIS clip", not "show the list". The native
+                            // recordings fragment ignores the file arg, so resolve the
+                            // filename to its path and jump straight to the player.
+                            // Falls back to the recordings list if it can't be resolved
+                            // (deleted, still recording, or the daemon is warming up).
+                            if (!file.isNullOrBlank()) {
+                                openEventByFilename(file, filter)
+                            } else {
+                                val bundle = android.os.Bundle().apply {
+                                    if (filter != null) putString("filter", filter)
+                                }
+                                androidx.navigation.fragment.NavHostFragment.findNavController(this@WebViewFragment)
+                                    .navigate(R.id.recordingsFragment, bundle)
                             }
-                            // Route web-side "events" links to the unified Recordings page.
-                            // RecordingsFragment hosts RecordingLibraryFragment and will pick
-                            // up the `filter` / `file` arguments through saved-state if needed.
-                            androidx.navigation.fragment.NavHostFragment.findNavController(this@WebViewFragment)
-                                .navigate(R.id.recordingsFragment, bundle)
                         } catch (e: Exception) {
                             android.util.Log.e("WebView", "Failed to navigate to events: ${e.message}")
                         }
@@ -953,6 +968,82 @@ class WebViewFragment : Fragment() {
             // Native bridge for direct HTTP calls bypassing proxy
             addJavascriptInterface(ProxyBypassBridge(), "AndroidBridge")
         }
+    }
+
+    /**
+     * Resolve a recording filename (from a notification / Log-tab deep link) to
+     * its on-disk path and open it directly in the native video player. The
+     * scan does a synchronous HTTP fetch to the daemon, so it runs off the UI
+     * thread; navigation is posted back to the main thread.
+     *
+     * Falls back to the recordings LIST (pre-selecting the type tab via
+     * `filter`) when the clip can't be resolved — deleted, still being written
+     * (`.mp4.tmp`), or the daemon index is still warming up. This preserves the
+     * old behavior for those edge cases instead of dead-ending on a black
+     * player.
+     */
+    private fun openEventByFilename(filename: String, filter: String?) {
+        // Single-flight: ignore re-taps while a resolve is already running.
+        if (deepLinkInFlight) return
+        // Capture the activity ON THE UI THREAD (shouldOverrideUrlLoading runs
+        // here) — never read the Fragment.activity field from the worker.
+        val act = activity ?: return
+        val appCtx = act.applicationContext
+        deepLinkInFlight = true
+        Thread({
+            var match: com.overdrive.app.ui.model.RecordingFile? = null
+            try {
+                // One bounded re-scan: a freshly-fired notification can arrive
+                // before the daemon has indexed the clip (scan returns empty
+                // during warmup). Retry a couple of times before falling back,
+                // mirroring how events.js polls inflight.
+                var attempts = 0
+                while (attempts < 3) {
+                    val all = com.overdrive.app.ui.util.RecordingScanner.scanRecordings(appCtx)
+                    match = all.firstOrNull { it.file.name == filename }
+                    if (match != null || attempts == 2) break
+                    attempts++
+                    try { Thread.sleep(1200) } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt(); break
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("WebView", "openEventByFilename scan failed: ${e.message}")
+            }
+            val resolved = match
+            act.runOnUiThread {
+                try {
+                    // Guard against the fragment being torn down while we scanned.
+                    if (!isAdded || isDetached || view == null) return@runOnUiThread
+                    val nav = androidx.navigation.fragment.NavHostFragment
+                        .findNavController(this@WebViewFragment)
+                    if (resolved != null) {
+                        val bundle = android.os.Bundle().apply {
+                            putString(
+                                com.overdrive.app.ui.fragment.VideoPlayerFragment.ARG_VIDEO_PATH,
+                                resolved.file.absolutePath
+                            )
+                            putString(
+                                com.overdrive.app.ui.fragment.VideoPlayerFragment.ARG_VIDEO_TITLE,
+                                resolved.file.name
+                            )
+                        }
+                        nav.navigate(R.id.action_global_videoPlayer, bundle)
+                    } else {
+                        // Unresolved (deleted / still recording / daemon warming)
+                        // — open the list, pre-selecting the type tab via `filter`.
+                        val bundle = android.os.Bundle().apply {
+                            if (filter != null) putString("filter", filter)
+                        }
+                        nav.navigate(R.id.recordingsFragment, bundle)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("WebView", "openEventByFilename navigate failed: ${e.message}")
+                } finally {
+                    deepLinkInFlight = false
+                }
+            }
+        }, "OpenEventDeepLink").start()
     }
 
     /**

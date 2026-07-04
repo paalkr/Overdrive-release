@@ -24,7 +24,15 @@ BYD.stream = {
     ws: null,
     isFullscreen: false,
     currentViewMode: -1, // -1 = not selected
-    viewModeNames: ['All Cameras', 'Front', 'Right', 'Rear', 'Left'],
+    // Index aligns with /api/stream/view/{n}: 0=Mosaic, 1=Front, 2=Right,
+    // 3=Rear, 4=Left, 5=Raw (legacy debug pano strip), 6=OEM Dashcam.
+    // _viewModeName(mode) resolves to the localized label via i18n
+    // (stream.view_name_<n>) at toast/label-set time so a language
+    // switch doesn't strand a stale English string in the UI. The
+    // English literals live only in en.json.
+    _viewModeName(mode) {
+        return BYD.i18n.t('stream.view_name_' + mode);
+    },
     reconnectTimer: null,
     frameCount: 0,
     lastFrameTime: 0,
@@ -43,6 +51,70 @@ BYD.stream = {
     // Check WebCodecs support
     hasWebCodecs: typeof VideoDecoder !== 'undefined',
     
+    /**
+     * Poll /api/stream/view/{mode} until the backend returns a terminal
+     * response (success=true, or success=false without starting=true).
+     * Cadence is geometric so the head-unit doesn't burn 12 sequential
+     * RTTs on a slow cellular link. Returns the final response object.
+     */
+    async _pollViewUntilSettled(mode, initialResponse) {
+        // Token-based cancellation: if a second view-set is fired while
+        // an earlier poll is still running, the older poll observes the
+        // token mismatch and bails so the UI mutation race lands on the
+        // newer click. Mirrors recording.js _oemPollToken.
+        const token = (this._viewPollToken || 0) + 1;
+        this._viewPollToken = token;
+        const delays = [500, 1000, 2000, 3000, 4000];
+        let data = initialResponse;
+        let toastShown = false;
+        // Cancellation returns a {cancelled:true} sentinel, NOT the
+        // last fetched data. Callers that don't recognise the sentinel
+        // would otherwise read a stale {success:false,starting:true}
+        // and fire a false error toast / clear UI for a click that's
+        // no longer the user's intent.
+        for (let i = 0; i < delays.length; i++) {
+            if (this._viewPollToken !== token) return { cancelled: true };
+            await new Promise(r => setTimeout(r, delays[i]));
+            if (this._viewPollToken !== token) return { cancelled: true };
+            try {
+                const res = await fetch('/api/stream/view/' + mode);
+                data = await res.json();
+            } catch (e) { continue; }
+            if (this._viewPollToken !== token) return { cancelled: true };
+            if (data && data.success === true) break;
+            // Terminal failure (no `starting` flag) — bail immediately so the
+            // user sees the real error toast instead of waiting out the full
+            // 10.5s geometric backoff. `oem_unsupported` from a sticky
+            // lastStartError is the canonical case.
+            if (data && data.success === false && !data.starting) break;
+            if (!toastShown && data && data.success === false && data.starting) {
+                if (BYD.utils && BYD.utils.toast) {
+                    // Prefer backend-provided errorCode (oem_starting,
+                    // pano_starting, stream_starting) so the toast text
+                    // matches the actual gate that's still warming up.
+                    // Fall back to the mode-based heuristic for older
+                    // backends that don't emit errorCode on the starting
+                    // path.
+                    const key = (data.errorCode && typeof data.errorCode === 'string')
+                        ? 'stream.' + data.errorCode
+                        : (mode === 6 ? 'stream.oem_starting' : 'stream.pano_starting');
+                    BYD.utils.toast(BYD.i18n.t(key), 'info');
+                }
+                toastShown = true;
+            }
+        }
+        // Augment the returned data so the caller can distinguish
+        // "polling exhausted while still in starting state" from
+        // "backend rejected the view mode". Without this flag the
+        // caller would toast "view unavailable" on a slow-pipeline
+        // timeout, which is inaccurate (the mode IS available, the
+        // backend just didn't settle within the geometric window).
+        if (data && data.success !== true && data.starting === true) {
+            data = Object.assign({}, data, { exhausted: true });
+        }
+        return data;
+    },
+
     /**
      * Set quality before streaming starts
      */
@@ -206,13 +278,13 @@ BYD.stream = {
             // Set up callbacks
             this.sotaPlayer.onConnected = () => {
                 console.log('[Stream] WebCodecs connected');
-                this.updateStreamStatus('Live', true);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Stream connected (WebCodecs)', 'success');
+                this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
+                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.connected_webcodecs'), 'success');
             };
-            
+
             this.sotaPlayer.onDisconnected = (code) => {
                 console.log('[Stream] WebCodecs disconnected:', code);
-                this.updateStreamStatus('Disconnected', false);
+                this.updateStreamStatus(BYD.i18n.t('stream.disconnected'), false);
             };
             
             this.sotaPlayer.onFrame = (count) => {
@@ -420,8 +492,8 @@ BYD.stream = {
             this.ws.onopen = () => {
                 console.log('[Stream] Connected');
                 this.frameCount = 0;
-                this.updateStreamStatus('Live', true);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Stream connected', 'success');
+                this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
+                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.connected'), 'success');
             };
             
             this.ws.onmessage = (event) => {
@@ -441,7 +513,7 @@ BYD.stream = {
             this.ws.onclose = (event) => {
                 console.log('[Stream] Closed:', event.code);
                 this.ws = null;
-                this.updateStreamStatus('Disconnected', false);
+                this.updateStreamStatus(BYD.i18n.t('stream.disconnected'), false);
                 
                 if (!this.reconnectTimer && this.streamStarted) {
                     this.reconnectTimer = setTimeout(() => {
@@ -496,51 +568,93 @@ BYD.stream = {
      */
     async startStream() {
         this.streamStarted = true;
-        
-        // Hide placeholder, show overlay
+
+        // Optimistic UI mutations — Connecting overlay shows during the
+        // multi-second view-mode poll. Both abandon paths (cancellation
+        // by a newer poll, and validated-rejection) MUST restore the
+        // prior state via abandonAndRestore() — pre-fix the cancellation
+        // path returned without undoing these, leaving the user with a
+        // permanent "Connecting..." spinner.
         const placeholder = document.getElementById('placeholder');
         const overlay = document.getElementById('streamOverlay');
         if (placeholder) placeholder.style.display = 'none';
         if (overlay) overlay.style.display = 'flex';
-        
+
         // Show connecting state immediately
-        this.updateStreamStatus('Connecting...', false);
-        
+        this.updateStreamStatus(BYD.i18n.t('stream.connecting'), false);
+
         // Update view label
         const viewLabel = document.getElementById('viewLabel');
-        if (viewLabel) viewLabel.textContent = this.viewModeNames[this.currentViewMode] || 'Camera';
-        
+        if (viewLabel) viewLabel.textContent = this._viewModeName(this.currentViewMode) || BYD.i18n.t('stream.camera');
+
         // Update mini selector
         this.updateCarSelector(this.currentViewMode);
-        
+
         // Sync quality selector with preset
         const qualitySelect = document.getElementById('qualitySelect');
         if (qualitySelect) qualitySelect.value = this.selectedQuality;
-        
-        // Enable streaming on server
+
+        const abandonAndRestore = () => {
+            this.streamStarted = false;
+            this.currentViewMode = -1;
+            if (viewLabel) viewLabel.textContent = '';
+            if (placeholder) placeholder.style.display = 'flex';
+            if (overlay) overlay.style.display = 'none';
+        };
+
+        // Validate view mode FIRST — before spinning up the server-side
+        // streaming encoder. Pre-fix this happened AFTER enableStreaming,
+        // so a backend rejection of the view-mode (e.g. view 6 with no
+        // OEM stream-routing hook) left the encoder running with no
+        // consumer until the next start or a manual disable. Mirrors
+        // the live-view.html flow which already validates first.
+        if (this.currentViewMode >= 0) {
+            try {
+                let res = await fetch('/api/stream/view/' + this.currentViewMode);
+                let data = await res.json();
+                if (data && data.success === false && data.starting) {
+                    data = await this._pollViewUntilSettled(this.currentViewMode, data);
+                }
+                // Cancelled by a newer poll — restore the placeholder so
+                // the Connecting overlay doesn't strand on cancellation.
+                if (data && data.cancelled) {
+                    abandonAndRestore();
+                    return;
+                }
+                if (data && data.success === false) {
+                    if (BYD.utils && BYD.utils.toast) {
+                        // exhausted=true means the geometric poll ran
+                        // out of attempts while the backend was still
+                        // in the starting=true state. That's a startup
+                        // timeout, not a view-mode rejection.
+                        const fallback = data.exhausted
+                            ? BYD.i18n.t('stream.start_timeout')
+                            : BYD.i18n.t('stream.view_unavailable');
+                        BYD.utils.toast(data.error || fallback, 'error');
+                    }
+                    abandonAndRestore();
+                    return;
+                }
+            } catch (e) {}
+        }
+
+        // Enable streaming on server (only after view-mode is validated)
         const enabled = await this.enableStreaming();
         if (!enabled) {
-            if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Failed to enable streaming', 'error');
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.enable_failed'), 'error');
             return;
         }
-        
+
         // Apply preset quality
         try {
             await fetch('/api/stream/quality/' + this.selectedQuality, { method: 'POST' });
         } catch (e) {}
         
-        // Set view mode on server
-        if (this.currentViewMode >= 0) {
-            try {
-                await fetch('/api/stream/view/' + this.currentViewMode);
-            } catch (e) {}
-        }
-        
         await new Promise(r => setTimeout(r, 300));
         
         const decoderReady = await this.initDecoder();
         if (!decoderReady) {
-            if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Decoder init failed', 'error');
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.decoder_failed'), 'error');
             return;
         }
         
@@ -634,20 +748,45 @@ BYD.stream = {
     async setViewMode(mode) {
         const btn = document.getElementById('vm' + mode);
         if (btn) btn.classList.add('loading');
-        
+
         try {
-            const res = await fetch('/api/stream/view/' + mode);
-            const data = await res.json();
-            
+            let res = await fetch('/api/stream/view/' + mode);
+            let data = await res.json();
+            if (data && data.success === false && data.starting) {
+                data = await this._pollViewUntilSettled(mode, data);
+            }
+            // Cancelled by a newer click — drop the loading spinner
+            // and exit without mutating UI label / current view.
+            if (data && data.cancelled) {
+                if (btn) btn.classList.remove('loading');
+                return;
+            }
+
             if (data.success) {
                 this.currentViewMode = mode;
                 this.updateCarSelector(mode);
-                
                 const viewLabel = document.getElementById('viewLabel');
-                if (viewLabel) viewLabel.textContent = this.viewModeNames[mode] || 'Camera';
-                
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(this.viewModeNames[mode], 'info');
+                const label = this._viewModeName(mode) || BYD.i18n.t('stream.camera');
+                if (viewLabel) viewLabel.textContent = label;
+                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(label, 'info');
             } else {
+                if (BYD.utils && BYD.utils.toast) {
+                    // Prefer i18n key from errorCode; fall back to the
+                    // exhausted-vs-rejection-aware localized fallback so
+                    // a startup timeout doesn't get mis-toasted as
+                    // "view mode unavailable".
+                    let msg;
+                    if (data.errorCode) {
+                        msg = BYD.i18n.t('stream.' + data.errorCode);
+                    } else if (data.error) {
+                        msg = data.error;
+                    } else {
+                        msg = data.exhausted
+                            ? BYD.i18n.t('stream.start_timeout')
+                            : BYD.i18n.t('stream.view_unavailable');
+                    }
+                    BYD.utils.toast(msg, 'error');
+                }
                 if (btn) btn.classList.remove('loading');
             }
         } catch (e) {
@@ -666,13 +805,19 @@ BYD.stream = {
             const data = await res.json();
             if (data.success) {
                 const displayName = data.displayName || quality;
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Quality: ' + displayName, 'info');
+                if (BYD.utils && BYD.utils.toast) {
+                    // {name}-templated so locales that need a different
+                    // separator/word-order can encode it inline rather
+                    // than relying on a trailing space getting dropped.
+                    const tmpl = BYD.i18n.t('stream.quality_set');
+                    BYD.utils.toast(tmpl.replace('{name}', displayName), 'info');
+                }
                 // Server restarts encoder with new resolution — the existing WebSocket
                 // connection will receive new SPS/PPS and the decoder handles it automatically
             }
         } catch (e) {
             console.error('[Stream] Set quality error:', e);
-            if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Failed to set quality', 'error');
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.quality_failed'), 'error');
         }
     },
     

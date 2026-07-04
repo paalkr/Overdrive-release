@@ -796,6 +796,9 @@ public class BydDataCollector {
      */
     private static final double ENGINE_POWER_CHARGING_DEADBAND = 0.3;
 
+    /** Throttle for the collectEngine power-resolution diagnostic (1/min). */
+    private long lastEnginePowerLogMs = 0;
+
     /** Called by CameraDaemon when ACC state changes. Adjusts poll rate accordingly. */
     public void setAccState(boolean isOn) {
         boolean wasOn = this.accIsOn;
@@ -931,6 +934,15 @@ public class BydDataCollector {
         // Extended data consumed by ABRP/MQTT/trips
         collectStatisticExtended(b);   // SOH, driving time, key battery
         collectInstrumentExtended(b);  // cabin temp, trip data, consumption
+        // Charging rest time (time-to-full) HAL fallback. The primary feature-ID
+        // read lives in collectInstrument() above, but many trims/firmware leave
+        // those instrument IDs at 255/not-available while charging — so the
+        // dashboard "Time to full" stayed blank because the chargingDevice
+        // getChargingRestTime() fallback only ran once at init (collectAllFull).
+        // Run it every poll here so a live charge populates rest time. The method
+        // self-guards on chargingRestTimeHours==UNAVAILABLE, so it only fills the
+        // gap and never clobbers a good feature-ID value.
+        collectChargingExtended(b);    // charging rest time (fallback)
 
         // Key proximity probe — runs every poll (ACC on or off) so we keep observing
         // fob state across the parked-charging window and any "approach unlock" event.
@@ -1020,6 +1032,57 @@ public class BydDataCollector {
         com.overdrive.app.monitor.ChargingDetector.getInstance()
             .updatePollEvidence(built, gearNow,
                 com.overdrive.app.monitor.GearMonitor.GEAR_P);
+
+        // Feed the ring-buffer power estimator (FALLBACK power source for models
+        // that report no direct/external charging power). It accumulates ONLY
+        // while the fused detector says CHARGING and the car is in Park, and only
+        // from a rising charge-energy counter — so regen (gear D/R) and V2L
+        // discharge can never produce a phantom reading. See ChargingPowerEstimator.
+        try {
+            boolean fusedCharging =
+                com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging();
+            boolean inPark = (gearNow == com.overdrive.app.monitor.GearMonitor.GEAR_P);
+            // SOC-derived energy = SOC × nominal × SOH. The SOC gauge is the ONE
+            // signal that reliably tracks charging on every drivetrain, and it's the
+            // estimator's PREFERRED source now: on PHEV the hardware energy getters
+            // lie (getBatteryRemainPowerEV=0, getBatteryPowerHEV constant,
+            // getRemainingBatteryPower FREEZES for tens of minutes while charging),
+            // and externalChargingPower reports the EVSE's rated capacity, not the
+            // real draw — so SOC-rate is the only truthful charging power on those
+            // trims. NaN when SOC or nominal isn't known yet, so the estimator falls
+            // back to the remain/cap counters exactly as before.
+            // PHEV ONLY. Pass raw SOC% + the SOC→energy scale (nominal × SOH); the
+            // estimator FREEZES the scale at session start so socE moves only with
+            // SOC, not with mid-charge SohEstimator revisions. On BEV we pass
+            // socScaleKwh = NaN so the estimator's socE stays NaN and behaves EXACTLY
+            // as before (remain-first): the BEV's remainKwh is verified full-scale and
+            // finer-grained than the 1%-quantised SOC, so the BEV fix must not regress.
+            // Only PHEV — whose hardware energy counters freeze/lie during charge —
+            // needs the SOC-derived source.
+            double socPctForEst = built.socPercent;
+            double socScaleKwh = Double.NaN;
+            if (isPhev(built)) {
+                try {
+                    com.overdrive.app.abrp.SohEstimator soh =
+                        com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
+                    double nominal = (soh != null) ? soh.getNominalCapacityKwh() : 0;
+                    if (nominal > 0) {
+                        double sohFrac = (soh != null && soh.hasDisplaySoh())
+                            ? soh.getDisplaySoh() / 100.0 : 1.0;
+                        if (sohFrac <= 0) sohFrac = 1.0;
+                        socScaleKwh = nominal * sohFrac;
+                    }
+                } catch (Throwable ignored) { /* leave NaN → estimator uses remain/cap */ }
+            }
+            com.overdrive.app.monitor.ChargingPowerEstimator.getInstance().sample(
+                System.currentTimeMillis(),
+                built.chargingCapacityKwh,
+                built.remainKwh,
+                socPctForEst, socScaleKwh,
+                fusedCharging, inPark);
+        } catch (Exception e) {
+            logger.info("ChargingPowerEstimator.sample failed: " + e.getMessage());
+        }
     }
 
     /**
@@ -1584,6 +1647,17 @@ public class BydDataCollector {
             //   - On most models: kW (range roughly -200..400)
             //   - On some models: deciwatts × 10 (raw > 100 → scale ×0.1)
             // Range-check excludes sentinels (BMS_UNAVAILABLE etc.) and bogus values.
+            //
+            // IMPORTANT: the builder is seeded from the PREVIOUS snapshot
+            // (toBuilder()), so b.enginePowerKw already carries last cycle's
+            // value and is almost never NaN. The typed-getter fallback below must
+            // therefore NOT gate on isNaN — that would lock the getter out forever
+            // once any read succeeds, and the value would freeze ("correct but
+            // stuck") on every cycle the flaky feature-ID read returns null.
+            // Track whether THIS cycle wrote a live value instead.
+            boolean powerWritten = false;
+            String powerSource = "carry-forward";
+            double powerRaw = Double.NaN;
             try {
                 Object val = BydDeviceHelper.callGet(engineDevice, BydFeatureIds.ENGINE_POWER, Double.class);
                 if (val != null) {
@@ -1591,18 +1665,45 @@ public class BydDataCollector {
                     if (!Double.isNaN(raw) && raw >= -200.0 && raw <= 400.0) {
                         double kw = (Math.abs(raw) > 100.0) ? raw * 0.1 : raw;
                         b.enginePowerKw(kw);
+                        powerWritten = true;
+                        powerSource = "featureId";
+                        powerRaw = raw;
                     }
                 }
             } catch (Exception e) {
                 logger.debug("collectEngine enginePower feature ID error: " + e.getMessage());
             }
-            // Fallback to typed getter if feature ID didn't populate
-            if (Double.isNaN(b.enginePowerKw)) {
+            // Fallback to typed getter whenever the feature-ID read did NOT write a
+            // fresh value THIS cycle — a live re-read that keeps the value tracking
+            // instead of freezing on the carried-forward number.
+            if (!powerWritten) {
                 Object power = BydDeviceHelper.callGetter(engineDevice, "getEnginePower");
                 if (power instanceof Number) {
                     double kw = ((Number) power).doubleValue();
-                    if (kw >= -200.0 && kw <= 400.0) b.enginePowerKw(kw);
+                    // ACC-OFF sign gate (mirrors the listener path): with the key
+                    // removed the only plausible engine-power direction is current
+                    // INTO the pack (kw < 0, plug-in charging). Positive readings
+                    // are stale ECU residue — reject so this fresh-read path can't
+                    // feed the ChargingDetector a spurious "engine running" value.
+                    boolean accOffReject = !accIsOn && kw > -ENGINE_POWER_CHARGING_DEADBAND;
+                    if (kw >= -200.0 && kw <= 400.0 && !accOffReject) {
+                        b.enginePowerKw(kw);
+                        powerWritten = true;
+                        powerSource = "getter";
+                        powerRaw = kw;
+                    }
                 }
+            }
+            // Diagnostic (throttled 1/min, INFO so it lands in default captures):
+            // confirms the value is refreshing each poll and which source won. If
+            // this logs source=carry-forward repeatedly while driving, BOTH live
+            // reads are missing and the value is genuinely stuck at the HAL layer.
+            long powerNow = System.currentTimeMillis();
+            if (powerNow - lastEnginePowerLogMs > 60_000L) {
+                lastEnginePowerLogMs = powerNow;
+                logger.info(String.format(java.util.Locale.US,
+                    "enginePower resolved=%.2fkW source=%s raw=%.1f",
+                    b.enginePowerKw, powerSource, powerRaw));
             }
 
             // Front motor speed (negated)
@@ -1944,6 +2045,13 @@ public class BydDataCollector {
                     || b.chargingState == 4 || b.chargingState == 12) {
                 b.chargingPowerKw(Double.NaN);
                 b.externalChargingPowerKw(Double.NaN);
+                // chargePowerKw is now the TOP priority in getChargingState()'s
+                // cascade, so a leftover value would surface a phantom power after
+                // the session ends. Clear it with its siblings. (getChargePower()
+                // also returns ~359 garbage when idle, but the >0.1 && <=300 gate
+                // at the read/use sites already rejects that; this kills a stale
+                // in-band value, e.g. the last real rate before the gun came out.)
+                b.chargePowerKw(Double.NaN);
             }
 
             // Charging mode — getChargingMode() raw value (AC vs DC vs wireless, model-specific).
@@ -2162,6 +2270,17 @@ public class BydDataCollector {
             // Charging rest time via instrument feature IDs (primary path)
             // Fallback to chargingDevice.getChargingRestTime() is in collectChargingExtended()
             // Validates: 255 = not available, hours 0-23, minutes 0-59
+            //
+            // CRITICAL: reset to UNAVAILABLE FIRST so this value RE-DERIVES every poll.
+            // The builder carries the previous snapshot forward via toBuilder(), and the
+            // fallback in collectChargingExtended() self-guards on `== UNAVAILABLE` — so
+            // without this reset the FIRST rest-time reading of a session would latch and
+            // never count down (the "Time to full stuck / not updating" bug). Clearing
+            // here lets both the feature-ID path (below) and the fallback re-populate a
+            // FRESH value each cycle; feature-ID priority is preserved because it runs
+            // first and the fallback only fills when this is still UNAVAILABLE.
+            b.chargingRestTimeHours(BydVehicleData.UNAVAILABLE);
+            b.chargingRestTimeMinutes(BydVehicleData.UNAVAILABLE);
             try {
                 Object hourVal = BydDeviceHelper.callGet(instrumentDevice,
                         BydFeatureIds.INSTRUMENT_CHARGING_CHARGE_REST_HOUR_DD, Integer.class);
@@ -3382,8 +3501,10 @@ public class BydDataCollector {
     }
 
     /**
-     * Extended charging data: charging rest time.
-     * Called from collectAllFull() only (display-only, on-demand).
+     * Extended charging data: charging rest time (time-to-full).
+     * Called from collectAll() (every poll, so a live charge keeps it fresh)
+     * and collectAllFull(). Acts as the fallback when the instrument feature-ID
+     * read in collectInstrument() leaves rest time UNAVAILABLE.
      */
     private void collectChargingExtended(BydVehicleData.Builder b) {
         if (chargingDevice == null) return;
@@ -3853,9 +3974,6 @@ public class BydDataCollector {
         // Actual data is read on-demand via collectAllFull().
     }
 
-    // Throttle for generic listener callbacks (StatisticDevice fires at ~10Hz on CAN bus)
-    private volatile long lastGenericCallbackTime = 0;
-
     private void onGenericCallback(String method, Object[] args) {
         // Typed callbacks for real-time updates
         if ("onElecPercentageChanged".equals(method) && args != null && args.length > 0) {
@@ -3941,10 +4059,38 @@ public class BydDataCollector {
             return;
         }
 
-        // HV pack voltage is NOT read from the onDataEventChanged stream anymore.
-        // Event 1151336480 (formerly parsed as pack voltage in decivolts) under-reports on the
-        // Seal 82.5 kWh trim — it tracks only ~149 cells' worth (~494 V vs the true ~570 V).
-        // Pack voltage is now derived from per-cell voltage × series count in collectStatistic().
+        // HV pack voltage DISPLAY value is no longer taken from this event — it
+        // under-reports on the Seal 82.5 trim (~494 V vs true ~570 V), so the shown
+        // hvPackVoltage is derived from per-cell voltage × series count in
+        // collectStatistic() instead (PR-125).
+        //
+        // BUT we still route the raw event into CAPACITY DETECTION only. That
+        // derivation needs the series cell count, which needs the capacity — a
+        // chicken-and-egg that leaves capacity unknown on models with no other
+        // detection source (no user model, getBatteryCapacity()=0, SOC-ratio
+        // unavailable, unknown ro.product.model, BMS-fuzzy miss). This event is the
+        // ONLY independent pack-level voltage on those trims, and even an
+        // under-reading value is enough for autoDetectFromPackVoltage() to SNAP to
+        // the nearest known BYD pack. It self-guards: no-op once capacity is known
+        // or the user set a model, so it never fights PR-125's accurate display
+        // value or a user override. We do NOT write hvPackVoltage here (keeping the
+        // accurate cell×count value authoritative for display/SOH math).
+        if ("onDataEventChanged".equals(method) && args != null && args.length >= 2) {
+            try {
+                int eventId = ((Number) args[0]).intValue();
+                if (eventId == 1151336480) {
+                    int iVal = BydDeviceHelper.getIntValue(args[1]);
+                    if (iVal > 2000 && iVal < 9000) {       // decivolts: 200.0–900.0 V
+                        double volts = iVal / 10.0;
+                        com.overdrive.app.abrp.SohEstimator soh =
+                            com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
+                        if (soh != null && !(soh.getNominalCapacityKwh() > 0)) {
+                            soh.autoDetectFromPackVoltage(volts, snapshot.get());
+                        }
+                    }
+                }
+            } catch (Exception ignored) { /* diagnostic-only path; never disrupt collection */ }
+        }
     }
 
     /**
@@ -4750,6 +4896,41 @@ public class BydDataCollector {
 
         windowMotionTasks[areaIdx] = getWindowExecutor(areaIdx).submit(task);
         return true;
+    }
+
+    // --- Door lock state ---
+
+    /** Driver's-door lock states from {@code BYDAutoOtaDevice.getLFDoorLockState}. */
+    public static final int DOOR_STATE_INVALID = 0;
+    public static final int DOOR_STATE_UNLOCK = 1;
+    public static final int DOOR_STATE_LOCK = 2;
+
+    /**
+     * Read the driver's-door (LF) lock state via the OTA device.
+     *
+     * <p>This is the same local rail AccSentry/CameraDaemon use
+     * ({@code BYDAutoOtaDevice.getLFDoorLockState}) — it works ACC=OFF with
+     * sub-second latency on DiLink 3.0. The legacy
+     * {@code BYDAutoDoorLockDevice.getDoorLockStatus(area)} path returns
+     * INVALID to user-UID processes on every field firmware and is not used.
+     *
+     * @return {@link #DOOR_STATE_INVALID}(0), {@link #DOOR_STATE_UNLOCK}(1),
+     *         or {@link #DOOR_STATE_LOCK}(2).
+     */
+    public int readDoorLockState() {
+        if (otaDevice == null) return DOOR_STATE_INVALID;
+        try {
+            Object v = BydDeviceHelper.callGetter(otaDevice, "getLFDoorLockState");
+            if (v instanceof Number) {
+                int state = ((Number) v).intValue();
+                if (state == DOOR_STATE_UNLOCK || state == DOOR_STATE_LOCK) {
+                    return state;
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("readDoorLockState error: " + e.getMessage());
+        }
+        return DOOR_STATE_INVALID;
     }
 
     // --- Tailgate ---

@@ -88,6 +88,34 @@ public final class BatteryVoltageMonitorV2 {
 
     private BatteryVoltageMonitorV2() {}
 
+    /**
+     * "Keep USB powered while parked" toggle (surveillance.keepUsbPowerOnAccOff,
+     * default true). Mirrors {@code AccSentryDaemon.isKeepUsbPowerOnAccOff()}
+     * EXACTLY — same key, same safe-default-true on any read failure — so the
+     * two subsystems can never disagree about the user's intent. Read fresh on
+     * each sleep decision (cheap, mtime-gated loadConfig; the value can't change
+     * mid-park anyway since the daemon reads it once at ACC-OFF setup).
+     *
+     * <p>WHY THIS GATES MCU SLEEP: on the affected hardware the USB-bridged SD
+     * reader's power rail follows the MCU/AP wake state. When the user asks to
+     * keep USB powered, this monitor MUST NOT issue its voltage-driven MCU sleep
+     * (the healthy-battery {@code doMcuSleep} path) — doing so drops USB/SD power
+     * ~15 min into a park even though the toggle is ON. This restored the
+     * pre-v22.2 behaviour where parked USB/SD stayed powered. The low-voltage
+     * {@link #forceWake} recovery and the separate {@code SocCutoffMonitor}
+     * (&le;10% SoC) remain the battery-safety floor regardless of this toggle.
+     */
+    private static boolean isKeepUsbPowerOnAccOff() {
+        try {
+            org.json.JSONObject s = com.overdrive.app.config.UnifiedConfigManager.loadConfig()
+                    .optJSONObject("surveillance");
+            if (s == null) return true;
+            return s.optBoolean("keepUsbPowerOnAccOff", true);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     public static synchronized void startMonitor(Context context) {
         if (running) {
             logger.info("startMonitor: already running");
@@ -191,6 +219,20 @@ public final class BatteryVoltageMonitorV2 {
     }
 
     private static void scheduleDeferredMcuSleep() {
+        // Keep-USB-powered gate. When the user opted to keep USB powered while
+        // parked, we never schedule the healthy-battery MCU sleep — that sleep
+        // would drop the USB/SD rail. The low-voltage forceWake() path and the
+        // SoC cutoff monitor still protect the 12V battery. Read fresh so a
+        // toggle flip on a later ACC-OFF cycle takes effect.
+        if (isKeepUsbPowerOnAccOff()) {
+            // Cancel any sleep already armed from before the toggle was read
+            // (defensive — the value can't change mid-park, but a pending
+            // message from a prior tick must not survive).
+            if (handler != null) handler.removeMessages(MSG_DEFERRED_MCU_SLEEP);
+            logger.info("scheduleDeferredMcuSleep: SUPPRESSED — Keep-USB-powered is ON "
+                    + "(MCU stays awake so USB/SD rail holds; low-voltage recovery + SoC cutoff still active)");
+            return;
+        }
         if (!isWakeupMcu) {
             // We already issued a sleep request this session — don't re-issue
             // until {@link #forceWake} flips the flag back to true.
@@ -211,6 +253,16 @@ public final class BatteryVoltageMonitorV2 {
 
     private static void doMcuSleep() {
         if (!running) return;
+        // Belt-and-suspenders to scheduleDeferredMcuSleep's gate: if a sleep
+        // message was already queued before the toggle was evaluated (e.g. a
+        // tick that fired in the 35s window before this monitor started), do
+        // NOT execute it while Keep-USB-powered is ON. The scheduling gate
+        // normally prevents us reaching here, but a queued message must also
+        // be honoured at execution time so the USB/SD rail is never dropped.
+        if (isKeepUsbPowerOnAccOff()) {
+            logger.info("doMcuSleep: SKIPPED — Keep-USB-powered is ON (queued sleep cancelled at execution)");
+            return;
+        }
         boolean ok = McuPowerHal.requestMcuSleep();
         // sentry-mode mirror — sleep variant
         boolean sentryOk = McuPowerHal.requestSentrySleep();

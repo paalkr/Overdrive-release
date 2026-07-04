@@ -75,6 +75,20 @@ public final class NominatimRateLimiter {
     }
 
     /**
+     * Non-consuming probe: true iff a {@link #tryAcquire()} right now WOULD be
+     * refused (persisted cooldown active, or the 1 s token not yet available).
+     * Does NOT advance the token clock. Used by the backfill sweep to tell a
+     * THROTTLE miss (transient — retry next tick) from a genuine empty-address
+     * miss (mark for cooldown), so a merely rate-limited resolvable clip is not
+     * wrongly pinned. Best-effort racy vs a concurrent tryAcquire; the failure
+     * mode is symmetric and harmless (at worst one extra cheap attempt later).
+     */
+    public static synchronized boolean isThrottled() {
+        if (readCooldownUntilMs() > System.currentTimeMillis()) return true;
+        return System.nanoTime() < nextTokenAtNs;
+    }
+
+    /**
      * Record a Nominatim success. Resets the failure streak so the next
      * transient failure starts at the shortest backoff again.
      */

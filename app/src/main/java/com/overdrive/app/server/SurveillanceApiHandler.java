@@ -349,7 +349,8 @@ public class SurveillanceApiHandler {
             config.put("detectPerson", sentryConfig.isDetectPerson());
             config.put("detectCar", sentryConfig.isDetectCar());
             config.put("detectBike", sentryConfig.isDetectBike());
-            
+            config.put("detectAnimal", sentryConfig.isDetectAnimal());
+
             // SOTA: Distance preset and block settings
             config.put("distancePreset", sentryConfig.getDistancePreset().name());
             config.put("blockSize", sentryConfig.getBlockSize());
@@ -400,6 +401,7 @@ public class SurveillanceApiHandler {
             config.put("detectPerson", true);
             config.put("detectCar", true);
             config.put("detectBike", true);
+            config.put("detectAnimal", false);
             config.put("preRecordSeconds", 5);
             config.put("postRecordSeconds", 10);
         }
@@ -436,8 +438,11 @@ public class SurveillanceApiHandler {
         // process (byd_cam_daemon) writes screenDeterrentImagePath via the
         // upload endpoint; without forceReload the in-memory UCM cache here
         // can be stale until the next file mtime tick is observed.
-        JSONObject survConfig = com.overdrive.app.config.UnifiedConfigManager
-                .forceReload().optJSONObject("surveillance");
+        // Single forceReload — read every section we need off the SAME fresh
+        // snapshot. (Calling forceReload again below for "power" would re-parse
+        // the file and leave survConfig pointing at the earlier snapshot.)
+        JSONObject ucmRoot = com.overdrive.app.config.UnifiedConfigManager.forceReload();
+        JSONObject survConfig = ucmRoot.optJSONObject("surveillance");
         if (survConfig == null) survConfig = new JSONObject();
         config.put("deterrentAction", survConfig.optString("deterrentAction", "silent"));
         config.put("deterrentCooldownSeconds", survConfig.optInt("deterrentCooldownSeconds", 60));
@@ -450,6 +455,13 @@ public class SurveillanceApiHandler {
         // Keep ONLY the USB/data rail powered after ACC OFF (cameras unaffected).
         // Default true; read by AccSentryDaemon on the next ACC-OFF cycle.
         config.put("keepUsbPowerOnAccOff", survConfig.optBoolean("keepUsbPowerOnAccOff", true));
+        // HV-battery SoC surveillance cutoff (%). Lives in the "power" section
+        // (the key SocCutoffMonitor reads), NOT "surveillance" — surface it on
+        // the surveillance config so the General-tab slider can hydrate. 0=Off.
+        // Default 10 matches SocCutoffMonitor.DEFAULT_CUTOFF_PERCENT.
+        org.json.JSONObject powerConfig = ucmRoot.optJSONObject("power");
+        config.put("lowSocCutoffPercent",
+                powerConfig != null ? powerConfig.optInt("lowSocCutoffPercent", 10) : 10);
         // Verify the file actually exists before claiming hasImage=true.
         // Without this check, a stale UCM pointer (file deleted out-of-band)
         // makes the UI show a broken preview spinner forever.
@@ -484,6 +496,7 @@ public class SurveillanceApiHandler {
             config.put("cameraLeft", cameras[3]);
             config.put("motionHeatmap", sentryConfig.isMotionHeatmapEnabled());
             config.put("filterDebugLog", sentryConfig.isFilterDebugLogEnabled());
+            config.put("discardEmptyBrightMotionEvents", sentryConfig.isDiscardEmptyBrightMotionEvents());
             config.put("telegramSendStartPing", sentryConfig.isTelegramSendStartPing());
             // Per-tier filter now lives in the telegram unified-config section
             // (see UnifiedTelegramConfig.K_TIER_*). Wire format on
@@ -597,6 +610,7 @@ public class SurveillanceApiHandler {
             config.put("cameraRear", true);
             config.put("motionHeatmap", false);
             config.put("filterDebugLog", false);
+            config.put("discardEmptyBrightMotionEvents", false);
             config.put("telegramSendStartPing", false);
             // Tier toggles live on the telegram unified-config section, so
             // they're available even when SurveillanceConfig isn't loaded.
@@ -813,7 +827,11 @@ public class SurveillanceApiHandler {
                 sentryConfig.setDetectBike(configJson.optBoolean("detectBike", true));
                 configChanged = true;
             }
-            
+            if (configJson.has("detectAnimal")) {
+                sentryConfig.setDetectAnimal(configJson.optBoolean("detectAnimal", false));
+                configChanged = true;
+            }
+
             // Apply object filters to running engine
             if (sentry != null && configChanged) {
                 sentry.setObjectFilters(
@@ -821,7 +839,8 @@ public class SurveillanceApiHandler {
                     sentryConfig.getAiConfidence(),
                     sentryConfig.isDetectPerson(),
                     sentryConfig.isDetectCar(),
-                    sentryConfig.isDetectBike()
+                    sentryConfig.isDetectBike(),
+                    sentryConfig.isDetectAnimal()
                 );
             }
             
@@ -1025,6 +1044,28 @@ public class SurveillanceApiHandler {
                         + " (takes effect next ACC-OFF cycle)");
             }
 
+            // HV-battery SoC surveillance cutoff (%). Routed to the "power"
+            // section — power.lowSocCutoffPercent is the EXACT key
+            // SocCutoffMonitor.cutoffPercent() reads, so the slider must land
+            // there (not in "surveillance"). Range 0..30; 0 = Off (the monitor
+            // early-returns on pct<=0 before the cutoff compare, so it never
+            // arms). Out-of-range is clamped, not rejected.
+            if (configJson.has("lowSocCutoffPercent")) {
+                int pct = configJson.optInt("lowSocCutoffPercent", 10);
+                if (pct < 0) pct = 0;
+                if (pct > 30) pct = 30;
+                boolean persisted = com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "power", java.util.Collections.singletonMap("lowSocCutoffPercent", pct));
+                if (!persisted) {
+                    CameraDaemon.log("Failed to persist lowSocCutoffPercent=" + pct);
+                    HttpResponse.sendJsonError(out, "Failed to save low-battery cutoff");
+                    return;
+                }
+                CameraDaemon.log("Low-battery surveillance cutoff set to: "
+                        + (pct == 0 ? "Off" : pct + "%")
+                        + " (SocCutoffMonitor reads live on next SoC tick)");
+            }
+
             if (configJson.has("clearScreenDeterrentImage") && configJson.optBoolean("clearScreenDeterrentImage", false)) {
                 String existing = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
                         .optString("screenDeterrentImagePath", "");
@@ -1123,7 +1164,8 @@ public class SurveillanceApiHandler {
                     boolean dPerson = sentryConfig.isDetectPerson();
                     boolean dCar = sentryConfig.isDetectCar();
                     boolean dBike = sentryConfig.isDetectBike();
-                    sentry.setObjectFilters(minObjSize, confidence, dPerson, dCar, dBike);
+                    boolean dAnimal = sentryConfig.isDetectAnimal();
+                    sentry.setObjectFilters(minObjSize, confidence, dPerson, dCar, dBike, dAnimal);
                 }
                 
                 CameraDaemon.log(String.format("Distance set: %s (minObjectSize=%.0f%%)",
@@ -1217,6 +1259,11 @@ public class SurveillanceApiHandler {
             }
             if (configJson.has("motionHeatmap")) {
                 sentryConfig.setMotionHeatmapEnabled(configJson.optBoolean("motionHeatmap", false));
+                configChanged = true;
+            }
+            if (configJson.has("discardEmptyBrightMotionEvents")) {
+                sentryConfig.setDiscardEmptyBrightMotionEvents(
+                        configJson.optBoolean("discardEmptyBrightMotionEvents", false));
                 configChanged = true;
             }
             if (configJson.has("filterDebugLog")) {

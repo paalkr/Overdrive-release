@@ -1210,6 +1210,7 @@ Questa azione non puo essere annullata.</string>
     <string name="roadsense_map_search_action">Cerca</string>
     <string name="roadsense_map_searching">Ricerca…</string>
     <string name="roadsense_map_no_results">Nessun posto trovato</string>
+    <string name="roadsense_map_search_network">Impossibile raggiungere il servizio di ricerca. Controlla la connessione o il proxy e riprova.</string>
     <string name="roadsense_map_pick_destination">Scegli destinazione</string>
     <string name="roadsense_map_routing">Ricerca percorso…</string>
     <string name="roadsense_map_route_failed">Impossibile trovare un percorso. Riprova.</string>

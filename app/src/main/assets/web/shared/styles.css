@@ -1298,21 +1298,22 @@ select.md-input ~ .md-label {
 .info-box-warning > .info-icon { color: var(--warning); }
 
 /* When the body of an info-box-note is just a `.info-note` text line
-   (no info-row table inside), tighten its line-height so the icon and
-   text share a common vertical centerline at small sizes. */
-.info-box-note .info-note {
-    font-size: 13px;
-    line-height: 1.55;
-    color: var(--text-secondary);
-}
-
-/* Same flat text line inside a WARNING box — keep the size/leading but
-   carry the warning tint so it reads as a caution, matching the icon. */
+   (no info-row table inside), it must read as a plain flat line beside the
+   icon. The standalone `.info-note` rule (used elsewhere as a boxed callout)
+   carries padding/background/border-left; reset those here so the text sits
+   flush against the flex-start icon instead of as an offset padded box —
+   otherwise a multi-line note renders visibly misaligned. */
+.info-box-note .info-note,
 .info-box-warning .info-note {
     font-size: 13px;
     line-height: 1.55;
-    color: var(--warning);
+    padding: 0;
+    background: none;
+    border: 0;
+    border-radius: 0;
 }
+.info-box-note .info-note { color: var(--text-secondary); }
+.info-box-warning .info-note { color: var(--warning); }
 
 .info-row {
     display: flex;

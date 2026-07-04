@@ -500,11 +500,19 @@ class RoadSenseOverlayService : Service() {
         )
 
         if (state.hazardAhead && !stale) {
-            // Zone-aware caption (D-032): a cluster reads as "3 bumps ahead" /
-            // "Rough section · 40 m"; a singleton keeps the "Moderate · Pothole" line.
+            // Zone-aware caption (D-032). A genuine washboard/rough STRETCH is one
+            // continuous section you can't pass "one at a time", so it keeps the
+            // "Rough section · 40 m" caption. A DISCRETE cluster (N separate bumps
+            // within the 30 m zone gap) deliberately does NOT use a "3 bumps ahead"
+            // count: the warn engine already drops each member as it's passed
+            // (rank() filters range < minRangeM) and promotes the next-closest as the
+            // new lead every tick, so the card walks the bumps closest→farthest one by
+            // one — each showing its own type + live distance. Showing the lead's
+            // identity (like a singleton) makes that sequence legible; a static count
+            // hid which hazard was actually next and how far it was. The "there are
+            // several" awareness now comes from the sequential reveal, not a number.
             val zoneCaption: String? = when {
                 state.zoneRough -> getString(R.string.roadsense_zone_rough, state.zoneLengthM)
-                state.zoneCount > 1 -> getString(R.string.roadsense_zone_count, state.zoneCount)
                 else -> null
             }
             pillLabel?.text = getString(

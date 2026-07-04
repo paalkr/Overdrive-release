@@ -28,10 +28,16 @@ object Constants {
     const val FRAME_RATE = 25
     const val BITRATE = 4_000_000
     const val KEYFRAME_INTERVAL = 2
+    // Default clip segment length. The live value is configurable per-install
+    // (2/5/10 min) via recording.segmentDurationMinutes — a single shared key
+    // read by BOTH the ACC-on dashcam (GpuSurveillancePipeline) and the
+    // ACC-off / OEM surveillance (OemDashcamPipeline) axes, mirroring how
+    // recording.rectifyStrength is shared. This constant is only the seed
+    // default; HardwareEventRecorderGpu carries the live mutable value.
     const val SEGMENT_DURATION_MINUTES = 2
-    const val SEGMENT_DURATION_MS = SEGMENT_DURATION_MINUTES * 60 * 1000L
     const val MIN_SEGMENT_DURATION_MINUTES = 2
     const val MAX_SEGMENT_DURATION_MINUTES = 10
+    const val SEGMENT_DURATION_MS = SEGMENT_DURATION_MINUTES * 60 * 1000L
     
     // Streaming Configuration
     const val STREAM_WIDTH = 640

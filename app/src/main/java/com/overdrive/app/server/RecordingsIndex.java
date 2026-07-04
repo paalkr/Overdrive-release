@@ -1353,6 +1353,40 @@ public final class RecordingsIndex {
                         JSONObject a = actors.optJSONObject(i);
                         if (a == null) continue;
                         String c = a.optString("class", "").toLowerCase(Locale.US);
+                        // Skip static NON-person actors (parked cars, hydrants):
+                        // they are background, not threats, and shouldn't surface
+                        // a "Vehicle" chip / class filter on the events page.
+                        // Mirrors the engine's rule (keep a static loitering PERSON,
+                        // drop static non-persons) and the JSON count gate in
+                        // EventTimelineCollector. Use the timeline-static SUPERSET
+                        // (isStaticForTimeline) — falling back to isStatic for older
+                        // sidecars — so a parked car detected via the never-moved
+                        // signal (which may not have latched the severity-path
+                        // isStatic under sparse cadence) also drops its chip.
+                        boolean timelineStatic = a.optBoolean("isStaticForTimeline",
+                                a.optBoolean("isStatic", false));
+                        if (timelineStatic && !"person".equals(c)) {
+                            continue;
+                        }
+                        // Also drop the chip for the low-conf-FAR-NOTICE
+                        // misclassification profile (a far low-conf parked car/bike
+                        // at NOTICE) that the engine already excluded from the live
+                        // count/pill/caption. The verdict is persisted by
+                        // EventTimelineCollector (it depends on everMoved/everMovedTested
+                        // which aren't otherwise in the sidecar, so it can't be
+                        // recomputed here). The persisted flag is written ONLY for
+                        // NON-person actors — EventTimelineCollector uses
+                        // suppressFromSummary, which exempts PERSON — so a PERSON-FP
+                        // chip is intentionally KEPT here, matching the headline
+                        // count + SRT + caption (a real far still person is
+                        // byte-identical to a bike-as-person FP, and the hard
+                        // invariant forbids dropping a person from the summary).
+                        // Absent on older sidecars / real non-person actors → fail
+                        // open (chip kept) = prior behavior, so no real actor's chip
+                        // is ever dropped.
+                        if (a.optBoolean("lowConfFarNotice", false)) {
+                            continue;
+                        }
                         if (!c.isEmpty() && seen.add(c)) {
                             if (cls.length() > 0) cls.append(',');
                             cls.append(c);

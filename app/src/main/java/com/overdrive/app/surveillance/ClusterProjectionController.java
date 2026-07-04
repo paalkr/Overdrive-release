@@ -396,6 +396,18 @@ public final class ClusterProjectionController {
     /** True while the map holds the projection (used to gate BS coexistence). */
     public boolean isSustainedHeld() { return sustainedHeld; }
 
+    /** Null-safe static read of {@link #isSustainedHeld()} that does NOT construct the
+     *  singleton (mirrors {@link #forceCloseIfActive}/{@link #shutdownIfActive}). If
+     *  {@code instance} is null this daemon never opened a projection, so nothing is held.
+     *  Used by the {@code ClusterMapProjector} keep-alive watchdog to confirm the
+     *  projection is still held FOR THE MAP before relaunching the Activity — so a
+     *  projection torn down via a direct {@link #forceClose} (bs-disable / relayout /
+     *  retarget / ACC-off) is never repainted over the restored gauges. */
+    public static boolean isSustainedHeldStatic() {
+        ClusterProjectionController i = instance;
+        return i != null && i.sustainedHeld;
+    }
+
     /** Bump the signal timestamp (called every tick while a turn signal is active). */
     public void noteSignal() { lastSignalMs = System.currentTimeMillis(); }
 

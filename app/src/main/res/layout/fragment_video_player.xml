@@ -2,8 +2,8 @@
 <!--
   SOTA Video player overlay.
 
-  Composition: full-bleed ZoomableVideoView with overlay chrome (top bar,
-  bottom controls, and a right-edge per-camera quadrant selector).
+  Composition: full-bleed ZoomableVideoView with two overlay bars (top +
+  bottom) plus a floating quadrant selector pill above the bottom controls.
   Both overlays use semi-transparent black scrims rather than M3 surface
   tokens — this is INTENTIONAL.
 
@@ -23,10 +23,15 @@
     matched anything in the design system — that has been replaced.
 
   Preserved IDs (VideoPlayerFragment.kt findViewById targets):
-    videoView (ZoomableVideoView), btnBack, tvTitle, tvMeta, btnMute,
-    btnFullscreen, topBar, bottomControls, eventTimeline, seekBar,
-    btnPlayPause, btnPrev, btnNext, tvCurrentTime, tvDuration, tvEventInfo,
-    quadrantBar, btnQuadrantAll/Front/Right/Rear/Left
+    videoView, btnBack, tvTitle, tvMeta, topBar, bottomControls,
+    eventTimeline, seekBar, btnPlayPause, btnPrev, btnNext,
+    tvCurrentTime, tvDuration, tvEventInfo
+
+  Quadrant zoom (single-camera fullscreen over the AVM 2x2 mosaic):
+    quadrantBar, btnQuadrantAll, btnQuadrantFront, btnQuadrantRight,
+    btnQuadrantRear, btnQuadrantLeft. The video surface is a
+    ZoomableVideoView so it can apply a TextureView matrix per
+    quadrant — see VideoPlayerFragment.setQuadrant for the wiring.
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -35,84 +40,15 @@
     android:background="#000000">
 
     <!-- Video Surface — letterboxed black is by spec, not theme.
-         ZoomableVideoView (a TextureView) so the per-camera quadrant zoom
-         can apply a matrix transform per frame; a plain VideoView/SurfaceView
-         ignores View transforms. Id stays `videoView` (the fragment casts it
-         to ZoomableVideoView). -->
+         ZoomableVideoView lets us apply a per-quadrant matrix transform so
+         the user can see one of the four AVM cameras at native resolution
+         without re-encoding. Same VideoView API surface (setVideoURI,
+         start, pause, currentPosition, ...) so the fragment doesn't care. -->
     <com.overdrive.app.ui.view.ZoomableVideoView
         android:id="@+id/videoView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:layout_gravity="center" />
-
-    <!-- ============== PER-CAMERA QUADRANT SELECTOR ==============
-         Vertical pill on the center-right edge so it never collides with the
-         title bar or the transport row. Part of the auto-hiding chrome
-         (fades with topBar/bottomControls). The fragment highlights the
-         active camera and toggles back to "all" on a second tap; double-tap
-         on the video does the same. For dashcam-layout clips the same five
-         controls map to the dashcam regions (front = top band, left/rear/
-         right = bottom thirds). -->
-    <LinearLayout
-        android:id="@+id/quadrantBar"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center_vertical|end"
-        android:layout_marginEnd="12dp"
-        android:background="@drawable/bg_quadrant_bar"
-        android:orientation="vertical"
-        android:padding="4dp">
-
-        <ImageButton
-            android:id="@+id/btnQuadrantAll"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/cd_player_quadrant_all"
-            android:scaleType="centerInside"
-            android:src="@drawable/ic_quadrant_all"
-            android:tint="#FFFFFF" />
-
-        <ImageButton
-            android:id="@+id/btnQuadrantFront"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/cd_player_quadrant_front"
-            android:scaleType="centerInside"
-            android:src="@drawable/ic_quadrant_front"
-            android:tint="#FFFFFF" />
-
-        <ImageButton
-            android:id="@+id/btnQuadrantRight"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/cd_player_quadrant_right"
-            android:scaleType="centerInside"
-            android:src="@drawable/ic_quadrant_right"
-            android:tint="#FFFFFF" />
-
-        <ImageButton
-            android:id="@+id/btnQuadrantRear"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/cd_player_quadrant_rear"
-            android:scaleType="centerInside"
-            android:src="@drawable/ic_quadrant_rear"
-            android:tint="#FFFFFF" />
-
-        <ImageButton
-            android:id="@+id/btnQuadrantLeft"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/cd_player_quadrant_left"
-            android:scaleType="centerInside"
-            android:src="@drawable/ic_quadrant_left"
-            android:tint="#FFFFFF" />
-    </LinearLayout>
 
     <!-- ==================== TOP BAR ==================== -->
     <!-- Dark scrim is intentional; see header comment. -->
@@ -190,6 +126,86 @@
             android:src="@drawable/ic_fullscreen"
             android:tint="#FFFFFF"
             android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- ==================== QUADRANT SELECTOR ====================
+         Floats above the bottom controls so it stays out of the timeline
+         while remaining within the auto-hide overlay group (the fragment
+         fades it in/out together with topBar + bottomControls). The pill
+         design follows M3 segmented-button visuals; selection state is
+         driven from VideoPlayerFragment so the icon highlight stays in
+         sync with the active ZoomableVideoView quadrant.
+
+         clickable=true so taps in the pill's padding/margin gaps absorb
+         here rather than falling through to the ZoomableVideoView's
+         GestureDetector — without it, double-tapping a button gap would
+         zoom into a quadrant of the video underneath the bar.
+
+         No android:tint on the ImageButtons: the vector drawables encode
+         their own lit/dim cell colors (ic_quadrant_*), and a tint would
+         flatten all four cells to a single color, killing the position
+         map. -->
+    <LinearLayout
+        android:id="@+id/quadrantBar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="120dp"
+        android:background="@drawable/bg_quadrant_bar"
+        android:clickable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingHorizontal="6dp"
+        android:paddingVertical="6dp">
+
+        <ImageButton
+            android:id="@+id/btnQuadrantAll"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_player_quadrant_all"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_quadrant_all" />
+
+        <ImageButton
+            android:id="@+id/btnQuadrantFront"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="2dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_player_quadrant_front"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_quadrant_front" />
+
+        <ImageButton
+            android:id="@+id/btnQuadrantRight"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="2dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_player_quadrant_right"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_quadrant_right" />
+
+        <ImageButton
+            android:id="@+id/btnQuadrantRear"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="2dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_player_quadrant_rear"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_quadrant_rear" />
+
+        <ImageButton
+            android:id="@+id/btnQuadrantLeft"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="2dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_player_quadrant_left"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_quadrant_left" />
     </LinearLayout>
 
     <!-- ==================== BOTTOM CONTROLS ==================== -->

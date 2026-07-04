@@ -11,7 +11,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js"></script>
+    <script src="../shared/app-shell.js?v=2"></script>
     <!--
       Per-page bottom-tab manifest. Five tabs grouped by user task:
         General   — mode toggle + schedule + deterrent (when/how surveillance runs)
@@ -33,7 +33,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=16">
+    <link rel="stylesheet" href="../shared/styles.css?v=17">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
@@ -151,11 +151,34 @@
 
                         <!-- Shown only while USB power is OFF: SD card is unpowered while
                              parked, so surveillance records to Internal. Visibility driven
-                             by SurvSettings.updateUsbPowerStorageNotice(). -->
+                             by SurvSettings.updateUsbPowerStorageNotice(). Belongs to the
+                             Keep-USB toggle above — keep them adjacent. -->
                         <div class="info-box-warning" id="survUsbPowerStorageNotice" style="display:none;margin-top:12px;">
                             <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
                             <div class="info-note" data-i18n="surveillance.usb_off_storage_notice">USB power is off, so the SD card is unpowered while parked. Surveillance records to Internal storage until USB power is turned back on.</div>
                         </div>
+
+                        <!-- HV-battery SoC cutoff for parked surveillance. At/below this %,
+                             SocCutoffMonitor arms a 60s grace then self-shuts-down to protect
+                             the traction pack. 0 = Off (never auto-stops on SoC). Persists to
+                             power.lowSocCutoffPercent — the exact key SocCutoffMonitor reads.
+                             oninput previews the label only; onchange (drag end) saves.
+                             Placed after the USB toggle+its warning so both parked-power
+                             settings sit together, before the Status/Events readout. -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.low_soc_cutoff">Low-battery cutoff</div>
+                                <div class="setting-desc" data-i18n="surveillance.low_soc_cutoff_desc">Stop surveillance and let the car sleep when the main battery drops to this level, protecting it from over-discharge. Set to Off to never stop on battery level.</div>
+                            </div>
+                            <div class="setting-control">
+                                <div class="slider-control">
+                                    <span class="slider-value" id="lowSocCutoffValue">10%</span>
+                                    <input type="range" class="slider" id="lowSocCutoffSlider" min="0" max="30" step="1" value="10"
+                                           oninput="SurvSettings.previewLowSocCutoff(this.value)" onchange="SurvSettings.updateLowSocCutoff(this.value)">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="setting-hint" id="lowSocCutoffHint" data-i18n="surveillance.low_soc_cutoff_hint">Higher values protect the battery more but end surveillance sooner. Off keeps watching until the battery is critically low.</div>
 
                         <div class="info-box">
                             <div class="info-row"><span class="label" data-i18n="surveillance.status_label">Status</span><span class="value" id="survState" data-i18n="common.idle">Idle</span></div>
@@ -339,6 +362,21 @@
                         </div>
                         <div class="setting-hint" id="shadowFilterHint" data-i18n="surveillance.shadow_hint.2">Normal works well for most outdoor parking. Use Aggressive if parked under trees with heavy shadow movement.</div>
 
+                        <!-- Aggressively discard non-actor recordings -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.discard_empty_motion">Discard non-actor recordings</div>
+                                <div class="setting-desc" data-i18n="surveillance.discard_empty_motion_desc">Aggressively drop recordings where no real person or vehicle was tracked</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="v2DiscardEmptyMotion" onchange="SurvSettings.updateDiscardEmptyMotion()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-hint" id="discardEmptyMotionHint" data-i18n="surveillance.discard_empty_motion_hint">Good if you get false alerts from shadows or tree-branch movement — these clips are deleted automatically when nothing real was tracked. Caution: in low light or unclear conditions it can occasionally discard a real threat the AI failed to identify. Leave off if you'd rather keep every recording.</div>
+
                         <!-- Camera Controls -->
                         <div class="setting-row" style="border-bottom:none;">
                             <div class="setting-info">
@@ -436,6 +474,7 @@
                             <label class="checkbox-item active"><input type="checkbox" id="detectPerson" checked onchange="SurvSettings.updateDetection()"><span data-i18n="surveillance.detect_person">Person</span></label>
                             <label class="checkbox-item active"><input type="checkbox" id="detectCar" checked onchange="SurvSettings.updateDetection()"><span data-i18n="surveillance.detect_vehicle">Vehicle</span></label>
                             <label class="checkbox-item"><input type="checkbox" id="detectBike" onchange="SurvSettings.updateDetection()"><span data-i18n="surveillance.detect_bike">Bike</span></label>
+                            <label class="checkbox-item"><input type="checkbox" id="detectAnimal" onchange="SurvSettings.updateDetection()"><span data-i18n="surveillance.detect_animal">Animal</span></label>
                         </div>
                         <div class="setting-hint" data-i18n="surveillance.detect_objects_hint">Select which objects YOLO AI should identify. Motion detection triggers regardless — AI classifies what was detected.</div>
 
@@ -823,9 +862,9 @@
                         <div class="setting-row">
                             <div class="setting-info">
                                 <div class="setting-name">
-                                    <span data-i18n="recording.recording_quality">Recording Quality</span>
+                                    <span data-i18n="surveillance.recording_quality">Surveillance Quality</span>
                                 </div>
-                                <div class="setting-desc" data-i18n="recording.recording_quality_desc">Higher tiers preserve more detail at the cost of more storage. Output is a 2560×1920 mosaic of four 1280×960 cameras.</div>
+                                <div class="setting-desc" data-i18n="surveillance.recording_quality_desc">Quality for parked (ACC-off) surveillance recording — independent of the driving dashcam quality. Higher tiers preserve more detail at the cost of more storage.</div>
                             </div>
                             <div class="setting-control">
                                 <div class="btn-group btn-group-vertical" id="survQualityBtns">
@@ -864,9 +903,9 @@
                         <div class="setting-row">
                             <div class="setting-info">
                                 <div class="setting-name">
-                                    <span data-i18n="recording.camera_fps">Camera FPS</span>
+                                    <span data-i18n="surveillance.camera_fps">Surveillance FPS</span>
                                 </div>
-                                <div class="setting-desc" data-i18n="recording.camera_fps_desc">Frame rate for recording &amp; surveillance.</div>
+                                <div class="setting-desc" data-i18n="surveillance.camera_fps_desc_split">Frame rate for parked (ACC-off) surveillance — independent of the driving dashcam. Lower saves power &amp; storage while parked.</div>
                             </div>
                             <div class="setting-control">
                                 <div class="btn-group" id="survFpsBtns">
@@ -876,6 +915,30 @@
                                     <button class="btn-toggle" data-value="25" onclick="SurvSettings.setFps(25)">25</button>
                                     <button class="btn-toggle" data-value="30" onclick="SurvSettings.setFps(30)">30</button>
                                 </div>
+                            </div>
+                        </div>
+                        <!-- Clip Duration — shared key (recording.segmentDurationMinutes)
+                             read by both axes; same control as the recording page. -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name">
+                                    <span data-i18n="recording.clip_duration">Clip Duration</span>
+                                    <span class="setting-badge" data-i18n="recording.applies_next_rotation">Next clip</span>
+                                </div>
+                                <div class="setting-desc" data-i18n="recording.clip_duration_desc">Length of each recorded video segment. Applies to both driving (ACC on) and parked surveillance (ACC off) recordings, on the next segment rotation.</div>
+                            </div>
+                            <div class="setting-control">
+                                <div class="btn-group" id="survClipDurationBtns">
+                                    <button class="btn-toggle active" data-value="2" onclick="SurvSettings.setClipDuration(2)" data-i18n="recording.clip_2min">2 min</button>
+                                    <button class="btn-toggle" data-value="5" onclick="SurvSettings.setClipDuration(5)" data-i18n="recording.clip_5min">5 min</button>
+                                    <button class="btn-toggle" data-value="10" onclick="SurvSettings.setClipDuration(10)" data-i18n="recording.clip_10min">10 min</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="info-box-note">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                            <div class="info-note" data-i18n="recording.clip_duration_warning">
+                                Longer clips mean fewer, larger files — but an in-progress clip is only finalized when it rotates. On sudden power loss (e.g. battery cut on impact) the current clip can be lost, so a 10-minute setting risks up to 10 minutes of unsaved footage vs 2. Keep 2 min if your vehicle can lose power abruptly.
                             </div>
                         </div>
                         <div class="info-box">
@@ -1298,7 +1361,7 @@
     <script src="../shared/pwa-init.js?v=index1"></script>
     <script src="../shared/core.js"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/surveillance.js?v=trycatchfix"></script>
+    <script src="../shared/surveillance.js?v=survqualsplit1"></script>
     <script src="../shared/safe-locations.js"></script>
     <script src="../shared/roi-schedule.js"></script>
     <script>

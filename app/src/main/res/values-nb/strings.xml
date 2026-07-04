@@ -751,4 +751,5 @@
     <string name="toast_cloudflared_token_cannot_be_empty">Hvis du angir den betalte versjonen, kan ikke tokenet være tomt</string>
     <string name="toast_cloudflared_token_invalid">Ugyldig token: bruk kun bokstaver, tall og tegnene . _ - =</string>
     <string name="toast_cloudflared_saved_settings">Cloudflared-innstillinger lagret</string>
+    <string name="roadsense_map_search_network">Kunne ikke nå søketjenesten. Sjekk tilkoblingen eller proxyen din og prøv igjen.</string>
 </resources>

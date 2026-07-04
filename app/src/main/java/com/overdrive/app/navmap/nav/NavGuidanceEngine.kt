@@ -85,6 +85,16 @@ class NavGuidanceEngine {
 
     private var route: NavRoute? = null
 
+    /** Prefix-sum of haversine arc length (m) along [route].points: cumArcM[i] is the
+     *  distance from the route start to vertex i. Built once in [start]. Drives the
+     *  along-route progress fraction for the traveled-route trim (line-gradient) — that
+     *  fraction MUST be measured against the POLYLINE arc length (not the Valhalla
+     *  summary [NavRoute.totalDistanceMeters], which differs from the densified
+     *  polyline length and would drift the trim boundary off the puck). */
+    private var cumArcM: DoubleArray = DoubleArray(0)
+    /** Total polyline arc length (m) = cumArcM.last(); 0.0 when no route. */
+    private var routeArcLenM: Double = 0.0
+
     /** Count of consecutive fixes whose route distance exceeded the threshold
      *  (legacy count-based latch, used by the no-bearing update overload). */
     private var consecutiveOffRoute = 0
@@ -102,6 +112,14 @@ class NavGuidanceEngine {
         this.consecutiveOffRoute = 0
         this.matchedSegIndex = -1
         this.offRouteSinceMs = 0L
+        // Prefix-sum the polyline arc length for the progress-fraction (route-trim) feed.
+        val pts = route.points
+        val cum = DoubleArray(pts.size)
+        for (i in 1 until pts.size) {
+            cum[i] = cum[i - 1] + haversineMeters(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng)
+        }
+        cumArcM = cum
+        routeArcLenM = if (cum.isNotEmpty()) cum[cum.size - 1] else 0.0
         Log.i(TAG, "guidance started: ${route.points.size} pts, ${route.maneuvers.size} maneuvers")
     }
 
@@ -111,8 +129,14 @@ class NavGuidanceEngine {
         this.consecutiveOffRoute = 0
         this.matchedSegIndex = -1
         this.offRouteSinceMs = 0L
+        this.cumArcM = DoubleArray(0)
+        this.routeArcLenM = 0.0
         Log.i(TAG, "guidance stopped")
     }
+
+    /** Total polyline arc length (m) of the active route, or 0.0 when none. The
+     *  denominator for the traveled-route progress fraction (see [cumArcM]). */
+    fun routeArcLengthMeters(): Double = routeArcLenM
 
     /** Whether a route is currently loaded (between [start] and [stop]). */
     fun isActive(): Boolean = route != null
@@ -336,13 +360,28 @@ class NavGuidanceEngine {
                 bestLat = snap.lat; bestLng = snap.lng
             }
         }
+        // NOTE: this per-frame snap is deliberately WINDOWED-ONLY (v26.8 behaviour). An
+        // added "global rescan when bestDist > OFF_ROUTE_LATERAL_M" was reverted: because
+        // it is a pure read that does NOT advance matchedSegIndex, successive render frames
+        // flipped the snap between the windowed match and the globally-nearest segment
+        // (a parallel carriageway / return leg on a loop) → the puck teleported/jittered
+        // off the line. The 1 Hz update() remains the SOLE owner of off-route recovery +
+        // matchedSegIndex re-acquisition; the render-frame snap must stay inside that
+        // window so it can't disagree with the latch.
         // Tangent bearing along the matched segment — smooth by construction
         // (it only changes at vertices), so the camera never chases GPS noise.
         val tangent = bearingBetween(
             pts[bestSeg].lat, pts[bestSeg].lng,
             pts[bestSeg + 1].lat, pts[bestSeg + 1].lng
         )
-        return Snapped(bestLat, bestLng, tangent, bestDist)
+        // Along-route arc distance to the snap point = (prefix sum to the segment start)
+        // + (partial from the segment start vertex to the snapped point). Used by the
+        // traveled-route trim's progress fraction. Guard cumArcM (may lag the route by a
+        // frame on a just-started/just-rerouted engine) → fall back to 0 (no trim).
+        val alongRouteM = if (bestSeg < cumArcM.size) {
+            cumArcM[bestSeg] + haversineMeters(pts[bestSeg].lat, pts[bestSeg].lng, bestLat, bestLng)
+        } else 0.0
+        return Snapped(bestLat, bestLng, tangent, bestDist, alongRouteM)
     }
 
     /** Result of [snapToRoute]: on-route position + the route tangent bearing there. */
@@ -352,7 +391,12 @@ class NavGuidanceEngine {
         /** Route tangent bearing at the snap point, 0..360°. */
         val bearingDeg: Double,
         /** Lateral distance (m) from the input point to the route. */
-        val offsetM: Double
+        val offsetM: Double,
+        /** Along-route arc distance (m) from the route START to this snap point —
+         *  measured on the POLYLINE (cumArcM + on-segment partial), so progress =
+         *  alongRouteM / [routeArcLengthMeters] matches MapLibre line-progress for the
+         *  traveled-route trim. 0.0 when no route / no metrics. */
+        val alongRouteM: Double = 0.0
     )
 
     /**

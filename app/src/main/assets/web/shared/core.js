@@ -705,11 +705,13 @@ BYD.core = {
                 if (el) el.textContent = status.deviceId;
             }
 
-            // App version. appVersion is the BuildConfig-derived identity
-            // "<channel>-v<versionName>" (e.g. "alpha-v26.0") — it ALREADY
-            // carries its own "-v", so do NOT prepend another 'v' (that
+            // App version. appVersion is getDisplayVersionFromFile() — the
+            // VERSION_FILE-persisted installed GitHub label "<channel>-v<semver>"
+            // (e.g. "braveheart-v27.4"), falling back to the BuildConfig identity
+            // only when nothing was installed via the updater. Either way it
+            // ALREADY carries its own "-v", so do NOT prepend another 'v' (that
             // produced "valpha-v26.0"). Show the label verbatim, matching the
-            // native About row.
+            // native About row (also getDisplayVersion / VERSION_FILE-first).
             if (status.appVersion) {
                 const el = document.getElementById('appVersion');
                 if (el) el.textContent = status.appVersion;

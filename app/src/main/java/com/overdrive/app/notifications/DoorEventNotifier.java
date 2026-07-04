@@ -3,6 +3,7 @@ package com.overdrive.app.notifications;
 import com.overdrive.app.byd.BydDataCollector;
 import com.overdrive.app.byd.BydVehicleData;
 import com.overdrive.app.byd.bodywork.BodyworkConstants;
+import com.overdrive.app.logging.DaemonLogger;
 import com.overdrive.app.server.Messages;
 
 import org.json.JSONObject;
@@ -35,6 +36,8 @@ public final class DoorEventNotifier {
     private static final int AREA_TRUNK = 6;
     private static final int AREA_FUEL_CAP = 7;
 
+    private static final DaemonLogger logger = DaemonLogger.getInstance("DoorEventNotifier");
+
     private static volatile DoorEventNotifier instance;
 
     private final BydDataCollector.DoorStateListener listener =
@@ -57,17 +60,47 @@ public final class DoorEventNotifier {
     private void onDoorStateChanged(int area, int state) {
         if (state != BodyworkConstants.STATE_OPEN
                 && state != BodyworkConstants.STATE_CLOSED) {
+            logger.debug("door area " + area + " ignored: non-open/close state " + state);
             return;
         }
-        Integer prev = lastState.put(area, state);
-        if (prev != null && prev == state) return;
 
-        // Gate on ACC OFF. If the snapshot doesn't yet have a powerLevel
-        // (very early boot), skip — we'd rather miss a transient edge than
-        // fire while driving.
+        // Gate out only when actually DRIVING (powerLevel ON/OK, i.e. >= ON),
+        // matching AccMonitor's definition (isAccOn = level >= POWER_LEVEL_ON).
+        // The bug this fixes: the old gate was `powerLevel != POWER_LEVEL_OFF`,
+        // which also rejected level ACC(1). Opening a door on a parked car
+        // (level OFF) wakes the cabin to ACC, so the door OPEN edge fires while
+        // still at OFF (passes) but the CLOSE edge that follows a moment later
+        // reads ACC → was dropped. That's the open-notifies-close-doesn't
+        // asymmetry. Treating ACC as parked (a car at ACC is not being driven)
+        // lets the close through. Doors that never wake the cabin (stay OFF)
+        // were unaffected either way.
+        //
+        // Gate BEFORE touching lastState: a gated edge must not advance the
+        // per-area dedup, or the next genuine edge would be deduped against a
+        // state that was never published and silently eaten.
+        //
+        // If the snapshot has no powerLevel yet (very early boot), skip — we'd
+        // rather miss a transient edge than fire while driving.
         BydVehicleData snap = BydDataCollector.getInstance().getData();
-        if (snap == null) return;
-        if (snap.powerLevel != BodyworkConstants.POWER_LEVEL_OFF) return;
+        if (snap == null) {
+            logger.debug("door area " + area + " state " + state
+                    + " skipped: no snapshot yet");
+            return;
+        }
+        if (snap.powerLevel >= BodyworkConstants.POWER_LEVEL_ON) {
+            logger.info("door area " + area + " state " + state
+                    + " skipped: powerLevel="
+                    + BodyworkConstants.powerLevelToString(snap.powerLevel)
+                    + " (driving) — dedup state left untouched");
+            return;
+        }
+
+        Integer prev = lastState.put(area, state);
+        if (prev != null && prev == state) {
+            logger.debug("door area " + area + " state " + state
+                    + " skipped: duplicate edge");
+            return;
+        }
 
         boolean opened = state == BodyworkConstants.STATE_OPEN;
         String category = opened
@@ -112,7 +145,12 @@ public final class DoorEventNotifier {
                     "door-" + area + "-" + (opened ? "open" : "close"),
                     null,
                     data));
-        } catch (Throwable ignored) {}
+            logger.info("published " + category + " (area " + area + ", "
+                    + (opened ? "WARN" : "INFO") + ")");
+        } catch (Throwable t) {
+            logger.warn("publish failed for area " + area + " state " + state
+                    + ": " + t.getMessage());
+        }
     }
 
     private static String areaLabel(int area) {

@@ -54,6 +54,10 @@ class MainActivity : AppCompatActivity() {
 
     // Daemon startup manager
     private lateinit var daemonStartupManager: DaemonStartupManager
+    private var onboardingHost: com.overdrive.app.onboarding.OnboardingHost? = null
+    // Bounded poll while waiting for an onboarding navigation to commit (~2s total).
+    private val NAV_POLL_INTERVAL_MS = 100L
+    private val NAV_POLL_MAX_ATTEMPTS = 20
 
     // Handler + runnable owned by the activity so they can be cancelled in
     // onDestroy() — prevents the periodic update check from leaking the
@@ -246,15 +250,20 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // Show post-update message if app was just updated.
-                // consumeJustUpdatedVersion is the success MARKER (non-null only
-                // when the just-updated flag was set); but DISPLAY the running
-                // build's BuildConfig identity (getInstalledVersion) — the new
-                // APK is already running, and this keeps the toast consistent
-                // with the About row / status, instead of the GitHub asset label
-                // which can differ on a braveheart in-place re-upload.
+                // consumeJustUpdatedVersion is the success MARKER and ALSO
+                // carries the GitHub label that was installed (PREF_UPDATED_VERSION
+                // = remoteVersion). Prefer that label so this toast matches the
+                // About row (getDisplayVersion) and /status (getDisplayVersionFromFile),
+                // both VERSION_FILE-first. getInstalledVersion() is the BuildConfig
+                // identity (braveheart-v26.0 today — versionName is pinned), which
+                // would make THIS toast the lone surface showing a stale 26.0 on a
+                // braveheart in-place re-upload. Empty marker (remoteVersion was
+                // "unknown") → fall through getDisplayVersion (still VERSION_FILE-
+                // first, only drops to BuildConfig on a fresh sideload).
                 val justUpdated = com.overdrive.app.updater.AppUpdater.consumeJustUpdatedVersion(this)
                 if (justUpdated != null) {
-                    val shown = com.overdrive.app.updater.AppUpdater.getInstalledVersion()
+                    val shown = if (justUpdated.isNotEmpty()) justUpdated
+                                else com.overdrive.app.updater.AppUpdater.getDisplayVersion(this)
                     Toast.makeText(this, getString(R.string.toast_updated_to, shown), Toast.LENGTH_LONG).show()
                     logsViewModel.info("Update", "App updated to $shown")
                 }
@@ -317,8 +326,28 @@ class MainActivity : AppCompatActivity() {
         // showIfNeeded is no-op when the seen install-time matches the current
         // PackageInfo.lastUpdateTime, so it's safe to call on every launch.
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            com.overdrive.app.overlay.SetupGuideDialog.showIfNeeded(this)
+            val guideShown = com.overdrive.app.overlay.SetupGuideDialog.showIfNeeded(this)
+            // Sequence the onboarding guide AFTER the setup-guide perms dialog. If the
+            // setup guide was shown this launch, wait for the user to clear it before
+            // starting onboarding (SetupGuideDialog has no completion callback, so we
+            // post on a further delay); otherwise start once the dialog window is free.
+            // The host self-gates on OnboardingState.shouldAutoRunNovice() + the parked
+            // ACC broadcast, and is sequenced after the PIN gate because startStatusOverlay
+            // runs in onCreate after maybeShowPinLock.
+            maybeStartOnboarding(if (guideShown) 1500L else 0L)
         }, 2000)
+    }
+
+    private fun maybeStartOnboarding(delayMs: Long) {
+        val runner = Runnable {
+            if (isFinishing || isDestroyed) return@Runnable
+            val host = onboardingHost ?: com.overdrive.app.onboarding.OnboardingHost(
+                this, daemonStartupManager.adbLauncher,
+            ).also { onboardingHost = it }
+            host.startIfNeeded()
+        }
+        if (delayMs <= 0L) runOnUiThread(runner)
+        else android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(runner, delayMs)
     }
     
     override fun onNewIntent(intent: android.content.Intent?) {
@@ -520,10 +549,16 @@ class MainActivity : AppCompatActivity() {
         val justUpdated = com.overdrive.app.updater.AppUpdater
             .consumeJustUpdatedVersion(this)
         if (justUpdated != null) {
-            // Marker non-null = update succeeded; DISPLAY the running build's
-            // BuildConfig identity (consistent with About/status), not the
-            // GitHub asset label which can differ on braveheart re-uploads.
-            val shown = com.overdrive.app.updater.AppUpdater.getInstalledVersion()
+            // Marker non-null = update succeeded; DISPLAY the installed GitHub
+            // label the marker carries (PREF_UPDATED_VERSION = remoteVersion) so
+            // this toast — and the Telegram post-update hint planted from `shown`
+            // below — match the About row (getDisplayVersion) and /status
+            // (getDisplayVersionFromFile), both VERSION_FILE-first. The old
+            // getInstalledVersion() returns the pinned BuildConfig identity
+            // (braveheart-v26.0), which is stale on a braveheart in-place
+            // re-upload. Empty marker → getDisplayVersion (VERSION_FILE-first).
+            val shown = if (justUpdated.isNotEmpty()) justUpdated
+                        else com.overdrive.app.updater.AppUpdater.getDisplayVersion(this)
             runOnUiThread {
                 Toast.makeText(this,
                     getString(R.string.toast_updated_to, shown),
@@ -707,6 +742,12 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     logsViewModel.info("ADB", "ADB authorization granted")
                     logsViewModel.info("ADB", "Re-initializing daemons...")
+
+                    // Advance the onboarding Step-0 (daemon auth) if it's waiting. This
+                    // is the SINGLE process-wide auth callback slot, so we notify the
+                    // host here rather than registering a second callback.
+                    onboardingHost?.onDaemonAuthGranted()
+                        ?: run { com.overdrive.app.onboarding.OnboardingState.get(this@MainActivity).daemonAuthorized = true }
                     
                     // Re-run daemon initialization now that ADB is authorized
                     android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
@@ -1265,6 +1306,7 @@ class MainActivity : AppCompatActivity() {
                 R.id.recordingsFragment,
                 R.id.vehicleControlFragment,
                 R.id.tripsFragment,
+                R.id.chargingFragment,
                 R.id.integrationsFragment,
                 R.id.roadSenseFragment,
                 R.id.diagnosticsFragment,
@@ -1301,6 +1343,8 @@ class MainActivity : AppCompatActivity() {
                 R.drawable.ic_vehicle_control, R.string.rail_vehicle),
             RailItem(R.id.railDestTrips, R.id.tripsFragment,
                 R.drawable.ic_trips, R.string.rail_trips),
+            RailItem(R.id.railDestCharging, R.id.chargingFragment,
+                R.drawable.ic_charging, R.string.rail_charging),
             RailItem(R.id.railDestIntegrations, R.id.integrationsFragment,
                 R.drawable.ic_integrations, R.string.rail_integrations),
             RailItem(R.id.railDestRoadSense, R.id.roadSenseFragment,
@@ -1367,6 +1411,13 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<View>(R.id.toolbarLanguageButton)?.setOnClickListener(languageClick)
         navigationRail.findViewById<View>(R.id.railLanguageButton)?.setOnClickListener(languageClick)
+
+        // Onboarding replay "?" — opens the guide's chapter menu (parked-gated inside
+        // the host). Present in the portrait toolbar AND the landscape rail header; wire
+        // both null-safely since only one exists per orientation.
+        val helpClick = View.OnClickListener { startOnboardingReplay() }
+        findViewById<View>(R.id.toolbarHelpButton)?.setOnClickListener(helpClick)
+        navigationRail.findViewById<View>(R.id.railHelpButton)?.setOnClickListener(helpClick)
     }
 
     private data class RailItem(
@@ -1613,13 +1664,21 @@ class MainActivity : AppCompatActivity() {
                 // reference would hold the destroyed activity in memory and
                 // showCameraMappingDialog could crash with
                 // "Activity has been destroyed" on layoutInflater.
-                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (isFinishing || isDestroyed) {
+                    // Don't strand a pending onboarding coach attached to a dead fetch.
+                    pendingCameraOnboardingCoach = null
+                    return@runOnUiThread
+                }
                 if (state == null) {
                     Toast.makeText(
                         this,
                         getString(R.string.toast_failed_to_save_short),
                         Toast.LENGTH_SHORT
                     ).show()
+                    // Fetch failed → the dialog won't open → the coach's attachToDialog
+                    // never fires. Clear it so it can't attach to a later manual open;
+                    // the coach's own failsafe timeout will defer the onboarding chapter.
+                    pendingCameraOnboardingCoach = null
                     return@runOnUiThread
                 }
                 showCameraMappingDialog(state)
@@ -1978,16 +2037,11 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton(getString(R.string.dialog_close), null)
             .create()
 
-        dialog.setOnDismissListener {
-            dialogClosed = true
-            previewHandler.removeCallbacksAndMessages(null)
-            // Drop the ImageView's drawable so the bitmap is no longer
-            // pinned, then recycle it — Android's GC won't reclaim the
-            // pixel buffer while the ImageView still references it.
-            previewImageView.setImageDrawable(null)
-            previousPreviewBitmap?.recycle()
-            previousPreviewBitmap = null
-        }
+        // NOTE: the dismiss listener is registered ONCE at the end of this method (after
+        // dialog.show()), so it can also unregister the ACC-dismiss receiver and notify
+        // the onboarding coach. It preserves this same teardown (recycle bitmap, stop the
+        // preview loop). Do not add a second setOnDismissListener here — it would replace
+        // that combined one and drop the ACC-receiver cleanup.
 
         // Lock both Save and Clear after the first click on either. The
         // success path dismisses the dialog and SIGKILLs the daemon for a
@@ -2382,6 +2436,57 @@ class MainActivity : AppCompatActivity() {
         selectCandidate(mappedCandidateIndexForRole(
             state.roles.getOrNull(currentRoleIndex)?.key ?: ""))
         dialog.show()
+
+        // SAFETY: the camera dialog shows a live 280dp preview that must NOT remain on
+        // screen while driving. The dialog has no ACC guard of its own, so register an
+        // ACC-ON/IGN-ON receiver (same vendor broadcast PinLockActivity uses) that
+        // dismisses it on the ignition edge — protecting BOTH the onboarding-driven open
+        // and a normal manual reconfigure. dialog.dismiss() drives the dismiss listener
+        // below (which also notifies the onboarding coach), so this is the single point
+        // that closes the dialog when the car starts moving.
+        val accDismissReceiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(ctx: android.content.Context?, intent: android.content.Intent?) {
+                when (intent?.action) {
+                    "com.byd.action.ACC_ON", "com.byd.action.IGN_ON" -> {
+                        android.util.Log.i("MainActivity", "ACC ON — dismissing camera mapping dialog")
+                        try { dialog.dismiss() } catch (_: Throwable) {}
+                    }
+                }
+            }
+        }
+        try {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(accDismissReceiver, android.content.IntentFilter().apply {
+                addAction("com.byd.action.ACC_ON")
+                addAction("com.byd.action.IGN_ON")
+            })
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "camera-dialog ACC receiver register failed: ${t.message}")
+        }
+
+        // If the onboarding camera wizard requested this dialog, hand it the dialog
+        // window + inflated view so it can attach coachmarks ABOVE the dialog and
+        // spotlight the real controls. Cleared on dismiss so a normal (non-onboarding)
+        // open never triggers the coach.
+        val onboardingCoach = pendingCameraOnboardingCoach
+        pendingCameraOnboardingCoach = null
+        val onboardingDecor = if (onboardingCoach != null) {
+            (dialog.window?.decorView as? android.view.ViewGroup)?.also { decor ->
+                onboardingCoach.attachToDialog(dialogView, decor)
+            }
+        } else null
+
+        // Single dismiss listener: preserves the original teardown (recycle bitmap,
+        // stop the preview loop), unregisters the ACC receiver, and notifies the coach.
+        dialog.setOnDismissListener {
+            dialogClosed = true
+            previewHandler.removeCallbacksAndMessages(null)
+            previewImageView.setImageDrawable(null)
+            previousPreviewBitmap?.recycle()
+            previousPreviewBitmap = null
+            try { unregisterReceiver(accDismissReceiver) } catch (_: Throwable) {}
+            if (onboardingCoach != null && onboardingDecor != null) onboardingCoach.onDialogDismissed()
+        }
     }
 
     private fun postSurveillanceConfig(body: String, onComplete: (Boolean, String?) -> Unit) {
@@ -3303,9 +3408,24 @@ class MainActivity : AppCompatActivity() {
         })
     }
     
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // MainActivity uses android:configChanges (no recreate on rotation), so the
+        // onboarding overlay's launch-orientation card width + spotlight cutout would go
+        // stale. Forward so it re-measures + re-resolves the anchor for the new orientation.
+        onboardingHost?.onConfigChanged()
+    }
+
     override fun onDestroy() {
         // Remove log listener
         LogManager.setLogListener(null)
+        // Tear down the onboarding overlay + its ACC receiver (mirrors the auth-callback
+        // teardown below — any guard cleared only in a callback needs a destroy path).
+        onboardingHost?.dismiss()
+        onboardingHost = null
+        // Cancel any in-flight nav-wait poll so it can't retain the Activity past destroy.
+        navPollRunnable?.let { mainHandler.removeCallbacks(it) }
+        navPollRunnable = null
         // Remove ADB auth callback
         com.overdrive.app.launcher.AdbShellExecutor.setAuthCallback(null)
         // Cancel the periodic update check so the Runnable doesn't leak the
@@ -3347,5 +3467,164 @@ class MainActivity : AppCompatActivity() {
         // Match drawer-open behavior: refresh status before showing dialog.
         checkTrafficMonitorStatus()
         onTrafficMonitorClicked()
+    }
+
+    // ===================== Onboarding bridge =====================
+    // Thin public entry points the onboarding coaches call. They reuse the EXISTING
+    // dialogs/handlers — onboarding never reimplements vehicle/camera logic.
+
+    /** Set by CameraWizardCoach before it opens the camera dialog; consumed on show(). */
+    private var pendingCameraOnboardingCoach: com.overdrive.app.onboarding.CameraWizardCoach? = null
+
+    /** Open the real camera-mapping dialog for the onboarding wizard to coach over. */
+    fun openCameraMappingForOnboarding(coach: com.overdrive.app.onboarding.CameraWizardCoach) {
+        pendingCameraOnboardingCoach = coach
+        onReconfigureCameraClicked()
+    }
+
+    /** Drop a pending coach (its open-failsafe fired) so a late fetch won't re-attach it. */
+    fun clearPendingCameraOnboardingCoach() {
+        pendingCameraOnboardingCoach = null
+    }
+
+    /**
+     * Run the real ~10s daemon restart so a pano-id save actually goes live during the
+     * camera wizard (btnSaveManualCameraId alone does not restart). Public wrapper around
+     * the private restartCameraDaemonForCameraSettings.
+     */
+    fun restartCameraDaemonForOnboarding() = restartCameraDaemonForCameraSettings()
+
+    /** Open the real vehicle capacity/model dialog for the vehicle chapter. */
+    fun openVehicleProfileForOnboarding() {
+        val nav = supportFragmentManager.findFragmentById(R.id.navHostFragment)
+                as? androidx.navigation.fragment.NavHostFragment
+        val dash = nav?.childFragmentManager?.primaryNavigationFragment
+                as? com.overdrive.app.ui.fragment.DashboardFragment
+        dash?.showVehicleCapacityDialog()
+    }
+
+    /** Live DashboardFragment root for the orientation tour anchors (null if not current). */
+    fun currentDashboardRoot(): android.view.View? {
+        val nav = supportFragmentManager.findFragmentById(R.id.navHostFragment)
+                as? androidx.navigation.fragment.NavHostFragment
+        val dash = nav?.childFragmentManager?.primaryNavigationFragment
+                as? com.overdrive.app.ui.fragment.DashboardFragment
+        return dash?.view
+    }
+
+    /** Expert-tour entry: land the user on Diagnostics (advanced camera knobs live there). */
+    fun openExpertTourEntry() {
+        try { navController.navigate(R.id.diagnosticsFragment) } catch (_: Throwable) {}
+    }
+
+    /**
+     * A nav-rail ROW view by id (e.g. R.id.railDestMap), for the Expert tour to spotlight
+     * entries that aren't nav destinations — notably the Hazard Map row, which launches a
+     * separate Activity (destinationId 0) so navigateForOnboarding can't reach it. Rail
+     * rows are always laid out regardless of the current fragment, so they're reliable
+     * anchors. Returns null in portrait where the rail row may be absent → caller centers.
+     */
+    fun railRowView(rowId: Int): android.view.View? =
+        try { navigationRail.findViewById(rowId) } catch (_: Throwable) { null }
+
+    /**
+     * Navigate to any nav destination for the Expert tour (navController is private, so
+     * coaches route through this). Returns false if the id isn't in the current graph.
+     */
+    fun navigateForOnboarding(destId: Int): Boolean {
+        return try { navController.navigate(destId); true } catch (_: Throwable) { false }
+    }
+
+    /** True if the given nav destination is currently shown (tour waits on this). */
+    fun isCurrentDestination(destId: Int): Boolean =
+        try { navController.currentDestination?.id == destId } catch (_: Throwable) { false }
+
+    /**
+     * Root view of the currently-shown native fragment (any type), for the Expert tour
+     * to resolve anchors. Null if the destination isn't laid out yet or is a WebView page
+     * with no inner anchors — callers degrade to a centered card.
+     */
+    fun currentFragmentRoot(): android.view.View? = currentNavFragment()?.view
+
+    /** The currently-shown nav destination fragment INSTANCE (not its view). */
+    private fun currentNavFragment(): androidx.fragment.app.Fragment? {
+        val nav = supportFragmentManager.findFragmentById(R.id.navHostFragment)
+                as? androidx.navigation.fragment.NavHostFragment
+        return nav?.childFragmentManager?.primaryNavigationFragment
+    }
+
+    /**
+     * Navigate to [destId] (if not already there) and invoke [onReady] with the TARGET
+     * fragment's laid-out root once navigation has actually committed.
+     *
+     * Why fragment-IDENTITY, not just currentDestination: navController.navigate() updates
+     * currentDestination.id SYNCHRONOUSLY, but FragmentNavigator commits the fragment
+     * transaction ASYNCHRONOUSLY (commit(), not commitNow) — so for one frame after
+     * navigate(), currentDestination.id already == destId while primaryNavigationFragment
+     * still points at the PREVIOUS fragment (whose view is laid out, width>0). A
+     * "committed && width>0" gate is therefore satisfied by the STALE fragment on the
+     * first tick and spotlights the wrong screen. We capture the pre-navigate fragment
+     * instance and wait until primaryNavigationFragment is a DIFFERENT, laid-out instance
+     * (or, for a same-destination no-op nav, accept the current one immediately).
+     */
+    fun navigateForOnboardingThen(destId: Int, onReady: (android.view.View?) -> Unit) {
+        // Cancel any in-flight poll from a prior call so its stale onReady can't fire
+        // against this (or a later) chapter. Chapters run sequentially today, but this
+        // makes re-entry safe regardless.
+        navPollRunnable?.let { mainHandler.removeCallbacks(it) }
+        navPollRunnable = null
+        val alreadyThere = isCurrentDestination(destId)
+        val previousFragment = currentNavFragment()
+        if (!alreadyThere) {
+            if (!navigateForOnboarding(destId)) { onReady(null); return }
+        }
+        fun attempt(remaining: Int) {
+            if (isFinishing || isDestroyed) { onReady(null); return }
+            val committed = isCurrentDestination(destId)
+            val frag = currentNavFragment()
+            val root = frag?.view
+            // Ready when: destination committed AND (we didn't navigate / it's a NEW
+            // fragment instance, not the stale previous one) AND the root is measured.
+            val isFreshOrSameDest = alreadyThere || (frag != null && frag !== previousFragment)
+            if (committed && isFreshOrSameDest && root != null && root.width > 0) {
+                onReady(root); return
+            }
+            if (remaining <= 0) { onReady(if (committed && isFreshOrSameDest) root else null); return }
+            val r = Runnable { attempt(remaining - 1) }
+            navPollRunnable = r
+            mainHandler.postDelayed(r, NAV_POLL_INTERVAL_MS)
+        }
+        attempt(NAV_POLL_MAX_ATTEMPTS)
+    }
+
+    private var navPollRunnable: Runnable? = null
+
+    /**
+     * Orientation-agnostic Settings anchor for the Expert tour (portrait card vs landscape
+     * sub-rail row). The live SettingsFragment resolves it and, in landscape, selects the
+     * section so its pane is shown. Null if Settings isn't current → caller centers.
+     */
+    fun settingsTourAnchor(
+        target: com.overdrive.app.ui.fragment.SettingsFragment.TourTarget,
+    ): android.view.View? {
+        val nav = supportFragmentManager.findFragmentById(R.id.navHostFragment)
+                as? androidx.navigation.fragment.NavHostFragment
+        val settings = nav?.childFragmentManager?.primaryNavigationFragment
+                as? com.overdrive.app.ui.fragment.SettingsFragment
+        return settings?.tourAnchorFor(target)
+    }
+
+    private fun ensureOnboardingHost(): com.overdrive.app.onboarding.OnboardingHost =
+        onboardingHost ?: com.overdrive.app.onboarding.OnboardingHost(
+            this, daemonStartupManager.adbLauncher,
+        ).also { onboardingHost = it }
+
+    /** Toolbar "?" — opens the Expert chapter menu (the on-demand help tour). */
+    fun startOnboardingReplay() = ensureOnboardingHost().startExpertTour()
+
+    /** Hidden Diagnostics long-press — wipe onboarding state and re-run the full novice track. */
+    fun resetAndReplayOnboarding() {
+        com.overdrive.app.onboarding.OnboardingState.get(this).reset()
+        ensureOnboardingHost().startReplay()
     }
 }

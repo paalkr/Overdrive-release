@@ -268,6 +268,18 @@ public class MqttConnectionManager {
 
         MqttConnectionConfig config = publisher.getConfig();
 
+        // Active health check, decoupled from whether a publish is due. The change-gated
+        // publish loop can skip idle cycles for up to maxIntervalSeconds, during which a
+        // silently-dropped link (idle NAT timeout, ACC-OFF data blackout) would otherwise
+        // go unnoticed — and QoS 0 means the eventual heartbeat publish can succeed into a
+        // half-open socket without throwing, so reconnect never triggers. Polling
+        // isConnected() each cycle lets us reconnect within ~keep-alive seconds of a drop.
+        try {
+            publisher.ensureAlive();
+        } catch (Exception e) {
+            logger.warn("Health check error for " + config.name + ": " + e.getMessage());
+        }
+
         try {
             // Collect telemetry (shared across all connections)
             JSONObject payload = collectTelemetry();
@@ -585,17 +597,32 @@ public class MqttConnectionManager {
             boolean v2l = false;
             if (vd != null && vd.chargingGunState != BydVehicleData.UNAVAILABLE) {
                 payload.put("is_dcfc", vd.chargingGunState == 3 ? 1 : 0);
-                if (vd.chargingGunState == 4) { payload.put("is_charging", 0); v2l = true; } // V2L
+                // V2L is gun state 5 (VTOL), NOT 4. Per BYDAutoChargingDevice:
+                // 2=AC, 3=DC, 4=AC_DC (a real combined charging gun), 5=VTOL. The
+                // old `== 4` mislabelled genuine AC_DC charging as V2L — forcing
+                // is_charging=0 (and, once charge_power gated on v2l, 0 kW) during a
+                // real charge. Every other site (BydDataCollector isVtol, ChargingDetector
+                // gunPlausible) correctly treats 5 as V2L and 4 as charging.
+                if (vd.chargingGunState == 5) { payload.put("is_charging", 0); v2l = true; } // V2L (VTOL)
             }
 
-            // charge_power — DC charge power into the pack (kW), from InstrumentDevice.getChargePower().
-            // Only meaningful while charging: getChargePower() returns garbage (~359) when idle, so
-            // gate on the charging state and a sane upper bound; 0 otherwise. This is the real charge
-            // rate (matches the BYD app / cloud battery_power, e.g. 2.9 kW on a 15 A AC charge).
+            // charge_power — DC charge power into the pack (kW). Prefer the direct
+            // getChargePower() reading; when it's absent (dead on PHEV) fall back to
+            // the resolved getChargingState().chargingPowerKW — the SAME value the app
+            // UI and ABRP use (SOC-derived ring estimator on PHEV) — so all surfaces
+            // agree. getChargePower() returns ~359 garbage when idle, so gate on the
+            // charging state and a sane upper bound; 0 otherwise.
             double chargeKw = 0;
-            if (isCharging && !v2l && vd != null && !Double.isNaN(vd.chargePowerKw)
-                    && vd.chargePowerKw > 0.1 && vd.chargePowerKw <= 300) {
-                chargeKw = vd.chargePowerKw;
+            if (isCharging && !v2l) {
+                if (vd != null && !Double.isNaN(vd.chargePowerKw)
+                        && vd.chargePowerKw > 0.1 && vd.chargePowerKw <= 300) {
+                    chargeKw = vd.chargePowerKw;
+                } else if (chargingState != null
+                        && !Double.isNaN(chargingState.chargingPowerKW)
+                        && chargingState.chargingPowerKW > 0.1
+                        && chargingState.chargingPowerKW <= 300) {
+                    chargeKw = chargingState.chargingPowerKW;
+                }
             }
             payload.put("charge_power", chargeKw);
 

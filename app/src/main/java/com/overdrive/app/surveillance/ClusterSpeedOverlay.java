@@ -84,9 +84,19 @@ public final class ClusterSpeedOverlay {
     private static final long EXEC_KEEPALIVE_MS = 5000;
 
     // Badge geometry, as fractions of the cluster panel (robust across cluster sizes).
-    private static final double BADGE_H_FRAC = 0.26;   // ~187px on a 720-tall panel
-    private static final double BADGE_ASPECT = 1.72;   // w / h
-    private static final int LEFT_MARGIN_PX = 56;      // gap from the left edge
+    // The badge is a SHORT single-line strip ("88 KM/H" on one row): height is small and
+    // the width is wide enough to hold the number + unit side by side. It sits just ABOVE
+    // the app-drawn TBT banner (RoadSenseMapActivity), left-aligned with it. The banner
+    // pins its TOP edge at panel.y/2, so the badge's BOTTOM is placed at panel.y/2 − gap
+    // (see createAndShow) — the two must agree on panel.y/2 as the shared seam, which they
+    // do since both read the same physical cluster panel height.
+    private static final double BADGE_H_FRAC = 0.13;   // ~94px on a 720-tall panel (single line)
+    private static final double BADGE_ASPECT = 2.7;    // w / h — wide short strip; fits "888 KM/H" on one line
+    private static final int LEFT_MARGIN_PX = 56;      // gap from the left edge (== banner marginStart)
+    // Gap (px) between the badge's BOTTOM and the TBT banner's TOP (which sits at panel.y/2).
+    // MUST stay in sync with the app's stack seam (RoadSenseMapActivity pins the banner top
+    // at panel.y/2, so the badge ends this many px above it).
+    private static final int BADGE_BOTTOM_GAP_PX = 12;
 
     private static volatile ClusterSpeedOverlay instance;
 
@@ -273,7 +283,7 @@ public final class ClusterSpeedOverlay {
                 bufferW = maxW;
                 bufferH = (int) Math.round(bufferW / BADGE_ASPECT);
             }
-            if (bufferW < 8 || bufferH < 8) { bufferW = 320; bufferH = 184; }
+            if (bufferW < 8 || bufferH < 8) { bufferW = 254; bufferH = 94; }   // short-strip fallback (matches BADGE_ASPECT)
 
             if (!createLayer("ClusterSpeed", bufferW, bufferH)) return false;
 
@@ -282,7 +292,10 @@ public final class ClusterSpeedOverlay {
 
             // Clamp x too so the badge always sits fully on-panel (left side).
             int x = Math.max(0, Math.min(LEFT_MARGIN_PX, panel.x - bufferW));
-            int y = Math.max(0, (panel.y - bufferH) / 2);   // vertically centred, left side
+            // Stack the badge just ABOVE the TBT banner: the app pins the banner's TOP at
+            // panel.y/2, so the badge's BOTTOM sits BADGE_BOTTOM_GAP_PX above that seam.
+            // Clamp to >=0 so a very tall badge can't push off the top edge.
+            int y = Math.max(0, panel.y / 2 - BADGE_BOTTOM_GAP_PX - bufferH);
             // Arm geometry HIDDEN, post the first "--" buffer, THEN show — so the layer is
             // never composited before a buffer exists (mirrors BsNativeLayer's
             // setGeometryHidden→render→show; avoids a one-transaction empty-layer flicker).
@@ -359,10 +372,12 @@ public final class ClusterSpeedOverlay {
     private void buildPaints(int w, int h) {
         float inset = h * 0.05f;
         badgeRect = new RectF(inset, inset, w - inset, h - inset);
-        badgeRadius = h * 0.22f;
+        badgeRadius = h * 0.30f;   // rounder corners for the short strip
         badgeCx = w / 2f;
-        numBaselineY = h * 0.55f;
-        unitBaselineY = h * 0.82f;
+        // Single-line layout: number + unit share ONE baseline, drawn as a centred pair
+        // (see drawGlassBadge). One baseline near the vertical centre of the short strip.
+        numBaselineY = h * 0.68f;
+        unitBaselineY = numBaselineY;   // same line as the number now
 
         badgeClip = new android.graphics.Path();
         badgeClip.addRoundRect(badgeRect, badgeRadius, badgeRadius, android.graphics.Path.Direction.CW);
@@ -381,17 +396,21 @@ public final class ClusterSpeedOverlay {
         pRim.setStrokeWidth(Math.max(1.5f, h * 0.012f));
         pRim.setColor(Color.argb(0x40, 0xFF, 0xFF, 0xFF));
 
+        // Number + unit are drawn side by side on one line and positioned as a centred
+        // group (drawGlassBadge measures the total run width), so both are LEFT-aligned
+        // here and the group is offset to centre it. Text sizes scale with the (now
+        // shorter) strip height; the number fills most of the row, the unit is smaller.
         pNum = new Paint(Paint.ANTI_ALIAS_FLAG);
         pNum.setColor(Color.WHITE);
         pNum.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
-        pNum.setTextAlign(Paint.Align.CENTER);
-        pNum.setTextSize(h * 0.50f);
+        pNum.setTextAlign(Paint.Align.LEFT);
+        pNum.setTextSize(h * 0.62f);
 
         pUnit = new Paint(Paint.ANTI_ALIAS_FLAG);
         pUnit.setColor(Color.argb(0xCC, 0xFF, 0xFF, 0xFF));
         pUnit.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL));
-        pUnit.setTextAlign(Paint.Align.CENTER);
-        pUnit.setTextSize(h * 0.16f);
+        pUnit.setTextAlign(Paint.Align.LEFT);
+        pUnit.setTextSize(h * 0.34f);
     }
 
     /**
@@ -421,9 +440,19 @@ public final class ClusterSpeedOverlay {
         // 3) Thin light rim.
         c.drawRoundRect(badgeRect, badgeRadius, badgeRadius, pRim);
 
-        // 4) Speed numerals + 5) unit label.
-        c.drawText(value, badgeCx, numBaselineY, pNum);
-        c.drawText(unit.toUpperCase(Locale.US), badgeCx, unitBaselineY, pUnit);
+        // 4)+5) Speed numerals and unit on ONE line, drawn as a horizontally-centred group:
+        // "88 KM/H". Measure the number, a spacer, and the unit, then start the run so the
+        // whole thing is centred in the badge (both paints are LEFT-aligned). The unit
+        // baseline is nudged up slightly so its smaller cap-height looks optically aligned
+        // with the number's midline rather than sitting on the same baseline.
+        String unitStr = unit.toUpperCase(Locale.US);
+        float gap = pNum.getTextSize() * 0.22f;          // space between number and unit
+        float numW = pNum.measureText(value);
+        float unitW = pUnit.measureText(unitStr);
+        float totalW = numW + gap + unitW;
+        float startX = badgeCx - totalW / 2f;
+        c.drawText(value, startX, numBaselineY, pNum);
+        c.drawText(unitStr, startX + numW + gap, unitBaselineY - pNum.getTextSize() * 0.06f, pUnit);
     }
 
     // ── Speed + units ───────────────────────────────────────────────────────────────

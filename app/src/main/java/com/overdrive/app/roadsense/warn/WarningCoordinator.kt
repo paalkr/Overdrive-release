@@ -109,11 +109,20 @@ class WarningCoordinator(
     private var stickyMinRangeM = Double.MAX_VALUE
 
     /**
-     * Evaluate one tick. [pose] is the live (or back-projected current) vehicle
-     * pose; [cfg] the current config snapshot; [headingReliable] false at crawl /
-     * no-fix (ApproachEngine then suppresses entirely — no direction-blind warnings).
+     * Evaluate one tick. [pose] is the RAW (back-projected current) vehicle pose and
+     * is the SOLE authority for every selection/geometry decision (queryAhead, rank /
+     * forward-cone / road-match, the sticky-visual recompute, and the latched running
+     * minimum) — so "is this hazard still ahead?" is always judged from the true fix.
+     * [displayPose] is the forward-extrapolated DISPLAY pose used ONLY to smooth the
+     * SHOWN distance so it counts down between the ~1–2 Hz fixes; it never decides
+     * whether a hazard is ahead (a constant-velocity dead-reckon over-advances while
+     * braking and could otherwise drop a not-yet-passed lead a tick early / skip the
+     * next cluster member). When extrapolation is off (crawl/bad fix) displayPose == the
+     * raw pose, so the shown range is just the raw range. [cfg] the current config
+     * snapshot; [headingReliable] false at crawl / no-fix (ApproachEngine then
+     * suppresses entirely — no direction-blind warnings).
      */
-    fun onTick(pose: Pose, cfg: RoadSenseConfig.Snapshot, headingReliable: Boolean) {
+    fun onTick(pose: Pose, displayPose: Pose, cfg: RoadSenseConfig.Snapshot, headingReliable: Boolean) {
         if (!cfg.enabled || !cfg.warnEnabled) {
             visualSink?.clearApproach()
             return
@@ -163,16 +172,39 @@ class WarningCoordinator(
         }
 
         val lead = visualTarget.lead
-        // The zone chimes/colours at its WORST member, not its nearest (D-032).
+        // AUDIO chimes at the zone's WORST member (D-032): one chime must convey the
+        // most serious thing in the cluster (a deep pothole 20 m past a gentle bump
+        // still warrants the urgent tone). The VISUAL, however, now reveals the cluster
+        // ONE HAZARD AT A TIME — closest first, advancing as each is passed — so the
+        // card's severity (arrow colour, pulse urgency) must describe the LEAD hazard
+        // actually being shown, not a worse one still further ahead. Colouring the
+        // nearest gentle bump "severe" because of a later pothole misreads the card.
+        // Split them: zone-worst drives audio, lead drives the visual.
         val sev = severityFromLevel(visualTarget.maxSeverityLevel)
+        // A rough/washboard SECTION is shown as one continuous stretch (not advanced
+        // hazard-by-hazard), so it keeps the zone-worst tint; a discrete cluster is
+        // revealed one bump at a time, so its tint follows the lead bump being shown.
+        val visualSev = if (visualTarget.isRoughSection) sev
+            else severityFromLevel(lead.stored.hazard.severity.level)
         val now = clock()
 
         // (A) VISUAL: refresh every tick while the hazard is ahead in the interest band
         // — NOT gated on the dynamic alertDist. Shown continuously, distance counting
         // down, until passed. (visual modes = VISUAL or BOTH)
         if (cfg.warnMode != RoadSenseConfig.WarnMode.AUDIO) {
+            // SHOWN distance smoothing: the lead range above is from the RAW fix (so the
+            // ahead/passed decision is honest), but the raw fix is step-held flat between
+            // the ~1–2 Hz pushes, so it freezes then jumps. Subtract the forward-advance
+            // the DISPLAY pose dead-reckoned past the raw fix (how far we've travelled
+            // since the fix) so the shown number counts down smoothly — clamped so it can
+            // NEVER cross the hazard (>= minRange) and never below 0. displayPose == pose
+            // when extrapolation is off, so this is a no-op (raw range) at crawl/bad fix.
+            val forwardAdvanceM = GeoMath.haversineMeters(
+                pose.lat, pose.lng, displayPose.lat, displayPose.lng
+            ).coerceAtMost((lead.rangeM - approach.minRangeMeters).coerceAtLeast(0.0))
+            val displayRangeM = lead.rangeM - forwardAdvanceM
             visualSink?.showApproach(
-                lead.stored.id, lead.rangeM, lead.relativeBearingDeg, sev,
+                lead.stored.id, displayRangeM, lead.relativeBearingDeg, visualSev,
                 lead.stored.hazard.type.ordinal,
                 visualTarget.count, visualTarget.lengthM.toInt(), visualTarget.isRoughSection,
             )

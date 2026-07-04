@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title data-i18n="app.charging_title">Charging - OverDrive</title>
+    <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="../shared/app-icon-dark.webp">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0EA5E9">
+    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/app-shell.js?v=2"></script>
+    <!--
+      Bottom-tab manifest for Charging. Tabs apply to the LIST VIEW only;
+      the DETAIL VIEW (#chargingDetail) is a sequential drill-in and ignores
+      data-tab so its full content stays scrollable.
+        Sessions — date filters + session-card list + empty state + load-more
+        Stats    — live SoC / energy / cost hero + SoC-over-time + trends
+        Settings — rate / currency / sampling + clear-history (Data)
+    -->
+    <script>
+        window.OT_TABS = [
+            { id: 'sessions', label: 'Sessions', i18n: 'charge.tab_sessions', svg: '<path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/>' },
+            { id: 'stats',    label: 'Stats',    i18n: 'charge.tab_stats',    svg: '<polyline points="3 17 9 11 13 15 21 7"/><polyline points="14 7 21 7 21 14"/>' },
+            { id: 'settings', label: 'Settings', i18n: 'charge.tab_settings', svg: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>' }
+        ];
+    </script>
+    <script src="../shared/app-tabs.js"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=17">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <style>
+        /* ===== OLD WEBVIEW COMPAT (Chrome <88, Android 7.x) ===== */
+        /* Flexbox gap is Grid-only on old Chrome — fall back to margin via > * + *. */
+        .hero-row > * + * { margin-top: 20px; }
+        @media (min-width: 768px) { .hero-row > * + * { margin-top: 0; margin-left: 20px; } }
+        .filter-tabs > * + * { margin-left: 6px; }
+
+        /* ===== HERO ROW ===== */
+        .hero-row {
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 24px;
+        }
+        @media (min-width: 768px) { .hero-row { flex-direction: row; } }
+        .ch-hero-card {
+            flex: 1;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+        }
+        .ch-hero-card .card-title {
+            display: flex;
+            align-items: center;
+            align-self: flex-start;
+            margin-bottom: 16px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+        .ch-hero-card .card-title > svg + span { margin-left: 8px; }   /* gap ignored on Chrome-58 */
+        .ch-hero-gauge-wrap { position: relative; width: 120px; height: 120px; margin: 0 auto; }
+        /* Center the value over the gauge with the translate(-50%) pattern, NOT
+           `inset:0` (Chrome 87+; the head-unit WebView is Chrome 58 and would
+           ignore it, dropping the % text to the top-left). Mirrors Trips. */
+        .ch-hero-gauge-value {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 22px; font-weight: 700; color: var(--text-primary);
+            line-height: 1; white-space: nowrap;
+        }
+        .ch-hero-big { font-size: 34px; font-weight: 700; color: var(--text-primary); margin-top: 8px; }
+        .ch-hero-sub { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+
+        /* ===== FILTER TABS ===== */
+        .filter-tabs {
+            display: flex;
+            overflow-x: auto;
+            scrollbar-width: none;
+            margin-bottom: 20px;
+        }
+        .filter-tabs::-webkit-scrollbar { display: none; }
+        .filter-tab {
+            padding: 8px 16px;
+            border-radius: var(--radius-full);
+            border: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        @media (min-width: 480px) { .filter-tab { flex: 1; text-align: center; } }
+        .filter-tab.active { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-default); }
+        /* Custom date-range row (From → To + Apply). */
+        /* Custom From → To range picker. Stacks the date row over a full-width
+           Apply so nothing wraps awkwardly on a narrow phone. Collapsed by
+           default; revealed with a height+fade transition (display:none can't
+           animate). Apply reuses .btn .btn-primary for design-system styling. */
+        /* NOTE: flex `gap` is ignored on the Chrome-58 head-unit WebView, so all
+           spacing here uses margins (the dates ran together / collapsed without
+           it). No `gap` anywhere in this block. */
+        .ch-range-row {
+            display: flex; flex-direction: column;
+            max-height: 0; opacity: 0; overflow: hidden; margin-top: 0;
+            transition: max-height 0.3s ease, opacity 0.2s ease, margin-top 0.3s ease;
+        }
+        .ch-range-row.open { max-height: 160px; opacity: 1; margin-top: 12px; }
+        /* From | → | To on ONE line; the two pills share the width equally. */
+        .ch-range-dates { display: flex; align-items: center; margin-bottom: 10px; }
+        .ch-range-dates .calendar-toggle { flex: 1 1 0; min-width: 0; justify-content: center; }
+        .ch-range-dates .calendar-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ch-range-arrow { color: var(--text-muted); font-size: 14px; flex: 0 0 auto; margin: 0 8px; }
+        /* .btn-primary hardcodes color:#000 (only right for dark theme). Use the
+           M3 --on-primary token so the label is white on the dark-green light-
+           theme brand and dark on the mint dark-theme brand. */
+        .ch-range-apply { width: 100%; padding: 10px 18px; color: var(--on-primary, #000); }
+        /* Calendar toggle button + popup — mirrors the events page picker. */
+        .calendar-toggle {
+            display: inline-flex; align-items: center;
+            padding: 9px 14px; border-radius: var(--radius-full);
+            background: var(--bg-surface); border: 1px solid var(--border-subtle);
+            color: var(--text-primary); font-size: 13px; font-weight: 600; cursor: pointer;
+            transition: all 0.2s;
+        }
+        .calendar-toggle svg + span { margin-left: 8px; }   /* gap ignored on Chrome-58 */
+        .calendar-toggle:hover { background: var(--bg-elevated); border-color: var(--brand-primary); }
+        .calendar-toggle.has-date { background: var(--brand-primary); color: var(--bg-base); border-color: var(--brand-primary); }
+        .calendar-toggle svg { width: 18px; height: 18px; flex: 0 0 auto; }
+        .calendar-popup {
+            /* Explicit edges, NOT inset:0 — inset is Chrome-87+; the head-unit
+               WebView is Chrome-58 and would drop the full-screen overlay. */
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--panel-overlay-bg-deep);
+            z-index: 500; display: none; align-items: flex-end; justify-content: center;
+            -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+        }
+        .calendar-popup.active { display: flex; }
+        .calendar-panel {
+            background: var(--bg-surface); border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+            padding: 20px; padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+            width: 100%; max-width: 100%; max-height: 85vh; overflow-y: auto;
+            display: flex; flex-direction: column;
+            box-shadow: var(--shadow-lg); animation: chgSlideUp 0.3s ease;
+        }
+        .calendar-panel > * + * { margin-top: 16px; }   /* gap ignored on Chrome-58 */
+        @keyframes chgSlideUp { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @media (min-width: 480px) {
+            .calendar-popup { align-items: center; padding: 20px; }
+            .calendar-panel { border-radius: var(--radius-lg); max-width: 340px; max-height: none; padding-bottom: 20px; animation: chgPopIn 0.2s ease; }
+        }
+        @keyframes chgPopIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .calendar-header { display: flex; justify-content: space-between; align-items: center; }
+        .calendar-title { font-size: 18px; font-weight: 600; }
+        .calendar-nav { display: flex; }
+        .calendar-nav button + button { margin-left: 8px; }   /* gap ignored on Chrome-58 */
+        .calendar-nav button {
+            width: 32px; height: 32px; border-radius: var(--radius-sm);
+            background: var(--bg-elevated); color: var(--text-secondary);
+            display: flex; align-items: center; justify-content: center; transition: all 0.2s;
+        }
+        .calendar-nav button:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+        .calendar-weekday { text-align: center; font-size: 11px; font-weight: 600; color: var(--text-muted); padding: 8px 0; text-transform: uppercase; }
+        .calendar-day {
+            /* aspect-ratio is Chrome-88+ and is ignored on the Chrome-58
+               head-unit WebView, so without an explicit height the cell would
+               collapse to text height. The grid track (repeat(7,1fr)) sets the
+               width; pin the height to 40px as the fallback square so the
+               layout matches modern Chrome (where aspect-ratio takes over). */
+            aspect-ratio: 1; height: 40px; display: flex; align-items: center; justify-content: center;
+            border-radius: var(--radius-sm); font-size: 13px; font-weight: 500;
+            color: var(--text-secondary); cursor: pointer; position: relative;
+            transition: all 0.2s; min-height: 40px;
+            -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+        }
+        .calendar-day:hover { background: var(--bg-hover); }
+        .calendar-day:active { background: var(--bg-elevated); transform: scale(0.95); }
+        .calendar-day.other-month { color: var(--text-muted); opacity: 0.5; }
+        .calendar-day.today { background: var(--bg-elevated); color: var(--text-primary); font-weight: 600; }
+        .calendar-day.selected { background: var(--brand-primary); color: var(--bg-base); }
+        /* In-range days between From and To get a subtle fill. */
+        .calendar-day.in-range { background: rgba(14,165,233,0.16); color: var(--text-primary); }
+        .calendar-day.disabled { color: var(--text-muted); opacity: 0.3; cursor: not-allowed; pointer-events: none; }
+        .calendar-close {
+            margin-top: 8px; padding: 10px; background: var(--bg-elevated);
+            border-radius: var(--radius-md); color: var(--text-secondary);
+            font-size: 13px; font-weight: 500; text-align: center; cursor: pointer; transition: all 0.2s;
+        }
+
+        /* ===== SESSION CARDS ===== */
+        #sessionList {
+            display: grid;
+            /* Multi-column on wide screens; the 260px min keeps the pill + badge
+               on one row there. min(...) isn't supported on the Chrome-58
+               head-unit WebView, so the narrow case is handled by the media
+               query below (single column) to stop the cards overflowing right. */
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 12px;
+        }
+        @media (max-width: 560px) {
+            #sessionList { grid-template-columns: 1fr; }
+        }
+        .session-card {
+            position: relative;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: 20px;
+            padding: 20px;
+            cursor: pointer;
+            /* Match the Trips card motion: lift + glow on the same easing curve. */
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            overflow: hidden;
+        }
+        .session-card:hover {
+            background: var(--bg-elevated);
+            border-color: rgba(0,212,170,0.4);
+            transform: translateY(-4px);
+            box-shadow: 0 10px 30px var(--panel-overlay-bg-soft);
+        }
+        /* NOTE: flex `gap` is ignored on the Chrome-58 head-unit WebView, so every
+           intra-card spacing below uses sibling margins, not gap, or values run
+           together ("AC SLOW7.0 kW", pin touching the place name, etc.). */
+        /* Both children are single-line now (pill is nowrap), so centre-align is
+           safe and keeps the pill + date/badge on a shared vertical axis. */
+        .session-card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-right: 30px; }
+        .session-card-top > * + * { margin-left: 10px; }
+        /* SOTA charge-type pill: tier icon + label + peak-kW chip, colour-coded
+           per tier (DC fast / AC fast / AC slow / unknown). */
+        .session-type {
+            display: inline-flex; align-items: center;
+            font-size: 11px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+            padding: 5px 10px; border-radius: var(--radius-full);
+            border: 1px solid transparent;
+            /* Size to content and never wrap or shrink: a shrinking pill
+               collapsed the "AC slow" label to zero width (only the icon + kW
+               chip showed); a wrapping pill grew taller than the date and broke
+               row centring. Sit on one line at natural width. */
+            flex: 0 0 auto; white-space: nowrap;
+        }
+        .session-type svg { width: 14px; height: 14px; flex: 0 0 auto; }
+        .session-type > svg + span { margin-left: 6px; }   /* icon → label */
+        .session-type-peak {
+            font-weight: 600; letter-spacing: 0; text-transform: none;
+            opacity: .85; margin-left: 6px; padding-left: 6px; border-left: 1px solid currentColor;
+            flex: 0 0 auto;
+        }
+        /* DC fast — electric blue. */
+        .session-type-dc   { background: rgba(14,165,233,0.16);  color: #0EA5E9; border-color: rgba(14,165,233,0.35); }
+        /* AC fast (wallbox) — teal. */
+        .session-type-fast { background: rgba(0,212,170,0.16);   color: #00D4AA; border-color: rgba(0,212,170,0.35); }
+        /* AC slow (trickle) — amber. */
+        .session-type-slow { background: rgba(245,158,11,0.16);  color: #F59E0B; border-color: rgba(245,158,11,0.35); }
+        .session-type-unk  { background: var(--bg-elevated);     color: var(--text-muted); }
+        .session-date { font-size: 12px; color: var(--text-muted); flex: 0 0 auto; white-space: nowrap; }
+        /* "Charging now" live badge for the open in-progress session. */
+        .session-live { display: inline-flex; align-items: center; flex: 0 0 auto; white-space: nowrap;
+            font-size: 12px; font-weight: 600; color: #00D4AA; }
+        .session-live > * + * { margin-left: 6px; }   /* dot → text (gap ignored on Chrome-58) */
+        .session-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #00D4AA;
+            box-shadow: 0 0 0 0 rgba(0,212,170,0.6); animation: chgLivePulse 1.6s ease-out infinite; }
+        @keyframes chgLivePulse {
+            0%   { box-shadow: 0 0 0 0 rgba(0,212,170,0.55); }
+            70%  { box-shadow: 0 0 0 7px rgba(0,212,170,0); }
+            100% { box-shadow: 0 0 0 0 rgba(0,212,170,0); }
+        }
+        /* Headline figures row: energy added (left) + cost (right), both prominent. */
+        .session-figures { display: flex; align-items: baseline; justify-content: space-between; }
+        .session-figures > * + * { margin-left: 12px; }   /* gap ignored on Chrome-58 */
+        .session-energy { font-size: 26px; font-weight: 700; color: var(--text-primary); }
+        .session-cost { font-size: 18px; font-weight: 700; color: var(--brand-primary, #0EA5E9); }
+        /* Location chip: pin + place name / coords. */
+        .session-loc {
+            display: flex; align-items: center;
+            margin-top: 10px; font-size: 12px; color: var(--text-secondary);
+            overflow: hidden;
+        }
+        .session-loc svg { width: 14px; height: 14px; flex: 0 0 auto; color: var(--text-muted); }
+        .session-loc svg + span { margin-left: 6px; }   /* pin → place (gap ignored on Chrome-58) */
+        .session-loc span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* gap: is ignored for flexbox on the Chrome-58 head-unit WebView, which
+           ran the meta values together ("20% → 99%4:07 PM…"). Use sibling
+           margins (no gap, so no double-spacing where gap DOES work). */
+        .session-meta { display: flex; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: var(--text-secondary); }
+        .session-meta > span + span { margin-left: 14px; }
+
+        /* Detail location row. gap is ignored on the Chrome-58 head-unit
+           WebView (flex gap is Chrome-84+), so the pin/text and the map button
+           collapsed together. Space them with a sibling margin on the main
+           block instead (there are exactly two children). */
+        .ch-loc-row { display: flex; align-items: center; justify-content: space-between; }
+        .ch-loc-main { display: flex; align-items: center; min-width: 0; margin-right: 16px; }
+        .ch-loc-main > svg { width: 22px; height: 22px; flex: 0 0 auto; color: var(--brand-primary, #0EA5E9); margin-right: 12px; }
+        .ch-map-link {
+            flex: 0 0 auto;
+            padding: 8px 14px; border-radius: var(--radius-full);
+            border: 1px solid var(--border-subtle); background: var(--bg-elevated);
+            color: var(--text-primary); font-size: 13px; font-weight: 600; text-decoration: none;
+        }
+
+        /* Per-card delete (hover-reveal trash, mirrors trip-delete-btn). */
+        .session-delete-btn {
+            position: absolute; top: 12px; right: 12px;
+            width: 30px; height: 30px; padding: 0;
+            display: flex; align-items: center; justify-content: center;
+            border: none; border-radius: var(--radius-sm);
+            background: transparent; color: var(--text-muted);
+            cursor: pointer; opacity: 0; transition: opacity .15s, background .15s, color .15s;
+        }
+        .session-card:hover .session-delete-btn { opacity: 1; }
+        .session-delete-btn:hover { background: rgba(239,68,68,0.16); color: #EF4444; }
+        .session-delete-btn svg { width: 15px; height: 15px; }
+        /* Touch devices have no hover — keep the trash faintly visible. */
+        @media (hover: none) { .session-delete-btn { opacity: .55; } }
+
+        .ch-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-lg);
+            padding: 20px 24px;
+            margin-bottom: 16px;
+        }
+        .ch-card h3 { font-size: 15px; font-weight: 600; margin: 0 0 14px; color: var(--text-primary); }
+        .ch-card canvas { width: 100%; display: block; }
+        /* Card head with title + an inline period selector on the right.
+           flex gap is ignored on the Chrome-58 head-unit WebView (Chrome-84+),
+           so use a sibling margin for the inter-item horizontal spacing; the
+           vertical spacing when the row wraps is covered by the children's own
+           bottom margins (h3 / .ch-period-tabs both have margin-bottom:14px). */
+        .ch-card-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+        .ch-card-head > * + * { margin-left: 12px; }
+        .ch-card-head h3 { margin: 0 0 14px; }
+        .ch-card-sub { margin: -6px 0 12px; font-size: 12px; color: var(--text-muted); }
+        /* Compact period tabs (smaller than the full-width session filter tabs). */
+        .ch-period-tabs { margin-bottom: 14px; overflow: visible; }
+        .ch-period-tabs .filter-tab { flex: 0 0 auto; padding: 5px 12px; font-size: 12px; }
+        .ch-period-tabs .filter-tab + .filter-tab { margin-left: 6px; }
+
+        /* ===== SUMMARY / DETAIL STAT GRID ===== */
+        .ch-stat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 12px;
+        }
+        .ch-stat {
+            background: var(--bg-elevated);
+            border-radius: var(--radius-md);
+            padding: 14px 16px;
+        }
+        .ch-stat span { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+        .ch-stat strong { font-size: 18px; font-weight: 700; color: var(--text-primary); }
+
+        .load-more-btn {
+            display: block;
+            width: 100%;
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+            color: var(--text-secondary);
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .empty-state { text-align: center; padding: 48px 16px; color: var(--text-muted); }
+        .empty-state svg { width: 56px; height: 56px; opacity: .4; margin-bottom: 12px; }
+
+        .ch-skeleton-card { height: 96px; border-radius: var(--radius-lg); background: var(--bg-surface); opacity: .5; animation: chPulse 1.3s ease-in-out infinite; }
+        @keyframes chPulse { 0%,100% { opacity: .35; } 50% { opacity: .6; } }
+
+        /* ===== DETAIL DRILL-IN ===== */
+        #chargingDetail.hidden { display: none; }
+        #sessionListView.hidden { display: none; }
+        .ch-detail-head { display: flex; align-items: center; margin-bottom: 18px; }
+        .ch-detail-head > * + * { margin-left: 12px; }   /* gap ignored on Chrome-58 */
+        .ch-back-btn {
+            display: inline-flex; align-items: center;   /* svg+span spacing via sibling margin (Chrome-58: flex gap unsupported) */
+            padding: 8px 14px; border-radius: var(--radius-full);
+            border: 1px solid var(--border-subtle); background: var(--bg-surface);
+            color: var(--text-secondary); font-weight: 600; cursor: pointer;
+        }
+        .ch-back-btn svg { width: 16px; height: 16px; }
+        .ch-back-btn svg + span, .ch-detail-delete-btn svg + span { margin-left: 6px; }  /* gap ignored on Chrome-58 */
+        .ch-detail-delete-btn {
+            margin-left: auto;
+            display: inline-flex; align-items: center;   /* svg+span spacing via sibling margin (Chrome-58: flex gap unsupported) */
+            padding: 8px 14px; border-radius: var(--radius-full);
+            border: 1px solid rgba(239,68,68,0.4); background: rgba(239,68,68,0.08);
+            color: #EF4444; font-weight: 600; cursor: pointer;
+        }
+        .ch-detail-delete-btn:hover { background: rgba(239,68,68,0.18); }
+        .ch-detail-delete-btn svg { width: 16px; height: 16px; }
+
+        /* ===== SETTINGS =====
+           .setting-row / .setting-name / .setting-desc are CANONICAL shared
+           classes (styles.css) — do NOT redefine here. Only the value-control
+           styling + charging-specific note/danger button live below, on tokens. */
+        /* Match the Trips settings controls exactly: compact mono number field
+           (digits line up), elevated surface, token radius. The currency select
+           keeps its own max-width (set inline, like Trips). */
+        /* Settings rate control + button row — flex `gap` is ignored on the
+           Chrome-58 head-unit WebView, so space children with sibling margins. */
+        .ch-rate-control { display: flex; align-items: center; }
+        .ch-rate-control > * + * { margin-left: 8px; }
+        .settings-button-row { display: flex; }
+        .settings-button-row > * + * { margin-left: 8px; }
+        .ch-card .setting-row input[type="number"], .ch-card .setting-row select {
+            padding: 8px 10px; border-radius: var(--radius-sm);
+            border: 1px solid var(--border-subtle); background: var(--bg-elevated);
+            color: var(--text-primary); font-size: 13px;
+        }
+        .ch-card .setting-row input[type="number"] {
+            width: 80px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .ch-note { font-size: 12px; color: var(--text-muted); margin-top: 12px; }
+        .ch-danger-btn {
+            padding: 10px 16px; border-radius: var(--radius-md);
+            border: 1px solid rgba(231,76,60,0.4); background: rgba(231,76,60,0.08);
+            color: #e74c3c; font-weight: 600; cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-layout">
+        <!-- App shell sidebar (rendered by ../shared/app-shell.js) -->
+        <div id="app-shell-mount"></div>
+        <main class="main-content">
+            <div class="mobile-header">
+                <button class="menu-toggle" onclick="toggleSidebar()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg>
+                </button>
+                <span style="font-weight:600;" data-i18n="charge.title">Charging</span>
+                <div style="width:40px;"></div>
+            </div>
+
+            <header class="page-header">
+                <h1 class="page-title" data-i18n="charge.title">Charging</h1>
+                <div class="header-actions">
+                    <div class="header-badge">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        <span id="currentTime">--:--</span>
+                    </div>
+                </div>
+            </header>
+
+            <div class="page-body">
+                <!-- ========== SESSION LIST VIEW ========== -->
+                <div id="sessionListView">
+
+                    <!-- Hero (Stats tab): live SoC, energy this period, cost/kWh -->
+                    <div class="hero-row" data-tab="stats" id="heroRow">
+                        <div class="ch-hero-card" id="socHeroCard">
+                            <div class="card-title">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;color:var(--brand-primary,#0EA5E9)"><rect x="6" y="6" width="14" height="12" rx="2"/><line x1="22" y1="10" x2="22" y2="14"/></svg>
+                                <span data-i18n="charge.hero_soc">State of charge</span>
+                            </div>
+                            <div class="ch-hero-gauge-wrap">
+                                <canvas id="socCircleCanvas" width="120" height="120"></canvas>
+                                <div class="ch-hero-gauge-value" id="socCircleValue">--</div>
+                            </div>
+                        </div>
+                        <div class="ch-hero-card" id="kwhHeroCard">
+                            <div class="card-title">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;color:var(--brand-primary,#0EA5E9)"><path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/></svg>
+                                <span id="kwhHeroLabel" data-i18n="charge.hero_energy">Added this period</span>
+                            </div>
+                            <div class="ch-hero-big"><span id="kwhHeroValue">--</span> <span style="font-size:16px;color:var(--text-muted)">kWh</span></div>
+                        </div>
+                        <div class="ch-hero-card" id="costHeroCard">
+                            <div class="card-title">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;color:var(--brand-primary,#0EA5E9)"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 0 1 5 0c0 1.5-2.5 2-2.5 3.5"/><line x1="12" y1="16" x2="12" y2="16.5"/></svg>
+                                <span id="costHeroLabel" data-i18n="charge.hero_cost">Cost per kWh</span>
+                            </div>
+                            <div class="ch-hero-big" id="costHeroValue">--</div>
+                            <div class="ch-hero-sub" id="costHeroSub"></div>
+                        </div>
+                    </div>
+
+                    <!-- SoC over time (Stats tab) -->
+                    <div class="ch-card" data-tab="stats">
+                        <div class="ch-card-head">
+                            <h3 data-i18n="charge.chart_soc_title">State of charge over time</h3>
+                            <div class="filter-tabs ch-period-tabs" id="socPeriodTabs">
+                                <button class="filter-tab" data-hours="24" onclick="CHARGING.socPeriod(24, this)" data-i18n="charge.period_24h">24h</button>
+                                <button class="filter-tab active" data-hours="168" onclick="CHARGING.socPeriod(168, this)" data-i18n="charge.period_7d">7d</button>
+                                <button class="filter-tab" data-hours="720" onclick="CHARGING.socPeriod(720, this)" data-i18n="charge.period_30d">30d</button>
+                            </div>
+                        </div>
+                        <canvas id="socChart"></canvas>
+                    </div>
+
+                    <!-- Trend / lifetime cards (Stats tab). These are derived from
+                         completed charging sessions, so they're HIDDEN until at
+                         least one session exists (JS toggles via these ids) — no
+                         point showing empty chart frames. -->
+                    <div class="ch-card" data-tab="stats" id="sohTrendCard" style="display:none;">
+                        <h3 data-i18n="charge.chart_soh_title">Battery health trend</h3>
+                        <canvas id="sohTrendChart"></canvas>
+                    </div>
+                    <div class="ch-card" data-tab="stats" id="monthlyCostCard" style="display:none;">
+                        <h3 data-i18n="charge.chart_cost_title">Energy cost</h3>
+                        <canvas id="monthlyCostChart"></canvas>
+                    </div>
+                    <div class="ch-card" data-tab="stats" id="efficiencyCard" style="display:none;">
+                        <h3 data-i18n="charge.chart_energy_title">Energy per charge</h3>
+                        <div class="ch-card-sub" data-i18n="charge.chart_energy_sub">kWh added each session — DC blue, AC teal</div>
+                        <canvas id="efficiencyChart"></canvas>
+                    </div>
+
+                    <!-- Lifetime totals (Stats tab) -->
+                    <div class="ch-card" data-tab="stats" id="lifetimeCard" style="display:none;">
+                        <h3 data-i18n="charge.lifetime_title">Lifetime</h3>
+                        <div class="ch-stat-grid">
+                            <div class="ch-stat"><span data-i18n="charge.lifetime_sessions">Total sessions</span><strong id="lifetimeSessions">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.lifetime_energy">Total energy</span><strong id="lifetimeEnergy">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.lifetime_cost">Total cost</span><strong id="lifetimeCost">--</strong></div>
+                        </div>
+                    </div>
+
+                    <!-- Empty-state for the Stats tab when no charging sessions
+                         have been recorded yet (only the SoC chart + hero show). -->
+                    <div class="ch-card empty-state" data-tab="stats" id="statsEmptyState" style="display:none;">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/></svg>
+                        <div id="statsEmptyMsg" data-i18n="charge.no_data_yet">No charging data yet</div>
+                        <div style="font-size:13px;margin-top:6px;" data-i18n="charge.no_data_hint">Trends and totals appear after your first recorded charge</div>
+                    </div>
+
+                    <!-- Filters (Sessions tab) -->
+                    <div data-tab="sessions" id="sessionFilters">
+                        <div class="filter-tabs">
+                            <button class="filter-tab active" data-days="7" onclick="CHARGING.quickFilter(7, this)" data-i18n="charge.filter_7d">7 days</button>
+                            <button class="filter-tab" data-days="30" onclick="CHARGING.quickFilter(30, this)" data-i18n="charge.filter_30d">30 days</button>
+                            <button class="filter-tab" data-days="0" onclick="CHARGING.quickFilter(0, this)" data-i18n="charge.filter_all">All time</button>
+                            <button class="filter-tab" id="chargeCustomTab" onclick="CHARGING.toggleCustomRange(this)" data-i18n="charge.filter_custom">Custom</button>
+                        </div>
+                        <!-- Custom date range (hidden until "Custom" is tapped).
+                             Each field opens the shared calendar popup — matches
+                             the events-page date picker look & feel. -->
+                        <div class="ch-range-row" id="chargeRangeRow">
+                            <div class="ch-range-dates">
+                                <button class="calendar-toggle" id="chargeFromToggle" onclick="CHARGING.openCalendar('from')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                                    <span id="chargeFromText" data-i18n="charge.range_from">From</span>
+                                </button>
+                                <span class="ch-range-arrow">→</span>
+                                <button class="calendar-toggle" id="chargeToToggle" onclick="CHARGING.openCalendar('to')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                                    <span id="chargeToText" data-i18n="charge.range_to">To</span>
+                                </button>
+                            </div>
+                            <button class="btn btn-primary ch-range-apply" onclick="CHARGING.applyCustomRange()" data-i18n="charge.range_apply">Apply</button>
+                        </div>
+                    </div>
+
+                    <!-- Period summary (Sessions tab) -->
+                    <div class="ch-card" data-tab="sessions" id="chargeSummary">
+                        <div class="ch-stat-grid">
+                            <div class="ch-stat"><span data-i18n="charge.summary_sessions">Sessions</span><strong id="summarySessions">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.summary_energy">Energy</span><strong id="summaryEnergy">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.summary_cost">Cost</span><strong id="summaryCost">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.summary_dc_ac">DC / AC</span><strong id="summaryDcAc">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.summary_range_gained">Range added</span><strong id="summaryRangeGained">--</strong></div>
+                        </div>
+                    </div>
+
+                    <!-- Session list (Sessions tab) -->
+                    <div data-tab="sessions">
+                        <div id="sessionListSkeleton">
+                            <div class="ch-skeleton-card" style="margin-bottom:12px;"></div>
+                            <div class="ch-skeleton-card" style="margin-bottom:12px;"></div>
+                            <div class="ch-skeleton-card"></div>
+                        </div>
+                        <div id="sessionList"></div>
+                        <div class="empty-state" id="sessionEmptyState" style="display:none;">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/></svg>
+                            <div data-i18n="charge.no_sessions_yet">No charging sessions yet</div>
+                            <div style="font-size:13px;margin-top:6px;" data-i18n="charge.no_sessions_hint">Sessions appear automatically when you plug in to charge</div>
+                        </div>
+                        <button class="load-more-btn" id="loadMoreBtn" style="display:none;" onclick="CHARGING.loadMore()" data-i18n="charge.load_more">Load More</button>
+                    </div>
+
+                    <!-- Settings tab -->
+                    <div class="ch-card" data-tab="settings">
+                        <h3 data-i18n="charge.settings_title">Charging Analytics</h3>
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="charge.settings_auto_record">Automatically record charging sessions</div>
+                                <div class="setting-desc" data-i18n="charge.settings_auto_record_desc">Logs each charge as a session with power, cost and battery data</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch"><input type="checkbox" id="chargingEnabled" checked onchange="CHARGING.showApplyNeeded()"><span class="toggle-slider"></span></label>
+                            </div>
+                        </div>
+                        <!-- Electricity Rate — currency + per-kWh price together in
+                             one control, identical layout to the Trips page (both
+                             read/write the same shared tripAnalytics rate/currency). -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="charge.settings_rate">Electricity Rate</div>
+                                <div class="setting-desc" data-i18n="charge.settings_rate_desc">Cost per kWh, shared with Trips</div>
+                            </div>
+                            <div class="setting-control ch-rate-control">
+                                <select id="currencySelect" onchange="CHARGING.showApplyNeeded()" style="max-width:150px;">
+                                    <optgroup label="Common">
+                                        <option value="$">$ USD</option>
+                                        <option value="€">€ EUR</option>
+                                        <option value="£">£ GBP</option>
+                                        <option value="¥">¥ JPY</option>
+                                        <option value="A$">A$ AUD</option>
+                                        <option value="C$">C$ CAD</option>
+                                        <option value="CHF ">CHF</option>
+                                    </optgroup>
+                                    <optgroup label="Asia / Pacific">
+                                        <option value="₹">₹ INR</option>
+                                        <option value="रू">रू NPR</option>
+                                        <option value="CN¥">CN¥ CNY</option>
+                                        <option value="HK$">HK$ HKD</option>
+                                        <option value="NT$">NT$ TWD</option>
+                                        <option value="₩">₩ KRW</option>
+                                        <option value="฿">฿ THB</option>
+                                        <option value="RM">RM MYR</option>
+                                        <option value="S$">S$ SGD</option>
+                                        <option value="Rp">Rp IDR</option>
+                                        <option value="₱">₱ PHP</option>
+                                        <option value="₫">₫ VND</option>
+                                        <option value="NZ$">NZ$ NZD</option>
+                                    </optgroup>
+                                    <optgroup label="Middle East / Africa">
+                                        <option value="AED ">AED</option>
+                                        <option value="SAR ">SAR</option>
+                                        <option value="QAR ">QAR</option>
+                                        <option value="₪">₪ ILS</option>
+                                        <option value="R ">R ZAR</option>
+                                    </optgroup>
+                                    <optgroup label="Europe (non-EUR)">
+                                        <option value="NOK ">NOK kr</option>
+                                        <option value="SEK ">SEK kr</option>
+                                        <option value="DKK ">DKK kr</option>
+                                        <option value="zł">zł PLN</option>
+                                        <option value="Kč">Kč CZK</option>
+                                        <option value="Ft">Ft HUF</option>
+                                        <option value="₺">₺ TRY</option>
+                                        <option value="₽">₽ RUB</option>
+                                        <option value="₴">₴ UAH</option>
+                                    </optgroup>
+                                    <optgroup label="Latin America">
+                                        <option value="R$">R$ BRL</option>
+                                        <option value="MX$">MX$ MXN</option>
+                                        <option value="AR$">AR$ ARS</option>
+                                        <option value="CLP$">CLP$ CLP</option>
+                                        <option value="S/">S/ PEN</option>
+                                        <option value="COL$">COL$ COP</option>
+                                    </optgroup>
+                                </select>
+                                <input type="number" id="rateInput" placeholder="0.00" step="0.01" min="0" onchange="CHARGING.showApplyNeeded()">
+                                <span style="font-size:11px;color:var(--text-muted);">/kWh</span>
+                            </div>
+                        </div>
+                        <!-- DC rate is charging-specific (no Trips equivalent); kept
+                             as its own row with the same currency/kWh framing. -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="charge.settings_dc_rate">DC Fast Rate (optional)</div>
+                                <div class="setting-desc" data-i18n="charge.settings_dc_rate_desc">Separate tariff for DC fast charging; leave 0 to use the base rate</div>
+                            </div>
+                            <div class="setting-control ch-rate-control">
+                                <input type="number" id="dcRateInput" placeholder="0.00" step="0.01" min="0" onchange="CHARGING.showApplyNeeded()">
+                                <span style="font-size:11px;color:var(--text-muted);">/kWh</span>
+                            </div>
+                        </div>
+                        <div class="settings-button-row" style="margin-top:12px;">
+                            <button class="btn btn-primary" id="chargingApplyBtn" onclick="CHARGING.saveSettings()" style="flex:1;" disabled data-i18n="common.apply_changes">Apply Changes</button>
+                        </div>
+                        <div class="ch-note" data-i18n="charge.baking_note">Detailed metrics fill in as you complete new charges</div>
+                    </div>
+
+                    <div class="ch-card" data-tab="settings">
+                        <h3 data-i18n="charge.settings_data_title">Data</h3>
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="charge.settings_clear">Clear charging history</div>
+                                <div class="setting-desc" data-i18n="charge.settings_clear_desc">Permanently delete all recorded charging sessions and curves</div>
+                            </div>
+                            <div class="setting-control">
+                                <button class="ch-danger-btn" onclick="CHARGING.clearHistory()" data-i18n="charge.settings_clear">Clear charging history</button>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- ========== DETAIL DRILL-IN (no data-tab) ========== -->
+                <div id="chargingDetail" class="hidden">
+                    <div class="ch-detail-head">
+                        <button class="ch-back-btn" onclick="CHARGING.hideDetail()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+                            <span data-i18n="charge.detail_back">Back to sessions</span>
+                        </button>
+                        <button class="ch-detail-delete-btn" onclick="CHARGING.deleteCurrent()" title="Delete session">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                            <span data-i18n="charge.detail_delete">Delete</span>
+                        </button>
+                    </div>
+                    <h2 id="detailTitle" style="margin:0 0 4px;font-size:20px;">--</h2>
+                    <div id="detailSubtitle" style="color:var(--text-muted);font-size:13px;margin-bottom:18px;"></div>
+
+                    <div class="ch-card">
+                        <div class="ch-stat-grid">
+                            <div class="ch-stat"><span data-i18n="charge.detail_energy_added">Energy added</span><strong id="detailEnergy">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.detail_avg_power">Average power</span><strong id="detailAvgPower">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.detail_peak_power">Peak power</span><strong id="detailPeakPower">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.detail_range_gained">Range gained</span><strong id="detailRangeGained">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.detail_cost">Cost</span><strong id="detailCost">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.detail_type">Type</span><strong id="detailType">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.detail_temp">Battery temp</span><strong id="detailTemp">--</strong></div>
+                            <div class="ch-stat"><span data-i18n="charge.detail_time_to_full">Time to full</span><strong id="detailTimeToFull">--</strong></div>
+                        </div>
+                    </div>
+
+                    <!-- Location row — hidden by JS when no location was captured. -->
+                    <div class="ch-card ch-loc-row" id="detailLocRow" style="display:none;">
+                        <div class="ch-loc-main">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-6-5.5-6-10a6 6 0 0 1 12 0c0 4.5-6 10-6 10z"/><circle cx="12" cy="11" r="2"/></svg>
+                            <div>
+                                <div class="setting-name" data-i18n="charge.detail_location">Location</div>
+                                <div class="setting-desc" id="detailLocLabel">--</div>
+                            </div>
+                        </div>
+                        <button type="button" id="detailMapLink" class="ch-map-link" onclick="CHARGING.openSessionMap()" data-i18n="charge.view_on_map">View on map</button>
+                    </div>
+
+                    <div class="ch-card">
+                        <h3 data-i18n="charge.chart_power_title">Charge power &amp; curve</h3>
+                        <canvas id="detailPowerChart"></canvas>
+                        <div class="ch-note" id="detailNoSamples" style="display:none;" data-i18n="charge.detail_no_samples">No detailed curve recorded for this session</div>
+                    </div>
+                    <div class="ch-card">
+                        <h3 data-i18n="charge.chart_temp_title">Battery temperature</h3>
+                        <canvas id="detailTempChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Shared calendar popup for the custom date-range picker (mirrors events). -->
+    <div class="calendar-popup" id="chargeCalendarPopup">
+        <div class="calendar-panel">
+            <div class="calendar-header">
+                <span class="calendar-title" id="chargeCalendarTitle">Calendar</span>
+                <div class="calendar-nav">
+                    <button onclick="CHARGING.calPrevMonth()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg></button>
+                    <button onclick="CHARGING.calNextMonth()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></button>
+                </div>
+            </div>
+            <div class="calendar-grid" id="chargeCalendarGrid"></div>
+            <button class="calendar-close" onclick="CHARGING.closeCalendar()" data-i18n="common.close">Close</button>
+        </div>
+    </div>
+
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script src="../shared/core.js"></script>
+    <script src="../shared/update-flow.js"></script>
+    <script src="../shared/charging.js?v=25"></script>
+    <script>
+        function toggleSidebar() {
+            var sb = document.getElementById('sidebar');
+            var ov = document.getElementById('sidebarOverlay');
+            if (sb) sb.classList.toggle('open');
+            if (ov) ov.classList.toggle('show');
+        }
+        BYD.i18n.init().then(function () {
+            if (typeof BYD !== 'undefined' && BYD.core) BYD.core.init();
+            CHARGING.init();
+        });
+    </script>
+</body>
+</html>

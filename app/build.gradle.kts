@@ -10,7 +10,7 @@ val openh264Version = "2.6.0"
 
 // Build-time stamp for the custom debug build's version string. Evaluated at
 // gradle configuration time, so every assembleDebug self-identifies when it was
-// built (e.g. custom-v28.3-20260628-2015). Local-only — never on an upstream branch.
+// built (e.g. custom-v29.0-20260705-0001). Local-only — never on an upstream branch.
 val customBuildStamp: String = SimpleDateFormat("yyyyMMdd-HHmm").format(Date())
 
 // Auto-download OpenH264 from Cisco's official binary releases
@@ -217,7 +217,7 @@ android {
         minSdk = 25
         targetSdk = 25
         versionCode = 1
-        versionName = "28.3"
+        versionName = "29.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
         // Note: abiFilters removed - using splits.abi instead for size optimization
@@ -287,7 +287,7 @@ android {
 
             // Custom local build: timestamped versionName so BuildConfig.VERSION_NAME
             // (and getInstalledVersion = channel + "-v" + VERSION_NAME) reads
-            // custom-v28.3-<ts>. Release stays on the plain "28.3".
+            // custom-v29.0-<ts>. Release stays on the plain "29.0".
             versionNameSuffix = "-$customBuildStamp"
 
             // Channel "custom": (1) the staleness guard in getDisplayVersion rejects the

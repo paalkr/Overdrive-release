@@ -37,6 +37,14 @@ public class VehicleDataMonitor {
     private final CopyOnWriteArrayList<VehicleDataListener> listeners = new CopyOnWriteArrayList<>();
     private boolean isRunning = false;
     private Context context;
+
+    // Throttle for the charging-power resolution diagnostic (see getChargingState).
+    private volatile long lastChargePowerLogMs = 0L;
+
+    /** Compact formatter for a possibly-NaN candidate value in the diag line. */
+    private static String fmt(double v) {
+        return Double.isNaN(v) ? "NaN" : String.format("%.2f", v);
+    }
     
     private VehicleDataMonitor() {
         this.batteryPowerMonitor = new BatteryPowerMonitor();
@@ -179,11 +187,16 @@ public class VehicleDataMonitor {
      * resolve power magnitude.
      *
      * Power magnitude resolution (when fused says CHARGING):
-     *   1. external charging power (InstrumentDevice — charger-reported)
-     *   2. chargingDevice.chargingPower
-     *   3. abs(engine power) — only when ACC is on (NaN-guarded after
+     *   1. chargePower (InstrumentDevice.getChargePower — real DC rate INTO the
+     *      pack; matches the BYD app/cloud). Preferred over externalChargingPower
+     *      because on PHEV trims that one reports the AC wall-side input (higher:
+     *      includes onboard-charger conversion loss) or a 104857.5 sentinel.
+     *   2. external charging power (InstrumentDevice — charger-reported, AC-side)
+     *   3. chargingDevice.chargingPower
+     *   4. abs(engine power) — only when ACC is on (NaN-guarded after
      *      ACC OFF invalidation in BydDataCollector.setAccState)
-     *   4. nominal-capacity hint (3.3 kW PHEV / 7 kW BEV, marked estimated)
+     *   5. ring-buffer counter-derivative estimator (measured, not nominal)
+     *   6. nominal-capacity hint (3.3 kW PHEV / 7 kW BEV, marked estimated)
      *
      * @return ChargingStateData populated from the fused detector, or
      *         null when no state signal is available at all.
@@ -209,17 +222,88 @@ public class VehicleDataMonitor {
 
         // ---- Power magnitude ----
         if (effectiveState == ChargingStateData.CHARGING_BATTERY_STATE_CHARGING) {
-            if (!Double.isNaN(vd.externalChargingPowerKw) && vd.externalChargingPowerKw > 0) {
+            String powerSource;  // which cascade branch won — surfaced in the diag log below
+            double estKw = ChargingPowerEstimator.getInstance().estimatePowerKw();
+            // On PHEV, externalChargingPower is NOT trustworthy for charging power:
+            // it reports the EVSE's RATED capacity (observed a flat 7.13 kW on a real
+            // ~1.7 kW charge), not the actual draw. So on PHEV the SOC-derived ring
+            // estimator (which tracks the true rate via the SOC gauge) OUTRANKS the
+            // external/device getters. On BEV the external getter is genuine, so it
+            // keeps priority and the estimator stays the last-resort fallback.
+            boolean phev;
+            try { phev = isPhev(); } catch (Throwable t) { phev = false; }
+            boolean estUsable = !Double.isNaN(estKw);
+
+            if (phev && estUsable) {
+                // PHEV: the SOC-derived ring estimator is ground truth from the SOC
+                // gauge, so it OUTRANKS every hardware getter — including chargePowerKw.
+                // On PHEV those getters are unreliable: getChargePower() has been seen
+                // returning the AC/EVSE-side ~7 kW (not the true DC pack rate) on some
+                // trims, and getExternalChargingPower() reports the EVSE's rated
+                // capacity. Trusting either produced the "shows 7 kW on a 1.7 kW
+                // charge" bug. Only once the estimator has a value do we prefer it;
+                // before warm-up we fall to the phev placeholder branch below.
+                data.updateChargingPower(estKw);
+                powerSource = "estimator(ring,phev)";
+            } else if (!phev && !Double.isNaN(vd.chargePowerKw) && vd.chargePowerKw > 0.1 && vd.chargePowerKw <= 300) {
+                // Real DC charge rate into the pack (InstrumentDevice.getChargePower).
+                // BEV ONLY: it is the battery-side power the BYD app/cloud shows. This
+                // is NOT trusted on PHEV — getChargePower() has been seen returning the
+                // AC/EVSE-side ~7 kW there (not the true DC pack rate), so PHEV is
+                // handled entirely by the estimator/placeholder branches (above and
+                // below), never by a raw hardware getter.
+                data.updateChargingPower(vd.chargePowerKw);
+                powerSource = "chargePowerKw(DC)";
+            } else if (phev) {
+                // PHEV but the SOC estimator hasn't warmed up yet (needs ≥2 SOC ticks
+                // ≈ 15 min on a slow charge). Do NOT fall through to
+                // externalChargingPower/chargingPower here: on PHEV externalChargingPower
+                // is the EVSE's RATED capacity (a flat, confidently-WRONG 7.13 kW), not
+                // the real draw — displaying it would poison the session peak/avg and
+                // mislead. Skip to the engine-power / nominal-placeholder branches so
+                // the early window shows an honest estimated hint (isEstimated=true)
+                // instead of a wrong measured-looking value.
+                if (!Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3) {
+                    data.updateChargingPower(Math.abs(vd.enginePowerKw));
+                    powerSource = "enginePowerKw(phev)";
+                } else {
+                    powerSource = "phev-awaiting-estimator";
+                    try {
+                        com.overdrive.app.abrp.SohEstimator soh =
+                            com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
+                        if (soh != null && soh.getNominalCapacityKwh() > 0) {
+                            double nominal = soh.getNominalCapacityKwh();
+                            data.updateChargingPower(nominal < 30 ? 3.3 : 7.0);
+                            data.isEstimated = true;
+                            powerSource = "nominalPlaceholder(phev)";
+                        }
+                    } catch (Exception ignored) { /* leave power at 0 */ }
+                }
+            } else if (!Double.isNaN(vd.externalChargingPowerKw) && vd.externalChargingPowerKw > 0) {
                 data.updateChargingPower(vd.externalChargingPowerKw);
+                powerSource = "externalChargingPowerKw(AC)";
             } else if (!Double.isNaN(vd.chargingPowerKw) && vd.chargingPowerKw > 0) {
                 data.updateChargingPower(vd.chargingPowerKw);
+                powerSource = "chargingPowerKw(device)";
             } else if (!Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3) {
                 // engine current flowing into pack. setAccState(false) wipes
                 // this to NaN, so a value here is fresh from an ACC-on cycle.
                 data.updateChargingPower(Math.abs(vd.enginePowerKw));
+                powerSource = "enginePowerKw";
+            } else if (estUsable) {
+                // FALLBACK: no charger-reported power on this model. Derive it
+                // from the time-derivative of the rising charge-energy counter
+                // (ring-buffer estimator). This is a MEASURED-from-counter value,
+                // not a nominal guess, so it is NOT flagged isEstimated — it can
+                // legitimately seed the session peak/avg and drive the live curve.
+                // The estimator only produces a value while fused-CHARGING + Park,
+                // so it is regen/V2L-safe by construction.
+                data.updateChargingPower(estKw);
+                powerSource = "estimator(ring)";
             } else {
                 // Detector says CHARGING but no real kW signal arrived.
                 // Show a nominal-based hint so the UI doesn't say "Charging at 0 kW".
+                powerSource = "none";
                 try {
                     com.overdrive.app.abrp.SohEstimator soh =
                         com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
@@ -228,8 +312,24 @@ public class VehicleDataMonitor {
                         // < 30 kWh nominal pack → PHEV (3.3 kW AC); else BEV (7 kW AC)
                         data.updateChargingPower(nominal < 30 ? 3.3 : 7.0);
                         data.isEstimated = true;
+                        powerSource = "nominalPlaceholder";
                     }
                 } catch (Exception ignored) { /* leave power at 0 */ }
+            }
+            // Diagnostic (throttled 1/min): which branch resolved the displayed
+            // charging power, the chosen value, and EVERY candidate's raw value —
+            // so a single charge log says definitively whether 3.4 kW is the DC
+            // getter reading half, or the ring estimator. INFO so it lands in a
+            // default-level capture.
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastChargePowerLogMs > 60_000L) {
+                lastChargePowerLogMs = nowMs;
+                logger.info(String.format(
+                    "ChargingPower resolved=%.2fkW source=%s | candidates: chargePowerKw=%s extChgKw=%s chgDevKw=%s engineKw=%s estimatorKw=%s",
+                    data.chargingPowerKW, powerSource,
+                    fmt(vd.chargePowerKw), fmt(vd.externalChargingPowerKw),
+                    fmt(vd.chargingPowerKw), fmt(vd.enginePowerKw),
+                    fmt(ChargingPowerEstimator.getInstance().estimatePowerKw())));
             }
         }
         return data;

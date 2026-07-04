@@ -121,8 +121,13 @@ object RecentSearchStore {
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    /** Two results are the same place if labels match or coords are within epsilon. */
-    private fun isSamePlace(a: SearchResult, b: SearchResult): Boolean {
+    /**
+     * Two results are the same place if labels match (case-insensitive, trimmed)
+     * OR coords are within [COORD_EPSILON] on both axes. Public so callers that
+     * MERGE result sets (e.g. the map's local-saved-places-into-autocomplete
+     * surfacing) can dedup against this same rule rather than re-deriving it.
+     */
+    fun isSamePlace(a: SearchResult, b: SearchResult): Boolean {
         if (a.label.trim().equals(b.label.trim(), ignoreCase = true)) {
             return true
         }

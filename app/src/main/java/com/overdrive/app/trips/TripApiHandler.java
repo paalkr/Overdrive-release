@@ -750,6 +750,12 @@ public class TripApiHandler {
             response.put("success", true);
             JSONObject configJson;
             if (config != null) {
+                // Re-read from UnifiedConfigManager before serving so a
+                // rate/currency edit made on the Charging page (which writes the
+                // shared tripAnalytics section) is reflected here without a
+                // daemon restart. Without this, the in-memory TripConfig cached
+                // at init serves a stale value and the two pages disagree.
+                config.load();
                 configJson = config.toJson();
             } else {
                 configJson = new JSONObject();

@@ -309,10 +309,39 @@ public class GpuSurveillancePipeline {
         return recorder != null ? recorder.getEncoder() : null;
     }
 
-    public void updateSegmentDuration(int durationMinutes) {
-        HardwareEventRecorderGpu enc = encoder;
-        if (enc != null) {
-            enc.setSegmentDurationMs(java.util.concurrent.TimeUnit.MINUTES.toMillis(durationMinutes));
+    /**
+     * Reads the shared recording.segmentDurationMinutes (clamped) and pushes
+     * it to the live encoder as a millisecond rotation interval. Called after
+     * encoder (re)init; safe no-op if the encoder isn't up yet.
+     */
+    private void applySegmentDurationFromConfig() {
+        try {
+            HardwareEventRecorderGpu enc = encoder;
+            if (enc == null) return;
+            int minutes = com.overdrive.app.config.UnifiedConfigManager
+                .getSegmentDurationMinutes();
+            enc.setSegmentDurationMs(minutes * 60_000L);
+        } catch (Throwable t) {
+            logger.warn("Failed to apply segment duration from config: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Live-apply a new clip segment length (minutes) to the running dashcam
+     * encoder without a reinit. Takes effect on the next rotation. Called by
+     * the quality API when the user changes the shared Clip Duration control.
+     */
+    public void updateSegmentDuration(int minutes) {
+        try {
+            int clamped = Math.max(
+                com.overdrive.app.util.Constants.MIN_SEGMENT_DURATION_MINUTES,
+                Math.min(com.overdrive.app.util.Constants.MAX_SEGMENT_DURATION_MINUTES, minutes));
+            HardwareEventRecorderGpu enc = encoder;
+            if (enc != null) {
+                enc.setSegmentDurationMs(clamped * 60_000L);
+            }
+        } catch (Throwable t) {
+            logger.warn("updateSegmentDuration failed: " + t.getMessage());
         }
     }
 
@@ -436,6 +465,100 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * @return the pipeline's effective ACC-off SURVEILLANCE bitrate (bps),
+     * resolving recording.surveillanceQuality against the shared codec. Honors
+     * an active customBitrate (thermal/network throttle) exactly like
+     * {@link #getConfiguredRecordingBitrate()}. When the surveillance tier is
+     * unset (pre-split config), falls back to the ACC-on recordingQuality tier
+     * — byte-identical to the pre-split single-knob behaviour. Used by
+     * RecordingModeManager's reconcile and by {@link #setRecordingMode} when
+     * entering SENTRY.
+     */
+    public int getEffectiveSurveillanceBitrate() {
+        return config.getEffectiveBitrateForQuality(loadSurveillanceQuality());
+    }
+
+    /**
+     * Live re-assert of the ACC-off surveillance profile (fps + bitrate) when
+     * surveillance is CURRENTLY active. Called by the settings API after a
+     * surveillance quality/fps edit so the change takes effect on the running
+     * parked recording WITHOUT a pipeline restart or encoder reinit — fps via
+     * the camera HAL live knob, bitrate via the adaptive controller / encoder
+     * setParameters, exactly mirroring setRecordingMode(SENTRY). No-op (returns
+     * false) when not in surveillance mode or the pipeline is torn down; the
+     * persisted config is picked up on the next ACC-off transition in that case.
+     *
+     * @return true if the live re-assert was applied.
+     */
+    public boolean reapplySurveillanceProfileIfActive() {
+        synchronized (reconfigLock) {
+            if (!isSurveillanceMode()) {
+                return false;
+            }
+            // Same teardown gate as applyFpsChangeLocked / applyBitrateChangeLocked:
+            // reconfigLock does not serialize against stop()'s teardown body.
+            if (!running || stopping) {
+                logger.warn("reapplySurveillanceProfile: skipping live apply "
+                    + "(running=" + running + ", stopping=" + stopping + ") — "
+                    + "config persisted, applies on next ACC-off");
+                return false;
+            }
+            return applySurveillanceProfileLocked("re-assert");
+        }
+    }
+
+    /**
+     * Applies the ACC-off surveillance fps + bitrate to the live camera + encoder.
+     * CALLER MUST HOLD {@code reconfigLock}. This is the single canonical place
+     * the surveillance tier is pushed to hardware, funnelling every arm/re-assert
+     * path (enableSurveillance, setRecordingMode(SENTRY), the settings-API live
+     * re-apply) through one reconfigLock-guarded body so they can never race each
+     * other on the camera-fps / encoder-bitrate setters. No reinit: fps is a live
+     * HAL knob and bitrate is a MediaCodec setParameters, both gap-free.
+     *
+     * <p>When the surveillance keys are unset this resolves to the ACC-on
+     * recording tier (see loadSurveillanceTargetFps / getEffectiveSurveillanceBitrate),
+     * so on a pre-split config it applies exactly what the old SENTRY path did.
+     *
+     * @param reason short tag for the log line (e.g. "arm", "re-assert").
+     * @return true if applied without throwing.
+     */
+    private boolean applySurveillanceProfileLocked(String reason) {
+        try {
+            int survFps = loadSurveillanceTargetFps();
+            // Floor the shared camera HAL rate at the active live-view stream fps
+            // (0 when no stream) so arming surveillance — or editing the
+            // surveillance fps via the settings API — while a stream is open does
+            // NOT starve/desync that stream by dropping the HAL below its rate.
+            // This is exactly what RecordingModeManager's authority computes
+            // (reconcileCameraProfileLocked / applyFullRecordingProfile take the
+            // same max), so this arm-path assert converges with RMM rather than
+            // fighting it. NOTE: surveillance runs the recorder at stride 1
+            // (continuous-style ownStrideBitrate), so the RECORDING rate equals
+            // the HAL rate — when a stream forces camFps above survFps the clip is
+            // (intentionally, by the shared-camera design) recorded at camFps for
+            // the duration of the stream; with no stream it records at survFps.
+            int camFps = Math.max(survFps, getActiveStreamFps());
+            PanoramicCameraGpu cam = camera;
+            if (cam != null) {
+                cam.setTargetFps(camFps);
+            }
+            // setRecordingBitrate routes through the adaptive controller when
+            // present (else the encoder directly) — same path RMM reconcile uses,
+            // so the throttle/override semantics stay uniform.
+            int survBitrate = getEffectiveSurveillanceBitrate();
+            setRecordingBitrate(survBitrate);
+            logger.info("Surveillance profile applied (" + reason + "): survFps="
+                + survFps + ", camFps=" + camFps + ", bitrate="
+                + (survBitrate / 1_000_000) + " Mbps");
+            return true;
+        } catch (Throwable t) {
+            logger.warn("applySurveillanceProfileLocked(" + reason + ") failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * Request an immediate keyframe (IDR) on the recording encoder. Proximity
      * Guard uses this to keep a keyframe inside the pre-record window while the
      * low-rate monitor profile stretches the natural GOP, and to open the live
@@ -467,28 +590,38 @@ public class GpuSurveillancePipeline {
         // lane is also re-enabled in case a BS-only-warm state had it off — the
         // same by-construction guarantee startRecording() makes.)
         if (mode == GpuPipelineConfig.RecordingMode.SENTRY) {
-            try {
+            // SENTRY shares the SAME camera + recorder as the ACC-ON modes and is
+            // REUSED across ACC-off (not freshly start()ed — the common case when
+            // Proximity Guard kept it warm at ~4 fps). Re-assert the surveillance
+            // fps + bitrate + full recorder lane so sentry always captures at the
+            // user's real surveillance tier regardless of what the prior ACC-ON
+            // mode left the shared camera/encoder at. All live knobs (no reopen /
+            // no reinit); idempotent if already at this rate. Funnel the fps +
+            // bitrate through applySurveillanceProfileLocked so this shares ONE
+            // reconfigLock domain with enableSurveillance()'s arm assert and the
+            // settings-API re-apply — they can never race on the setters.
+            synchronized (reconfigLock) {
                 PanoramicCameraGpu cam = camera;
                 if (cam != null) {
-                    cam.setRecorderLaneEnabled(true);
-                    cam.setTargetFps(loadTargetFps());
+                    try {
+                        cam.setRecorderLaneEnabled(true);
+                    } catch (Throwable t) {
+                        logger.warn("setRecordingMode(SENTRY): recorder-lane re-enable failed: " + t.getMessage());
+                    }
                 }
-            } catch (Throwable t) {
-                logger.warn("setRecordingMode(SENTRY): camera fps/lane re-assert failed: " + t.getMessage());
+                if (running && !stopping) {
+                    applySurveillanceProfileLocked("SENTRY");
+                }
             }
-        }
-
-        // Apply to encoder - but DON'T override user's bitrate setting
-        // Only change FPS (which requires encoder restart anyway)
-        if (encoder != null) {
-            // Use the user's configured bitrate, not the mode's default
+        } else if (encoder != null) {
+            // Non-SENTRY (NORMAL etc.): re-assert the user's ACC-ON recording
+            // bitrate (NOT the RecordingMode enum's legacy per-mode default),
+            // honoring an active customBitrate throttle via getEffectiveBitrate.
             int userBitrate = config.getEffectiveBitrate();
             if (bitrateController != null) {
                 bitrateController.setImmediateBitrate(userBitrate);
             }
-            // Note: FPS is set during encoder initialization
-            // Dynamic FPS change would require encoder restart
-            logger.info(String.format("Recording mode: %s (using user bitrate=%d Mbps, mode default was %d Mbps)",
+            logger.info(String.format("Recording mode: %s (using bitrate=%d Mbps, mode default was %d Mbps)",
                     mode, userBitrate / 1_000_000, mode.bitrate / 1_000_000));
         }
     }
@@ -1195,6 +1328,49 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * Reads the user-selected ACC-off surveillance camera FPS from unified
+     * config (camera.surveillanceTargetFps). Falls back to the ACC-on
+     * targetFps, then to 15 — so a config predating the split (key absent)
+     * resolves to EXACTLY the pre-split rate (byte-identical). Same {8,15,25}
+     * UI restriction as loadTargetFps(); the settings API clamps before
+     * persisting.
+     */
+    private static int loadSurveillanceTargetFps() {
+        try {
+            org.json.JSONObject cameraConfig = com.overdrive.app.config.UnifiedConfigManager
+                .loadConfig().optJSONObject("camera");
+            if (cameraConfig != null) {
+                int accOnFallback = cameraConfig.optInt("targetFps", 15);
+                return cameraConfig.optInt("surveillanceTargetFps", accOnFallback);
+            }
+        } catch (Exception ignored) {}
+        return 15;
+    }
+
+    /**
+     * Resolves the configured ACC-off surveillance quality tier from unified
+     * config (recording.surveillanceQuality). Returns {@code null} when the key
+     * is ABSENT (pre-split config) so the caller
+     * ({@link GpuPipelineConfig#getEffectiveBitrateForQuality}) falls back to
+     * the ACC-on recordingQuality tier — byte-identical to the pre-split world.
+     * A present-but-unparseable value degrades to STANDARD via fromString, the
+     * same default recordingQuality itself uses.
+     */
+    private static GpuPipelineConfig.RecordingQuality loadSurveillanceQuality() {
+        try {
+            org.json.JSONObject rec = com.overdrive.app.config.UnifiedConfigManager
+                .loadConfig().optJSONObject("recording");
+            if (rec != null) {
+                String q = rec.optString("surveillanceQuality", null);
+                if (q != null) {
+                    return GpuPipelineConfig.RecordingQuality.fromString(q);
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;  // null => getEffectiveBitrateForQuality falls back to recordingQuality
+    }
+
+    /**
      * Reinitializes the encoder with current config settings.
      * This is a synchronous operation that waits for completion.
      *
@@ -1262,13 +1438,6 @@ public class GpuSurveillancePipeline {
         // recorder.encoder still points at a freed instance.
         try {
             encoder = new HardwareEventRecorderGpu(encoderWidth, encoderHeight, fps, bitrate, codecMimeType);
-            try {
-                org.json.JSONObject recCfg = com.overdrive.app.config.UnifiedConfigManager.getRecording();
-                int durationMinutes = recCfg.optInt("segmentDurationMinutes", com.overdrive.app.util.Constants.SEGMENT_DURATION_MINUTES);
-                encoder.setSegmentDurationMs(java.util.concurrent.TimeUnit.MINUTES.toMillis(durationMinutes));
-            } catch (Throwable t) {
-                logger.warn("Failed to set segment duration on encoder reinit: " + t.getMessage());
-            }
         } catch (Throwable t) {
             logger.warn("New encoder allocation failed — clearing recorder's stale "
                 + "encoder ref so caller can stop() cleanly: " + t.getMessage());
@@ -1356,6 +1525,10 @@ public class GpuSurveillancePipeline {
         }
 
         encoder.init();
+
+        // Re-seed the clip segment length after a codec/quality reinit so the
+        // fresh encoder keeps the user's chosen rotation interval.
+        applySegmentDurationFromConfig();
 
         // Reinitialize recorder with new encoder on GL thread
         if (camera != null && camera.getEglCore() != null) {
@@ -1517,22 +1690,6 @@ public class GpuSurveillancePipeline {
             (codecMimeType.contains("hevc") ? "H.265" : "H.264") +
             " @ " + fps + "fps, " + (bitrate / 1_000_000) + " Mbps");
         encoder = new HardwareEventRecorderGpu(encoderWidth, encoderHeight, fps, bitrate, codecMimeType);
-        
-        org.json.JSONObject recCfg = null;
-        try {
-            recCfg = com.overdrive.app.config.UnifiedConfigManager.getRecording();
-        } catch (Throwable t) {
-            logger.warn("Failed to retrieve recording config for encoder init: " + t.getMessage());
-        }
-
-        if (recCfg != null) {
-            try {
-                int durationMinutes = recCfg.optInt("segmentDurationMinutes", com.overdrive.app.util.Constants.SEGMENT_DURATION_MINUTES);
-                encoder.setSegmentDurationMs(java.util.concurrent.TimeUnit.MINUTES.toMillis(durationMinutes));
-            } catch (Throwable t) {
-                logger.warn("Failed to set segment duration on encoder init: " + t.getMessage());
-            }
-        }
 
         // Pre-load saved pre-record duration BEFORE encoder.init() so the
         // byte ring is sized correctly on first allocation. Mode-aware:
@@ -1549,14 +1706,14 @@ public class GpuSurveillancePipeline {
             // isn't yet constructed at this point in init()). UnifiedConfigManager
             // exposes the persisted mode under recording.mode.
             try {
-                if (recCfg != null) {
-                    String persistedMode = recCfg.optString("mode", "");
-                    if ("PROXIMITY_GUARD".equals(persistedMode)) {
-                        org.json.JSONObject pgCfg =
-                            com.overdrive.app.config.UnifiedConfigManager.getProximityGuard();
-                        int v = pgCfg.optInt("preRecordSeconds", -1);
-                        if (v > 0) preRecordSec = v;
-                    }
+                org.json.JSONObject recCfg =
+                    com.overdrive.app.config.UnifiedConfigManager.getRecording();
+                String persistedMode = recCfg.optString("mode", "");
+                if ("PROXIMITY_GUARD".equals(persistedMode)) {
+                    org.json.JSONObject pgCfg =
+                        com.overdrive.app.config.UnifiedConfigManager.getProximityGuard();
+                    int v = pgCfg.optInt("preRecordSeconds", -1);
+                    if (v > 0) preRecordSec = v;
                 }
             } catch (Throwable t) {
                 logger.debug("Cold-boot mode-aware pre-record lookup failed: " + t.getMessage());
@@ -1598,6 +1755,11 @@ public class GpuSurveillancePipeline {
         }
 
         encoder.init();
+
+        // Seed the clip segment length from the shared recording config so the
+        // ACC-on dashcam axis rotates at the user's chosen interval (2/5/10
+        // min). Same key the ACC-off / OEM axis reads — one control, both axes.
+        applySegmentDurationFromConfig();
 
         // Resolve the camera profile NOW so the recorder, downscaler, foveated
         // cropper, and PanoramicCameraGpu all share consistent per-quadrant
@@ -2033,6 +2195,44 @@ public class GpuSurveillancePipeline {
                             }
                         }
                     }
+                }
+
+                @Override
+                public void onHalRecoveryNeeded() {
+                    // ESCALATION (#3): bare close/reopen restarts have repeatedly
+                    // failed to revive frame delivery — the AVM HAL co-consumer
+                    // state is wedged and only a full teardown + com.byd.avc
+                    // warmup recovers it (the sole thing that ever broke the
+                    // sentry->drive blackout loop in field logs). Route through
+                    // RecordingModeManager's warmup-capable restart. Run on a
+                    // background thread: we're on the GL/watchdog path and the
+                    // recovery does a blocking 4s warmup + pipeline rebuild.
+                    logger.error("HAL recovery needed — bare reopen loop cannot recover. "
+                        + "Routing through warmup-restart (full teardown + com.byd.avc warmup).");
+                    final PanoramicCameraGpu cam = camera;
+                    new Thread(() -> {
+                        try {
+                            com.overdrive.app.recording.RecordingModeManager rmm =
+                                com.overdrive.app.daemon.CameraDaemon.getRecordingModeManager();
+                            if (rmm != null) {
+                                rmm.forceWarmupRestart("hal-zero-frame-escalation");
+                            } else {
+                                logger.warn("HAL recovery: RecordingModeManager unavailable — "
+                                    + "cannot route warmup restart; leaving stall watchdog to retry");
+                            }
+                        } catch (Throwable t) {
+                            logger.warn("HAL recovery routing failed: " + t.getMessage());
+                        } finally {
+                            // Always clear the escalation latch so the stall
+                            // watchdog can act again (bare restart or a fresh
+                            // escalation) if this recovery didn't take. Without
+                            // this, a failed recovery would permanently silence
+                            // the watchdog for the rest of the drive.
+                            if (cam != null) {
+                                cam.notePipelineRestarted();
+                            }
+                        }
+                    }, "HalRecoveryRestart").start();
                 }
             });
             
@@ -3382,6 +3582,22 @@ public class GpuSurveillancePipeline {
             sentry.enable();
             currentMode = Mode.SURVEILLANCE;
             logger.info("Surveillance mode enabled (sentry.active=" + sentry.isActive() + ")");
+            // Assert the ACC-off surveillance fps/bitrate NOW that the mode is
+            // SURVEILLANCE. setRecordingMode(SENTRY) only fires on the direct
+            // ACC-off (door-lock) path; the schedule-window-open and
+            // safe-zone-exit arm paths reach enableSurveillance() WITHOUT it, so
+            // without this call those paths would arm at the ACC-ON recording
+            // tier until RMM's 30s reconcile self-healed — mis-tiering any event
+            // clip captured in that window. Funnels through the same
+            // reconfigLock-guarded body as every other surveillance-profile push.
+            // No-op-equivalent on a pre-split config (resolves to the recording
+            // tier). Skip while a live encoder reconfig is mid-flight (running/
+            // stopping gate) — that path re-asserts on its own completion.
+            synchronized (reconfigLock) {
+                if (running && !stopping) {
+                    applySurveillanceProfileLocked("arm");
+                }
+            }
         } else {
             logger.error("Cannot enable surveillance: sentry is null!");
         }

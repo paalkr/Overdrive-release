@@ -124,12 +124,18 @@ public class ProxyHelper {
      */
     public static Proxy getHttpProxy() {
         if (isProxyAvailable()) {
-            // SOCKS, not HTTP: the sing-box inbound (port 8119) is type "mixed"
-            // so it accepts SOCKS too, while the Tailscale proxy (port 8539) is
-            // a tailscaled --socks5-server that ONLY speaks SOCKS5 and rejects
-            // the HTTP CONNECT framing. SOCKS works for both backends; HTTP
-            // broke every getHttpProxy() request once it resolved to Tailscale.
-            return new Proxy(Proxy.Type.SOCKS, new InetSocketAddress(PROXY_HOST, proxyPort));
+            // Proxy TYPE must match the resolved backend port:
+            //  - Tailscale (8539) is a `tailscaled --socks5-server` that ONLY speaks
+            //    SOCKS5 and REJECTS HTTP CONNECT → it needs Proxy.Type.SOCKS.
+            //  - sing-box (8119) is a "mixed" inbound; v26.8 reached it via HTTP CONNECT
+            //    and that is the PROVEN path. The blanket SOCKS swap (added for the
+            //    Tailscale case) regressed sing-box: route/geocode POSTs to the BYOK
+            //    endpoint began failing whenever sing-box was engaged. Restore HTTP for
+            //    the sing-box port; keep SOCKS only for the Tailscale port that requires it.
+            Proxy.Type type = (proxyPort == TAILSCALE_PROXY_PORT)
+                    ? Proxy.Type.SOCKS
+                    : Proxy.Type.HTTP;
+            return new Proxy(type, new InetSocketAddress(PROXY_HOST, proxyPort));
         }
         return Proxy.NO_PROXY;
     }

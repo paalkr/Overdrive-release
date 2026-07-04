@@ -17,13 +17,22 @@ BYD.surveillance = {
         detectPerson: true,
         detectCar: true,
         detectBike: true,
+        detectAnimal: false,
         preRecordSeconds: 5,
         postRecordSeconds: 10,
-        // Single recording quality tier (replaces legacy recordingBitrate
-        // LOW/MEDIUM/HIGH). Server rebuilds the encoder live on change.
-        recordingQuality: 'STANDARD',
+        // ACC-off SURVEILLANCE quality tier — INDEPENDENT of the ACC-on
+        // dashcam recordingQuality. This page's picker drives the parked
+        // sentry bitrate only. Persisted to recording.surveillanceQuality;
+        // the server live-applies it to a running parked recording with no
+        // encoder reinit. Seeded from the ACC-on tier server-side so it starts
+        // matching the old shared value until the user changes it.
+        surveillanceQuality: 'STANDARD',
+        // Surveillance camera fps — independent of the ACC-on targetFps.
+        // Persisted to camera.surveillanceTargetFps.
+        surveillanceCameraFps: 15,
+        // Codec is SHARED across both axes (a device-compat choice, not a
+        // per-mode quality knob), so it stays on the recordingCodec key.
         recordingCodec: 'H264',
-        segmentDurationMinutes: 2,
         // Server-supplied for UI (filled by load):
         recordingQualityOptions: {},
         activeRecordingEstimate: null,
@@ -42,6 +51,7 @@ BYD.surveillance = {
         cameraRear: true,
         motionHeatmap: false,
         filterDebugLog: false,
+        discardEmptyBrightMotionEvents: false,
         // Per-quadrant sensitivity / zone overrides. Keys: Q0=front, Q1=right,
         // Q2=rear, Q3=left. Absent key = inherit global. The "Side-cam Boost"
         // UI writes to Q1 + Q3.
@@ -75,7 +85,18 @@ BYD.surveillance = {
         // Shared with the recording page through UnifiedConfigManager
         // recording.rectifyStrength. Default 0 here so the dirty-diff
         // baseline is a real number even before loadConfig() fires.
-        rectifyStrength: 0
+        rectifyStrength: 0,
+        // Clip segment length in minutes (2/5/10). SAME shared key as the
+        // recording page (recording.segmentDurationMinutes) — one control
+        // governs both axes, so changing it here changes it there too.
+        segmentDurationMinutes: 2,
+        // HV-battery SoC cutoff (%) for parked surveillance. Saved to
+        // power.lowSocCutoffPercent (NOT the surveillance section) — that's the
+        // key SocCutoffMonitor reads to self-shut-down at/below this level.
+        // 0 = Off. Immediate-save on drag end (like screenDeterrentDuration),
+        // so it stays OUT of the Apply-button tab field map. Default 10 here so
+        // the dirty-diff baseline is a real number before loadConfig() lands.
+        lowSocCutoffPercent: 10
     },
     storageInfo: {
         sdCardAvailable: false,
@@ -221,6 +242,26 @@ BYD.surveillance = {
                 // Check if config actually changed (via timestamp)
                 const newTimestamp = data.config.lastModified || 0;
                 if (newTimestamp > this.lastConfigTimestamp) {
+                    // Load storage settings first (its own dirty-guard protects
+                    // the limit/type fields). Done BEFORE any mutation of
+                    // this.config so the mid-flight guard below can bail without
+                    // leaving config half-replaced.
+                    await this.loadStorageSettings();
+
+                    // Re-check hasUnsavedChanges: reloadConfig() is async with
+                    // awaits above. The entry guard only covers entry — if the
+                    // user started editing (markChanged) while we were suspended
+                    // at an await, we must NOT wholesale-replace this.config with
+                    // server data, advance the timestamp, re-baseline savedConfig,
+                    // or call updateUI() — doing so would strand config/UI/
+                    // savedConfig out of sync and silently discard the pending
+                    // edit. Return WITHOUT advancing lastConfigTimestamp so the
+                    // next reload re-attempts once the edit is saved. Mirrors the
+                    // mid-flight guard in recording.js reloadConfig.
+                    if (this.hasUnsavedChanges) return;
+
+                    // Apply server config atomically (no await between here and
+                    // updateUI, so the three stay consistent).
                     this.config = { ...this.config, ...data.config };
                     // Use server-provided distance/sensitivity if available
                     if (!data.config.distance) {
@@ -230,11 +271,7 @@ BYD.surveillance = {
                         this.config.sensitivity = 3;  // Default
                     }
                     this.lastConfigTimestamp = newTimestamp;
-                    
-                    // Load storage settings BEFORE setting savedConfig
-                    // so both config and savedConfig include the same storage values
-                    await this.loadStorageSettings();
-                    
+
                     this.savedConfig = JSON.parse(JSON.stringify(this.config));
                     this.updateUI();
                 }
@@ -261,7 +298,12 @@ BYD.surveillance = {
         try {
             const uResp = await fetch('/api/settings/unified');
             const uData = await uResp.json();
-            if (uData.success && uData.config && uData.config.recording &&
+            // Guard on !hasUnsavedChanges for the same reason as the clip-duration
+            // block below: this runs after awaits, so a mid-flight edit to the
+            // rectify slider would otherwise be overwritten and savedConfig
+            // re-baselined, erasing the dirty diff and graying out Apply.
+            if (!this.hasUnsavedChanges &&
+                uData.success && uData.config && uData.config.recording &&
                 typeof uData.config.recording.rectifyStrength === 'number') {
                 var rsRefresh = uData.config.recording.rectifyStrength;
                 if (rsRefresh < 0) rsRefresh = 0;
@@ -280,16 +322,83 @@ BYD.surveillance = {
                     }
                 }
             }
+            // Shared clip duration — re-sync if the recording page changed it.
+            // SIBLING of the rectify block above (NOT nested): segmentDuration
+            // must re-sync even when rectifyStrength is absent from the unified
+            // config (e.g. a config that only has the segmentDuration default).
+            // Mirrors recording.js reloadConfig, where these are sibling ifs.
+            // Guard on !hasUnsavedChanges: this runs after the awaits above, so
+            // the user may have clicked a clip-duration button mid-flight —
+            // without the re-check the resume would overwrite their pending pick
+            // AND re-baseline savedConfig, erasing the dirty diff / graying out
+            // Apply.
+            if (!this.hasUnsavedChanges &&
+                uData.success && uData.config && uData.config.recording &&
+                typeof uData.config.recording.segmentDurationMinutes === 'number') {
+                var sdRefresh = uData.config.recording.segmentDurationMinutes;
+                if (sdRefresh !== 2 && sdRefresh !== 5 && sdRefresh !== 10) sdRefresh = 2;
+                if (sdRefresh !== this.config.segmentDurationMinutes) {
+                    this.config.segmentDurationMinutes = sdRefresh;
+                    if (this.savedConfig) this.savedConfig.segmentDurationMinutes = sdRefresh;
+                    document.querySelectorAll('#survClipDurationBtns .btn-toggle').forEach(function (btn) {
+                        btn.classList.toggle('active', btn.dataset.value === String(sdRefresh));
+                    });
+                }
+            }
+            // ACC-off surveillance tier — SIBLING re-sync so a change made on
+            // another device / tab reflects on visibility refresh (the surv page
+            // now owns recording.surveillanceQuality; /api/surveillance/config
+            // does NOT surface it, so re-read it from unified config here — same
+            // pattern as the rectify + clip-duration blocks above). Falls back to
+            // the ACC-on recordingQuality when the surveillance key is absent, so
+            // a pre-split config shows the seeded value. Guarded on
+            // !hasUnsavedChanges to protect a mid-flight tier pick.
+            if (!this.hasUnsavedChanges &&
+                uData.success && uData.config && uData.config.recording) {
+                var sqRefresh = uData.config.recording.surveillanceQuality
+                    || uData.config.recording.recordingQuality;
+                if (sqRefresh && sqRefresh !== this.config.surveillanceQuality) {
+                    this.config.surveillanceQuality = sqRefresh;
+                    if (this.savedConfig) this.savedConfig.surveillanceQuality = sqRefresh;
+                    document.querySelectorAll('#survQualityBtns .btn-toggle').forEach(function (btn) {
+                        btn.classList.toggle('active', btn.dataset.value === sqRefresh);
+                    });
+                    this.renderActiveEstimate();
+                }
+            }
+            // ACC-off surveillance fps — SIBLING re-sync (camera.surveillanceTargetFps),
+            // falling back to camera.targetFps when unset. Same guard/pattern.
+            if (!this.hasUnsavedChanges &&
+                uData.success && uData.config && uData.config.camera) {
+                var sfRefresh = (typeof uData.config.camera.surveillanceTargetFps === 'number')
+                    ? uData.config.camera.surveillanceTargetFps
+                    : uData.config.camera.targetFps;
+                if (typeof sfRefresh === 'number' && sfRefresh !== this.config.surveillanceCameraFps) {
+                    this.config.surveillanceCameraFps = sfRefresh;
+                    if (this.savedConfig) this.savedConfig.surveillanceCameraFps = sfRefresh;
+                    document.querySelectorAll('#survFpsBtns .btn-toggle').forEach(function (btn) {
+                        btn.classList.toggle('active', btn.dataset.value === String(sfRefresh));
+                    });
+                }
+            }
         } catch (_) {}
     },
-    
+
     async loadStorageSettings() {
         try {
             const resp = await fetch('/api/settings/storage');
             const data = await resp.json();
             if (data.success) {
-                this.config.surveillanceLimitMb = data.surveillanceLimitMb || 500;
-                this.config.surveillanceStorageType = data.surveillanceStorageType || 'INTERNAL';
+                // Dirty-guard the user-editable picker fields — see the matching
+                // guard in recording.js loadStorageSettings. A reload landing just
+                // after Apply (hasUnsavedChanges already cleared) would otherwise
+                // overwrite the just-saved slider value with a stale server read
+                // and snap the slider back. Display-only storageInfo/ceilings below
+                // always refresh.
+                if (!this.hasUnsavedChanges) {
+                    this.config.surveillanceLimitMb = data.surveillanceLimitMb || 500;
+                    this.config.surveillanceStorageType = data.surveillanceStorageType || 'INTERNAL';
+                }
                 // Active = where surveillance ACTUALLY writes right now. Differs
                 // from the configured type when the chosen external volume isn't
                 // mounted (the SD card is bridged behind the USB power rail, so
@@ -410,25 +519,31 @@ BYD.surveillance = {
             const resp = await fetch('/api/settings/quality');
             const data = await resp.json();
             if (data.success) {
-                this.config.cameraFps = data.cameraFps || 15;
+                // Surveillance-specific fps + tier (fall back to the shared
+                // ACC-on value the server sends when the surveillance key is
+                // unset, so a fresh install shows the seeded default).
+                this.config.surveillanceCameraFps =
+                    data.surveillanceCameraFps || data.cameraFps || 15;
                 this.config.cameraFpsActual = data.cameraFpsActual || null;
                 this.config.cameraFpsClampNote = data.cameraFpsClampNote || null;
                 // Pull tier + render data so the picker can show live
                 // size estimates without waiting for the next reload.
-                if (data.recordingQuality) {
-                    this.config.recordingQuality = data.recordingQuality;
+                if (data.surveillanceQuality) {
+                    this.config.surveillanceQuality = data.surveillanceQuality;
+                } else if (data.recordingQuality) {
+                    this.config.surveillanceQuality = data.recordingQuality;
                 }
                 this.config.recordingQualityOptions = data.recordingQualityOptions || {};
                 this.config.activeRecordingEstimate = data.activeRecordingEstimate || null;
             }
         } catch (e) {
             console.warn('Failed to load camera FPS:', e);
-            this.config.cameraFps = 15;
+            this.config.surveillanceCameraFps = 15;
         }
     },
-    
+
     setFps(fps) {
-        this.config.cameraFps = parseInt(fps, 10);
+        this.config.surveillanceCameraFps = parseInt(fps, 10);
         document.querySelectorAll('#survFpsBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === String(fps)));
         // FPS shifts the per-tier qualityEquivalent labels — re-render so
@@ -900,18 +1015,23 @@ BYD.surveillance = {
             const uResp = await fetch('/api/settings/unified');
             const uData = await uResp.json();
             if (uData.success && uData.config) {
-                    if (typeof uData.config.recording.rectifyStrength === 'number') {
-                        var rs = uData.config.recording.rectifyStrength;
-                        if (rs < 0) rs = 0; if (rs > 100) rs = 100;
-                        this.config.rectifyStrength = rs;
-                    } else {
-                        this.config.rectifyStrength = 0;
-                    }
-                    if (typeof uData.config.recording.segmentDurationMinutes === 'number') {
-                        this.config.segmentDurationMinutes = uData.config.recording.segmentDurationMinutes;
-                    } else {
-                        this.config.segmentDurationMinutes = 2;
-                    }
+                if (uData.config.recording &&
+                    typeof uData.config.recording.rectifyStrength === 'number') {
+                    var rs = uData.config.recording.rectifyStrength;
+                    if (rs < 0) rs = 0; if (rs > 100) rs = 100;
+                    this.config.rectifyStrength = rs;
+                } else {
+                    this.config.rectifyStrength = 0;
+                }
+                // Shared clip duration (same key the recording page writes).
+                if (uData.config.recording &&
+                    typeof uData.config.recording.segmentDurationMinutes === 'number') {
+                    var sd = uData.config.recording.segmentDurationMinutes;
+                    if (sd !== 2 && sd !== 5 && sd !== 10) sd = 2;
+                    this.config.segmentDurationMinutes = sd;
+                } else {
+                    this.config.segmentDurationMinutes = 2;
+                }
                 try {
                     var mode = uData.config.camera && uData.config.camera.cameraMode;
                     var card = document.getElementById('survRectifyCard');
@@ -1029,15 +1149,20 @@ BYD.surveillance = {
         const timelinePost = document.getElementById('timelinePost');
         if (timelinePost) timelinePost.style.flex = this.config.postRecordSeconds / 20;
 
-        // New tier picker (replaces #bitrateBtns).
+        // Surveillance tier picker — bound to the ACC-off surveillanceQuality
+        // key (independent of the dashcam page's recordingQuality picker).
         document.querySelectorAll('#survQualityBtns .btn-toggle').forEach(btn =>
-            btn.classList.toggle('active', btn.dataset.value === this.config.recordingQuality));
+            btn.classList.toggle('active', btn.dataset.value === this.config.surveillanceQuality));
         document.querySelectorAll('#codecBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === this.config.recordingCodec));
 
-        // Camera FPS buttons
+        // Surveillance camera FPS buttons — bound to surveillanceCameraFps.
         document.querySelectorAll('#survFpsBtns .btn-toggle').forEach(btn =>
-            btn.classList.toggle('active', btn.dataset.value === String(this.config.cameraFps || 15)));
+            btn.classList.toggle('active', btn.dataset.value === String(this.config.surveillanceCameraFps || 15)));
+
+        // Clip duration buttons (shared across recording + surveillance).
+        document.querySelectorAll('#survClipDurationBtns .btn-toggle').forEach(btn =>
+            btn.classList.toggle('active', btn.dataset.value === String(this.config.segmentDurationMinutes || 2)));
 
         // Lens-dewarp slider (shared across recording + surveillance).
         var rectifySlider = document.getElementById('survRectifySlider');
@@ -1075,7 +1200,7 @@ BYD.surveillance = {
     },
 
     updateCheckboxStyles() {
-        ['detectPerson', 'detectCar', 'detectBike'].forEach(id => {
+        ['detectPerson', 'detectCar', 'detectBike', 'detectAnimal'].forEach(id => {
             const cb = document.getElementById(id);
             if (cb && cb.parentElement) {
                 cb.parentElement.classList.toggle('active', cb.checked);
@@ -1121,6 +1246,8 @@ BYD.surveillance = {
         this.config.detectPerson = document.getElementById('detectPerson').checked;
         this.config.detectCar = document.getElementById('detectCar').checked;
         this.config.detectBike = document.getElementById('detectBike').checked;
+        var _da = document.getElementById('detectAnimal');
+        if (_da) this.config.detectAnimal = _da.checked;
         this.updateCheckboxStyles();
         this.markChanged();
     },
@@ -1180,8 +1307,22 @@ BYD.surveillance = {
         }, 200);
     },
 
+    /** Clip segment length (minutes: 2/5/10). SAME shared key as the recording
+     *  page — editing here also changes the dashcam axis. Persisted on Apply
+     *  via the quality POST (which validates + live-applies to both axes);
+     *  takes effect on the next segment rotation. */
+    setClipDuration(minutes) {
+        var m = parseInt(minutes, 10);
+        if (m !== 2 && m !== 5 && m !== 10) m = 2;
+        this.config.segmentDurationMinutes = m;
+        document.querySelectorAll('#survClipDurationBtns .btn-toggle').forEach(function (btn) {
+            btn.classList.toggle('active', btn.dataset.value === String(m));
+        });
+        this.markChanged();
+    },
+
     setRecordingQuality(tier) {
-        this.config.recordingQuality = tier;
+        this.config.surveillanceQuality = tier;
         document.querySelectorAll('#survQualityBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === tier));
         this.renderActiveEstimate();
@@ -1206,13 +1347,7 @@ BYD.surveillance = {
     formatEstimate(est) {
         if (!est) return '—';
         const parts = [BYD.i18n.t('recording.unit_mbps', {n: (est.bitrateMbps != null ? est.bitrateMbps : '—')})];
-        const durationMin = this.config.segmentDurationMinutes || 2;
-        if (est.mbPerMinute != null) {
-            const mbPerSegment = Math.round(est.mbPerMinute * durationMin * 10) / 10;
-            parts.push(BYD.i18n.t('recording.unit_mb_per_segment', {n: mbPerSegment, min: durationMin}));
-        } else if (est.mbPer2Min != null) {
-            parts.push(BYD.i18n.t('recording.unit_mb_per_2min', {n: est.mbPer2Min}));
-        }
+        if (est.mbPer2Min != null) parts.push(BYD.i18n.t('recording.unit_mb_per_2min', {n: est.mbPer2Min}));
         if (est.qualityEquivalent) parts.push(est.qualityEquivalent);
         return parts.join(' · ');
     },
@@ -1223,8 +1358,8 @@ BYD.surveillance = {
             // Compute locally from the user's *current* selection, not the
             // server's stale activeRecordingEstimate. Show "saved → pending"
             // diff when the user has changed the tier without applying yet.
-            const currentTier = this.config.recordingQuality;
-            const savedTier = this.savedConfig ? this.savedConfig.recordingQuality : currentTier;
+            const currentTier = this.config.surveillanceQuality;
+            const savedTier = this.savedConfig ? this.savedConfig.surveillanceQuality : currentTier;
             const currentEst = this.estimateForTier(currentTier);
             const savedEst = this.estimateForTier(savedTier);
             if (currentTier === savedTier || !savedEst) {
@@ -1671,6 +1806,12 @@ BYD.surveillance = {
             hint.setAttribute('data-i18n', 'surveillance.shadow_hint.' + this.config.shadowFilter);
             hint.textContent = BYD.i18n.t('surveillance.shadow_hint.' + this.config.shadowFilter) || '';
         }
+        this.markChanged();
+    },
+
+    updateDiscardEmptyMotion() {
+        var el = document.getElementById('v2DiscardEmptyMotion');
+        this.config.discardEmptyBrightMotionEvents = (el && el.checked) || false;
         this.markChanged();
     },
     
@@ -2230,6 +2371,17 @@ BYD.surveillance = {
         // Reflect the "recording to Internal because USB power is off" notice.
         this.updateUsbPowerStorageNotice();
 
+        // Low-battery (HV SoC) cutoff slider. 0 renders as "Off".
+        const socCutoff = document.getElementById('lowSocCutoffSlider');
+        let socVal = parseInt(this.config.lowSocCutoffPercent, 10);
+        if (!isFinite(socVal)) socVal = 10;
+        if (socVal < 0) socVal = 0; if (socVal > 30) socVal = 30;
+        if (socCutoff) socCutoff.value = socVal;
+        const socCutoffLabel = document.getElementById('lowSocCutoffValue');
+        if (socCutoffLabel) socCutoffLabel.textContent = (socVal === 0)
+            ? (BYD.i18n.t('surveillance.low_soc_cutoff_off') || 'Off')
+            : socVal + '%';
+
         // Environment preset — check if current values match the saved preset
         // If user customized sliders after selecting a preset, don't highlight any preset
         const savedPreset = this.config.environmentPreset;
@@ -2367,6 +2519,12 @@ BYD.surveillance = {
             el.checked = !!want;
         };
 
+        // Discard non-actor recordings (detection tab) — user-facing toggle,
+        // so use setToggle for the Chrome-58 slider repaint (the developer
+        // toggles above can stay plain).
+        setToggle(document.getElementById('v2DiscardEmptyMotion'),
+                  !!this.config.discardEmptyBrightMotionEvents);
+
         // Telegram start-ping opt-in
         setToggle(document.getElementById('v2TelegramSendStartPing'),
                   !!this.config.telegramSendStartPing);
@@ -2388,6 +2546,8 @@ BYD.surveillance = {
         if (dc) dc.checked = this.config.detectCar;
         const db = document.getElementById('detectBike');
         if (db) db.checked = this.config.detectBike;
+        const da = document.getElementById('detectAnimal');
+        if (da) da.checked = this.config.detectAnimal;
         this.updateCheckboxStyles();
     },
 
@@ -2431,28 +2591,31 @@ BYD.surveillance = {
             'loiteringTime', 'approachTrigger', 'shadowFilter',
             'cameraFront', 'cameraRight', 'cameraLeft', 'cameraRear',
             'quadrantOverrides',
-            'detectPerson', 'detectCar', 'detectBike',
+            'detectPerson', 'detectCar', 'detectBike', 'detectAnimal',
             'aiConfidence', 'minObjectSize',
             'flashImmunity',
             // Folded in from the (removed) Advanced tab — these motion-
             // detection diagnostics belong with detection.
-            'motionHeatmap', 'filterDebugLog'
+            'motionHeatmap', 'filterDebugLog',
+            'discardEmptyBrightMotionEvents'
         ],
         recording: [
-            // Backend reads these EXACT names — preRecordSeconds (no "ing"),
-            // recordingQuality / recordingCodec (with the "recording" prefix).
-            // recordingQuality is the consolidated tier (ECONOMY..MAX) that
-            // replaces the legacy recordingBitrate (LOW/MEDIUM/HIGH).
-            // cameraFps now flows through Apply too — branch in applySettings()
-            // POSTs the trio (recordingQuality + recordingCodec + cameraFps)
-            // to /api/settings/quality before merging the rest into
-            // /api/surveillance/config.
-            // rectifyStrength is shared with the recording page; saving here
-            // also drives ACC-on dashcam dewarp via the unified config key
-            // (recording.rectifyStrength).
+            // Backend reads these EXACT names — preRecordSeconds (no "ing").
+            // This page's quality/fps pickers drive the ACC-off SURVEILLANCE
+            // knobs (surveillanceQuality + surveillanceCameraFps), INDEPENDENT
+            // of the dashcam page's ACC-on recordingQuality/cameraFps. The
+            // applySettings() recording branch POSTs them to
+            // /api/settings/quality, which persists + live-applies to a running
+            // parked recording with no encoder reinit.
+            // recordingCodec is SHARED (device-compat, not a per-mode knob) and
+            // stays on the shared key. rectifyStrength + segmentDurationMinutes
+            // are likewise shared with the dashcam page (one slider each).
             'preRecordSeconds', 'postRecordSeconds',
-            'recordingQuality', 'recordingCodec', 'cameraFps',
-            'rectifyStrength'
+            'surveillanceQuality', 'recordingCodec', 'surveillanceCameraFps',
+            'rectifyStrength',
+            // Shared clip duration — same recording.segmentDurationMinutes key
+            // the dashcam page writes; saving here also changes that axis.
+            'segmentDurationMinutes'
         ],
         oem: [
             // OEM tab is a sentinel — applySettings() branches off to
@@ -2519,6 +2682,30 @@ BYD.surveillance = {
                 });
                 if (!storageResp.ok) throw new Error('Storage save failed: ' + storageResp.status);
                 storageData = await storageResp.json();
+                // HTTP 200 with {success:false} = the requested storage-TYPE
+                // change was rejected (target volume unavailable). The server
+                // handles the type FIRST and returns before the limit, so
+                // nothing was committed — revert both optimistic fields to the
+                // baseline, re-render, and throw so the catch shows an error
+                // instead of baking the rejected value into savedConfig.
+                if (storageData && storageData.success === false) {
+                    if (this.savedConfig) {
+                        this.config.surveillanceStorageType = this.savedConfig.surveillanceStorageType;
+                        this.config.surveillanceLimitMb = this.savedConfig.surveillanceLimitMb;
+                    }
+                    this.updateStorageLimitUI();
+                    this.updateStorageTypeUI();
+                    throw new Error(storageData.error || 'storage change rejected');
+                }
+                // Re-sync config to the daemon's committed (possibly clamped)
+                // value so the savedConfig snapshot below baselines off the true
+                // persisted number — see the matching re-sync in recording.js.
+                if (typeof storageData.surveillanceLimitMb === 'number') {
+                    this.config.surveillanceLimitMb = storageData.surveillanceLimitMb;
+                }
+                if (storageData.surveillanceStorageType) {
+                    this.config.surveillanceStorageType = storageData.surveillanceStorageType;
+                }
                 // CDR cleanup card on this tab self-saves — toggleCdrCleanup()
                 // and the slider onchange handlers POST to
                 // /api/storage/external/config directly on each change. So
@@ -2568,7 +2755,8 @@ BYD.surveillance = {
                 // changes". Without this, parallel posts could promote
                 // savedConfig optimistically and leave divergent state
                 // with no recovery short of a full reload.
-                const qualityKeys = ['recordingQuality', 'recordingCodec', 'cameraFps'];
+                const qualityKeys = ['surveillanceQuality', 'recordingCodec', 'surveillanceCameraFps',
+                    'segmentDurationMinutes'];
                 const survKeys = ['preRecordSeconds', 'postRecordSeconds'];
                 const committed = {};
                 let firstError = null;
@@ -2578,9 +2766,14 @@ BYD.surveillance = {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            recordingQuality: this.config.recordingQuality,
+                            // ACC-off surveillance knobs — server persists to
+                            // recording.surveillanceQuality / camera.surveillanceTargetFps
+                            // and live-applies to a running parked recording.
+                            surveillanceQuality: this.config.surveillanceQuality,
+                            surveillanceCameraFps: this.config.surveillanceCameraFps,
+                            // Shared with the dashcam page (device-compat + clip length).
                             recordingCodec: this.config.recordingCodec,
-                            cameraFps: this.config.cameraFps
+                            segmentDurationMinutes: this.config.segmentDurationMinutes
                         })
                     });
                     if (!qResp.ok) throw new Error('Quality save failed: ' + qResp.status);
@@ -2900,6 +3093,47 @@ BYD.surveillance = {
         if (!isFinite(v)) return;
         var label = document.getElementById('screenDeterrentDurationValue');
         if (label) label.textContent = v + 's';
+    },
+
+    /**
+     * Low-battery (HV SoC) cutoff — label-only preview while dragging. The real
+     * save fires on `onchange` (drag end) via updateLowSocCutoff so a drag
+     * doesn't POST per pointer-move. 0 renders as "Off".
+     */
+    previewLowSocCutoff: function(value) {
+        var v = parseInt(value, 10);
+        if (!isFinite(v)) return;
+        var label = document.getElementById('lowSocCutoffValue');
+        if (label) label.textContent = (v === 0)
+            ? (BYD.i18n.t('surveillance.low_soc_cutoff_off') || 'Off')
+            : v + '%';
+    },
+
+    /**
+     * Persist the low-battery cutoff. Saves to power.lowSocCutoffPercent (the
+     * key SocCutoffMonitor reads), NOT the surveillance section — the handler
+     * routes it. Immediate-save + savedConfig mirror so it stays clean against
+     * the Apply-button dirty diff, mirroring updateScreenDeterrent('duration').
+     */
+    updateLowSocCutoff: function(value) {
+        var v = parseInt(value, 10);
+        if (!isFinite(v) || v < 0) v = 0;
+        if (v > 30) v = 30;
+        this.config.lowSocCutoffPercent = v;
+        if (this.savedConfig) this.savedConfig.lowSocCutoffPercent = v;
+        var label = document.getElementById('lowSocCutoffValue');
+        if (label) label.textContent = (v === 0)
+            ? (BYD.i18n.t('surveillance.low_soc_cutoff_off') || 'Off')
+            : v + '%';
+        fetch('/api/surveillance/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ lowSocCutoffPercent: v })
+        }).then(function() {
+            if (BYD.surveillance.markChanged) BYD.surveillance.markChanged();
+        }).catch(function(e) {
+            console.warn('Failed to save low-SoC cutoff:', e);
+        });
     },
 
     queueScreenDeterrentMessage: function(value) {

@@ -40,6 +40,44 @@ object UnifiedConfigManager {
     // Single source of truth - world-readable location
     private const val CONFIG_PATH = "/data/local/tmp/overdrive_config.json"
 
+    // ==================== DOUBLE-BUFFERED, SEQ-STAMPED DURABILITY ====================
+    //
+    // The core OTA config-loss defense. The config lives in sticky
+    // /data/local/tmp, where ONLY the daemon (UID 2000) can create the sibling
+    // needed for an atomic tmp+rename — the app UID (10xxx) cannot, so its
+    // direct writes are a NON-atomic truncate-rewrite that `pm install -r`'s
+    // SIGKILL can tear. During the pm-install window the daemon is DEAD, so the
+    // app is forced onto exactly that fragile path with no atomic-capable peer
+    // to forward to. Defenses, layered:
+    //
+    //  1. STICKY .bak  — daemon-maintained last-known-good in the shared dir.
+    //                    World-readable so any process can recover from it.
+    //  2. APP-PRIVATE .bak — a SECOND last-known-good the APP writes ATOMICALLY
+    //                    in its own data dir (it CAN create siblings + rename
+    //                    there). This is the copy that stays CURRENT across an
+    //                    entire daemon-down session — the sticky .bak goes stale
+    //                    because the app can't refresh it. The daemon can't read
+    //                    this dir (0700 app-owned), which is fine: the app heals
+    //                    itself from it, and the seq-promotion below repairs the
+    //                    case where the daemon healed the live file from its
+    //                    stale sticky .bak first.
+    //  3. configSeq — a MONOTONIC counter embedded in the config and bumped on
+    //                    every saveConfig under the cross-process lock. Recovery
+    //                    and load-time promotion pick the copy with the HIGHEST
+    //                    seq, so the system can NEVER silently revert to an older
+    //                    snapshot — even with ext4 second-granular mtime or a
+    //                    skewed RTC (BYD head units boot with a wrong clock).
+    //
+    // Hardcoded app-private path (UCM is a Context-free singleton object). Must
+    // match the application's package — Context.filesDir resolves here.
+    private const val APP_PACKAGE = "com.overdrive.app"
+    private const val APP_PRIVATE_DIR = "/data/data/$APP_PACKAGE/files"
+    private const val APP_PRIVATE_BAK_PATH = "$APP_PRIVATE_DIR/overdrive_config.json.bak"
+    // Monotonic write sequence. Absent (legacy configs) reads as 0; saveConfig
+    // bumps it. Stripped from backup bundles (see ConfigBackupService) so an
+    // imported bundle never injects a foreign seq.
+    private const val SEQ_KEY = "configSeq"
+
     // Daemon IPC: the app process (UID >= 10000) cannot create the .tmp sibling
     // needed for an atomic write in sticky /data/local/tmp/, so its direct
     // writes fall back to a NON-atomic truncate-then-rewrite that corrupts the
@@ -75,6 +113,50 @@ object UnifiedConfigManager {
     @Volatile
     private var cachedConfig: JSONObject? = null
     private val lastModified = AtomicLong(0)
+    /**
+     * Record the freshness key (the file mtime) for the bytes now cached. Call
+     * everywhere the cache is (re)populated. 0 = "force re-read next time".
+     */
+    private fun stampFreshness(mtime: Long) {
+        lastModified.set(mtime)
+    }
+
+    /**
+     * True iff the cache is still valid for [configFile].
+     *
+     * ext4 mtime is second-granular, so a cross-UID write committing in the
+     * SAME wall-clock second as our cached snapshot yields an EQUAL mtime — the
+     * old `fileModified <= lastModified` fast-path then served a stale config to
+     * bare-loadConfig getters (getSurveillance/getRecording/…). Pairing mtime
+     * with file SIZE was insufficient too: a pretty-printed same-length edit
+     * (targetFps 15→30, a double 1.66→1.77, an enum of equal length) keeps the
+     * byte count identical and slips through.
+     *
+     * Correct + cheap rule: serve the cache ONLY when the on-disk mtime is
+     * UNCHANGED since we cached AND the wall clock has advanced PAST that second
+     * — because a write landing after our stamped second necessarily carries a
+     * strictly greater mtime, so an equal mtime in a LATER second proves no
+     * write has occurred. Any other case re-reads:
+     *  - mtime advanced               → a newer write, reparse.
+     *  - mtime LOWER than our stamp    → the RTC stepped backward (a documented
+     *                                    BYD head-unit condition the rest of this
+     *                                    file already distrusts) or a recovery
+     *                                    wrote an older-mtime file; the content
+     *                                    may be newer, so reparse rather than
+     *                                    trust the clock.
+     *  - mtime equal, still IN that    → a same-second write could share this
+     *    second                          mtime; reparse to be safe.
+     * Cost: a bare getter polled within the 1s after a write reparses a few
+     * times — negligible, and strictly safer. The monotonic configSeq remains
+     * the authoritative ordering signal for recovery/promotion; this gate only
+     * decides cache-hit vs reparse.
+     */
+    private fun isCacheFresh(configFile: File): Boolean {
+        val stamped = lastModified.get()
+        if (stamped <= 0L) return false                          // sentinel → always re-read
+        if (configFile.lastModified() != stamped) return false   // any mismatch → re-read
+        return (System.currentTimeMillis() / 1000L) > (stamped / 1000L)
+    }
 
     // Raised when loadConfig() finds a NON-EMPTY but unparseable file on disk
     // (corruption — e.g. the non-atomic fallback write in saveConfigInternal
@@ -188,6 +270,7 @@ object UnifiedConfigManager {
                 copyIfExists(legacy, surveillance, "detectPerson")
                 copyIfExists(legacy, surveillance, "detectCar")
                 copyIfExists(legacy, surveillance, "detectBike")
+                copyIfExists(legacy, surveillance, "detectAnimal")
                 copyIfExists(legacy, surveillance, "preRecordSeconds")
                 copyIfExists(legacy, surveillance, "postRecordSeconds")
                 
@@ -268,8 +351,29 @@ object UnifiedConfigManager {
             } else {
                 unified
             }
-            saveConfigInternal(toPersist)
-            cachedConfig = toPersist
+            // Stamp the monotonic sequence on the very first persist so the
+            // backups seeded below carry a seq from creation (recovery /
+            // promotion can then order them). max(onDisk, mem)+1 keeps it
+            // monotonic if a peer already wrote a seq we re-read above.
+            toPersist.put(SEQ_KEY, nextConfigSeq(toPersist))
+            if (saveConfigInternal(toPersist)) {
+                cachedConfig = toPersist
+                stampFreshness(File(CONFIG_PATH).lastModified())
+                // Seed the last-known-good copies AT CREATION so there is never
+                // a "live file exists but no .bak" window for an app-UID torn
+                // write to fall into. The daemon (which runs init/migrate) can
+                // atomic-rename the sticky .bak; the app-private .bak is a no-op
+                // here (daemon UID) and gets seeded on the app's first save.
+                writeBackupCopy(toPersist)
+                writeAppPrivateBackup(toPersist)
+            } else {
+                cachedConfig = toPersist
+                // Persist failed (e.g. app UID, tmp-create denied). Force the
+                // next loadConfig to re-read rather than serve this unstamped
+                // in-memory object — explicit intent, not reliance on the
+                // still-initial sentinel.
+                stampFreshness(0)
+            }
         }
 
         Log.i(TAG, "Migration complete. Unified config saved to $CONFIG_PATH")
@@ -327,6 +431,11 @@ object UnifiedConfigManager {
         val blindspot = config.optJSONObject("blindspot") ?: JSONObject().also {
             config.put("blindspot", it)
         }
+        // Power / battery-safety section. Holds the HV-SoC surveillance cutoff
+        // read by SocCutoffMonitor.cutoffPercent() (key power.lowSocCutoffPercent).
+        val power = config.optJSONObject("power") ?: JSONObject().also {
+            config.put("power", it)
+        }
         // Ensure the telegram section exists (createDefaultConfig seeds it, but
         // applyDefaults must also work on a partial config built elsewhere — e.g.
         // a restored backup whose telegram section was skipped on a key
@@ -345,6 +454,7 @@ object UnifiedConfigManager {
         if (!surveillance.has("detectPerson")) surveillance.put("detectPerson", true)
         if (!surveillance.has("detectCar")) surveillance.put("detectCar", true)
         if (!surveillance.has("detectBike")) surveillance.put("detectBike", false)
+        if (!surveillance.has("detectAnimal")) surveillance.put("detectAnimal", false)
         if (!surveillance.has("preRecordSeconds")) surveillance.put("preRecordSeconds", 5)
         if (!surveillance.has("postRecordSeconds")) surveillance.put("postRecordSeconds", 10)
         if (!surveillance.has("blockSize")) surveillance.put("blockSize", 32)
@@ -368,7 +478,15 @@ object UnifiedConfigManager {
         if (!surveillance.has("screenDeterrentDurationSeconds")) surveillance.put("screenDeterrentDurationSeconds", 8)
         if (!surveillance.has("screenDeterrentImagePath")) surveillance.put("screenDeterrentImagePath", "")
         if (!surveillance.has("screenDeterrentMessage")) surveillance.put("screenDeterrentMessage", "")
-        
+
+        // HV traction-battery SoC cutoff for parked surveillance. At or below
+        // this %, SocCutoffMonitor arms a 60 s grace then self-shuts-down to
+        // protect the pack. User-tunable from Surveillance → General (slider
+        // 0..30). 0 = Off: SocCutoffMonitor.onElecPercentageChanged() early-
+        // returns on pct<=0 BEFORE the cutoff compare, so a 0 cutoff can never
+        // arm. Default 10 matches SocCutoffMonitor.DEFAULT_CUTOFF_PERCENT.
+        if (!power.has("lowSocCutoffPercent")) power.put("lowSocCutoffPercent", 10)
+
         // Recording defaults. The canonical key is `recordingQuality` (ECONOMY..MAX).
         // `quality` is the legacy mirror; `bitrate` (LOW/MEDIUM/HIGH) is no longer
         // seeded — it would drift from the active tier and confuse cross-channel
@@ -377,7 +495,20 @@ object UnifiedConfigManager {
         if (!recording.has("recordingQuality")) recording.put("recordingQuality", "STANDARD")
         if (!recording.has("quality")) recording.put("quality", recording.optString("recordingQuality", "STANDARD"))
         if (!recording.has("codec")) recording.put("codec", "H264")
-        if (!recording.has("segmentDurationMinutes")) recording.put("segmentDurationMinutes", com.overdrive.app.util.Constants.SEGMENT_DURATION_MINUTES)
+        // Surveillance (ACC-off / parked sentry) quality tier. Independent of the
+        // ACC-on recordingQuality above so parked footage can use a different
+        // bitrate (e.g. thriftier while parked all day, or higher for evidence).
+        //
+        // DELIBERATELY NOT SEEDED. It resolves via read-time fallback in each
+        // consumer instead: when this key is absent, the pano pipeline falls
+        // back to recording.recordingQuality and the OEM dashcam falls back to
+        // its own oemDashcam.recordingQuality → recording.recordingQuality
+        // chain. Physically seeding it (e.g. from recording.recordingQuality)
+        // would REGRESS the OEM axis whenever oemDashcam.recordingQuality
+        // diverges from the pano tier — the seeded pano value would override
+        // the OEM's own slot. Absence = byte-identical to the pre-split world
+        // for BOTH pipelines; presence = user explicitly chose a surveillance
+        // tier. Both flows resolve bitrate against the SHARED `codec` key.
         // Recording-side dewarp strength (Fitzgibbon division model). 0..100,
         // 0 = off (default). Single source of truth for both ACC-on dashcam
         // and ACC-off surveillance flows — both pipelines read the same key
@@ -385,7 +516,16 @@ object UnifiedConfigManager {
         // legacy 4-strip layout; dilink4 cars get a clean 2x2 from the HAL
         // already and the recorder's shader gates the dewarp accordingly.
         if (!recording.has("rectifyStrength")) recording.put("rectifyStrength", 0)
-        
+
+        // Clip segment length in minutes (2/5/10). Single source of truth for
+        // BOTH the ACC-on dashcam and ACC-off / OEM surveillance flows — both
+        // pipelines read this one key so a single UI control applies
+        // everywhere (mirrors rectifyStrength above).
+        if (!recording.has("segmentDurationMinutes")) {
+            recording.put("segmentDurationMinutes",
+                com.overdrive.app.util.Constants.SEGMENT_DURATION_MINUTES)
+        }
+
         // Streaming defaults
         if (!streaming.has("quality")) streaming.put("quality", "MEDIUM")
 
@@ -397,6 +537,16 @@ object UnifiedConfigManager {
                 com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO)
         }
         if (!camera.has("targetFps"))         camera.put("targetFps", 15)
+        // Surveillance (ACC-off / parked sentry) camera fps. Independent of the
+        // ACC-on targetFps so parked recording can run at a lower rate to save
+        // power/storage while the car sits all day.
+        //
+        // DELIBERATELY NOT SEEDED (see surveillanceQuality above for the full
+        // rationale). Read-time fallback only: absent ⇒ the pano pipeline uses
+        // camera.targetFps (15) and the OEM dashcam uses its own
+        // oemDashcam.fps (30) → recording.fps chain. Seeding a single value
+        // here would drop OEM parked fps from its 30 default to 15. Absence =
+        // byte-identical per pipeline; presence = an explicit user choice.
         if (!camera.has("probedCameraId"))    camera.put("probedCameraId", -1)
         if (!camera.has("probedSurfaceMode")) camera.put("probedSurfaceMode", -1)
         if (!camera.has("roleMappings"))      camera.put("roleMappings", JSONObject())
@@ -640,17 +790,17 @@ object UnifiedConfigManager {
         val configFile = File(CONFIG_PATH)
         
         // Check if file changed since last load
-        // Cheap fast-path: serve the cache unless the file's mtime advanced.
-        // INVARIANT (intentional): ext4 mtime is second-granular, so a peer-UID
-        // write committing in the SAME wall-clock second yields equal mtime and
-        // this returns a one-write-stale snapshot. That is acceptable for hot
-        // poll loops (e.g. RoadSenseOverlayService) that call bare loadConfig.
-        // Correctness-critical cross-UID reads MUST call forceReload() first
-        // (getUpdateChannel/ScreenDeterrent/the update + IPC handlers all do),
-        // and every WRITE path re-reads via loadConfigFresh() under the file
-        // lock — so no write loses data to this window. Deliberately NOT
-        // tightened to `<` (that would force a re-parse on every same-second
-        // read and tax the hot loops for a non-bug).
+        // Cheap fast-path: serve the cache unless the file changed. Freshness is
+        // now a COMPOSITE (mtime, size) key (see isCacheFresh): ext4 mtime is
+        // second-granular, so a peer-UID write committing in the SAME wall-clock
+        // second used to yield equal mtime and serve a one-write-stale snapshot
+        // to bare-loadConfig getters (getSurveillance/getRecording/…). Pairing
+        // mtime with file length catches that same-second cross-UID rewrite
+        // (a real section write almost always changes the byte count) while
+        // still short-circuiting genuinely-unchanged files for hot poll loops
+        // (e.g. RoadSenseOverlayService). Correctness-critical reads still
+        // forceReload() first, and every WRITE path re-reads via
+        // loadConfigFresh() under the file lock — so no write loses data.
         // Snapshot the volatile field ONCE into a local: this fast-path runs
         // OUTSIDE synchronized(this), and a concurrent writer (forceReload /
         // loadConfigFresh) nulls cachedConfig under the monitor. A check-then-`!!`
@@ -659,8 +809,7 @@ object UnifiedConfigManager {
         // (field is @Volatile) so `cached` cannot become null after the check.
         val cached = cachedConfig
         if (cached != null && configFile.exists()) {
-            val fileModified = configFile.lastModified()
-            if (fileModified <= lastModified.get()) {
+            if (isCacheFresh(configFile)) {
                 return cached
             }
         }
@@ -703,11 +852,56 @@ object UnifiedConfigManager {
                         // object in memory); the daemon persists on its next write.
                         persistMigrationUnderLock()
                     }
-                    cachedConfig = config
-                    lastModified.set(configFile.lastModified())
                     // Parsed cleanly — any earlier corruption is resolved
                     // (e.g. the daemon rewrote a valid config). Re-arm saving.
                     corruptionDetected = false
+
+                    // LOAD-TIME SEQ PROMOTION (app UID only). If a torn live
+                    // file was healed by the DAEMON from its own STALE sticky
+                    // .bak (the daemon can't read the app-private .bak), the
+                    // live file is now valid-but-STALE and recoverFromBackup
+                    // never fires. Here the app detects that its private .bak
+                    // carries a HIGHER configSeq than the (stale) live config
+                    // and promotes it — restoring the user's newer changes the
+                    // daemon couldn't see. One-shot: the promote save bumps the
+                    // live seq above the .bak, so the next load won't re-promote.
+                    // readAppPrivateBackup() returns null on the daemon, so this
+                    // is inert there (the daemon is the source of truth it heals
+                    // from). Skipped while a write holds the file lock to avoid
+                    // promoting over an in-progress update (re-entrancy flag).
+                    val appBak = if (!holdingFileLock.get()) readAppPrivateBackup() else null
+                    if (appBak != null && seqOf(appBak) > seqOf(config)) {
+                        Log.w(TAG, "App-private .bak (seq=${seqOf(appBak)}) newer than live " +
+                            "(seq=${seqOf(config)}); promoting — daemon likely healed from a stale .bak")
+                        cachedConfig = config            // provisional, until promote save
+                        stampFreshness(configFile.lastModified())
+                        // Promote UNDER the cross-process lock and RE-CHECK the
+                        // on-disk seq after acquiring it: a peer daemon may have
+                        // written a genuinely newer config between our read above
+                        // and the lock. Only promote if disk is STILL older than
+                        // the .bak — otherwise the peer's newer write wins and we
+                        // must not regress it (lost-update guard).
+                        val promoted = withConfigFileLock {
+                            val liveNow = try {
+                                val cf = File(CONFIG_PATH)
+                                if (cf.exists() && cf.length() > 0L) JSONObject(cf.readText()) else null
+                            } catch (_: Exception) { null }
+                            if (liveNow != null && seqOf(liveNow) >= seqOf(appBak)) {
+                                false   // peer already caught up / surpassed; don't regress
+                            } else {
+                                saveConfig(appBak)   // bumps seq past both; mirrors backups
+                            }
+                        }
+                        if (promoted) {
+                            // saveConfig set cachedConfig/lastModified to the
+                            // promoted object and bumped its seq on disk.
+                            return@synchronized cachedConfig ?: appBak
+                        }
+                        // Not promoted (peer newer, or app-UID non-atomic write
+                        // verify failed) — fall through with the live config.
+                    }
+                    cachedConfig = config
+                    stampFreshness(configFile.lastModified())
                     // DEBUG-only: this fires on every genuine reparse (the mtime
                     // early-return above gates unchanged loads), so a 2-3Hz writer
                     // makes it the dominant logcat line. Each Log.d is a synchronous
@@ -756,7 +950,7 @@ object UnifiedConfigManager {
                         val retry = JSONObject(configFile.readText())
                         applyDefaults(retry)
                         cachedConfig = retry
-                        lastModified.set(configFile.lastModified())
+                        stampFreshness(configFile.lastModified())
                         corruptionDetected = false
                         Log.w(TAG, "Config parsed on second read; treated as " +
                             "transient corruption (no latch)")
@@ -788,15 +982,49 @@ object UnifiedConfigManager {
                     // ability to save. Clear the latch since the file is now
                     // clean. Hold the cross-process lock so the repair rename
                     // doesn't interleave with a peer daemon's write.
-                    if (withConfigFileLock { saveConfigInternal(defaults) }) {
-                        cachedConfig = defaults
-                        lastModified.set(configFile.lastModified())
-                        corruptionDetected = false
-                        Log.e(TAG, "Unrecoverable config (corrupt, no .bak); " +
-                            "reset to defaults so saving works again. Corrupt " +
-                            "bytes preserved at .bad")
-                        return@synchronized defaults
+                    //
+                    // TOCTOU guard: a PEER daemon JVM may have repaired the file
+                    // (its own recovery, or a real write) in the window between
+                    // our parse-failure above and acquiring the lock here. So
+                    // RE-READ on-disk UNDER the lock first: if it now parses,
+                    // ADOPT the peer's bytes instead of clobbering them with
+                    // defaults (which would also REGRESS configSeq). Only write
+                    // defaults when the file is still genuinely unparseable, and
+                    // compute the seq INSIDE the lock so it can't regress below a
+                    // peer write that landed first.
+                    val repaired = withConfigFileLock {
+                        val cf = File(CONFIG_PATH)
+                        val peerGood = try {
+                            if (cf.exists() && cf.length() > 0L) JSONObject(cf.readText()) else null
+                        } catch (_: Exception) { null }
+                        if (peerGood != null) {
+                            // A peer already fixed it — adopt, don't overwrite.
+                            cachedConfig = peerGood
+                            stampFreshness(cf.lastModified())
+                            corruptionDetected = false
+                            Log.w(TAG, "Corrupt config was repaired by a peer (seq=${seqOf(peerGood)}); adopting")
+                            peerGood
+                        } else {
+                            defaults.put(SEQ_KEY, nextConfigSeq(defaults))
+                            if (saveConfigInternal(defaults)) {
+                                cachedConfig = defaults
+                                stampFreshness(cf.lastModified())
+                                corruptionDetected = false
+                                // Seed the sticky .bak from the repaired defaults
+                                // so the very next write isn't operating without
+                                // a recovery copy (the no-.bak window that made
+                                // this branch reachable).
+                                writeBackupCopy(defaults)
+                                Log.e(TAG, "Unrecoverable config (corrupt, no .bak); " +
+                                    "reset to defaults so saving works again. Corrupt " +
+                                    "bytes preserved at .bad")
+                                defaults
+                            } else {
+                                null
+                            }
+                        }
                     }
+                    if (repaired != null) return@synchronized repaired
                     Log.e(TAG, "Daemon repair-write of defaults failed; latching")
                 }
                 // App UID (or daemon repair failed): latch to block a
@@ -814,24 +1042,48 @@ object UnifiedConfigManager {
 
     /**
      * Best-effort recovery of a corrupt live config from the last-known-good
-     * sibling .bak written by saveConfig(). Returns the recovered config (and
+     * backups written by saveConfig(). Returns the recovered config (and
      * promotes it back to the live path + clears corruptionDetected) on
      * success, or null if there's no usable backup. Caller holds the monitor.
+     *
+     * SEQ-AWARE, DOUBLE-SOURCE recovery: considers BOTH the sticky .bak
+     * (daemon-maintained, may be STALE across a daemon-down session) AND the
+     * app-private .bak (app-maintained, current for app-side writes). It
+     * restores whichever VALID candidate has the highest [SEQ_KEY], so a stale
+     * sticky .bak can NEVER silently revert newer user changes that the
+     * app-private copy still holds (the historical "settings reverted after
+     * OTA" symptom). Ties / legacy seq=0 fall back to the sticky .bak.
      */
     private fun recoverFromBackup(configFile: File): JSONObject? {
         val bakFile = File(configFile.parentFile, configFile.name + ".bak")
-        if (!bakFile.exists() || bakFile.length() == 0L) return null
+        val stickyBak: JSONObject? = try {
+            if (bakFile.exists() && bakFile.length() > 0L) JSONObject(bakFile.readText()) else null
+        } catch (e: Exception) {
+            Log.w(TAG, "Sticky .bak at ${bakFile.path} unusable: ${e.message}"); null
+        }
+        val appBak: JSONObject? = readAppPrivateBackup()
+
+        // Pick the highest-seq valid candidate. Prefer the sticky .bak on a tie
+        // (seq equal, incl. both legacy 0) so behaviour matches the historical
+        // single-source path when seqs are uninformative.
+        val recovered: JSONObject? = when {
+            stickyBak != null && appBak != null ->
+                if (seqOf(appBak) > seqOf(stickyBak)) appBak else stickyBak
+            stickyBak != null -> stickyBak
+            appBak != null -> appBak
+            else -> null
+        }
+        if (recovered == null) return null
+        val src = if (recovered === appBak) APP_PRIVATE_BAK_PATH else bakFile.path
+
         return try {
-            val recovered = JSONObject(bakFile.readText())
             // Promote the good bytes back to the live path so peer processes
             // stop reading corruption. Recovering from a CORRUPT live file, so
-            // we deliberately overwrite with the .bak content (no fresh re-read
-            // — the on-disk bytes ARE the corruption we're fixing). Persist for
-            // BOTH UIDs under the lock: the daemon does an atomic rename; the
-            // app does the non-atomic direct write onto the existing world-RW
-            // file (no worse than the corruption it replaces). The previous
-            // daemon-only persistSelfHeal left the app's torn file on disk and
-            // re-latched on the next forceReload — fixed here.
+            // we deliberately overwrite with the chosen .bak content (no fresh
+            // re-read — the on-disk bytes ARE the corruption we're fixing).
+            // Persist for BOTH UIDs under the lock: the daemon does an atomic
+            // rename; the app does the non-atomic direct write onto the existing
+            // world-RW file (no worse than the corruption it replaces).
             val repaired = withConfigFileLock { saveConfigInternal(recovered) }
             cachedConfig = recovered
             corruptionDetected = false
@@ -840,15 +1092,15 @@ object UnifiedConfigManager {
             // re-reads (and re-recovers) rather than serving cache over still-
             // corrupt bytes.
             if (repaired) {
-                lastModified.set(configFile.lastModified())
-                Log.w(TAG, "Recovered + repaired config from ${bakFile.path} after corruption")
+                stampFreshness(configFile.lastModified())
+                Log.w(TAG, "Recovered + repaired config from $src (seq=${seqOf(recovered)}) after corruption")
             } else {
-                lastModified.set(0)
-                Log.w(TAG, "Recovered config in-memory from ${bakFile.path}; disk repair deferred")
+                stampFreshness(0)
+                Log.w(TAG, "Recovered config in-memory from $src (seq=${seqOf(recovered)}); disk repair deferred")
             }
             recovered
         } catch (e: Exception) {
-            Log.w(TAG, "Backup at ${bakFile.path} also unusable: ${e.message}")
+            Log.w(TAG, "Recovery from $src failed: ${e.message}")
             null
         }
     }
@@ -872,6 +1124,11 @@ object UnifiedConfigManager {
             return false
         }
         config.put("lastModified", System.currentTimeMillis())
+        // Bump the monotonic write sequence so recovery / load-time promotion can
+        // ALWAYS identify the newest copy independent of (second-granular,
+        // possibly clock-skewed) mtime. Take max(disk, mem)+1 so a write never
+        // regresses the seq even if `config` was built from a stale snapshot.
+        config.put(SEQ_KEY, nextConfigSeq(config))
         val success = saveConfigInternal(config)
         if (success) {
             cachedConfig = config
@@ -882,13 +1139,22 @@ object UnifiedConfigManager {
             // (almost always) be greater than the file's mtime, so the
             // fileModified <= lastModified check would never trip and
             // a cross-UID write would never invalidate the cache.
-            lastModified.set(File(CONFIG_PATH).lastModified())
+            stampFreshness(File(CONFIG_PATH).lastModified())
             // Mirror a last-known-good copy. loadConfig() restores from this
             // when the live file is found corrupt, so a truncated write (e.g.
             // process killed mid non-atomic fallback during `pm install`)
             // self-heals instead of degrading to defaults. Best-effort: a
             // failure here doesn't fail the save.
             writeBackupCopy(config)
+            // SECOND last-known-good in the app's OWN private dir. The sticky
+            // .bak above goes STALE across a daemon-down session (the app UID
+            // can't atomic-rename in the sticky dir, so writeBackupCopy skips),
+            // which used to make recoverFromBackup silently restore an OLD
+            // snapshot. The app CAN atomic-rename in its private dir, so this
+            // copy stays current for app-side writes. recoverFromBackup picks
+            // whichever .bak has the higher configSeq, so neither source can
+            // revert the other. Best-effort; only the app process can write it.
+            writeAppPrivateBackup(config)
             notifyListeners("all", config)
         }
         return success
@@ -923,6 +1189,84 @@ object UnifiedConfigManager {
         } catch (e: Exception) {
             Log.d(TAG, "Backup copy skipped: ${e.message}")
         }
+    }
+
+    /**
+     * Read the monotonic write sequence from a config (0 if absent/legacy).
+     * CLAMPED to non-negative: the config file is world-RW (0666), so a foreign
+     * writer could inject a negative or garbage configSeq. A negative seq would
+     * make an older .bak (positive seq) out-rank a newer live config in
+     * recovery/promotion — the exact "revert to older snapshot" the seq exists
+     * to prevent. Floor at 0 so a tampered value degrades to "legacy/unknown"
+     * (a no-op tie) rather than a monotonicity break.
+     */
+    private fun seqOf(config: JSONObject?): Long =
+        (config?.optLong(SEQ_KEY, 0L) ?: 0L).coerceAtLeast(0L)
+
+    /**
+     * Compute the next [SEQ_KEY] value: strictly greater than BOTH the value in
+     * the object being written AND the value currently on disk, so a write built
+     * from a stale in-memory snapshot can never regress the sequence (which would
+     * let a later load/recover wrongly prefer the older copy). Read under the
+     * caller's lock (saveConfig runs inside updateSection's withConfigFileLock,
+     * and ConfigBackupService's runUnderConfigLock).
+     *
+     * SATURATING add: if a foreign-injected seq is at Long.MAX_VALUE, `+1` would
+     * wrap to Long.MIN_VALUE (negative) and break ordering. Saturate at MAX_VALUE
+     * instead — the sequence then stops advancing (a benign monotonic plateau)
+     * rather than wrapping negative. seqOf already floors inputs at 0.
+     */
+    private fun nextConfigSeq(config: JSONObject): Long {
+        val inMem = seqOf(config)
+        val onDisk = try {
+            val cf = File(CONFIG_PATH)
+            if (cf.exists() && cf.length() > 0L) seqOf(JSONObject(cf.readText())) else 0L
+        } catch (_: Exception) { 0L }
+        val base = maxOf(inMem, onDisk)
+        return if (base >= Long.MAX_VALUE - 1L) Long.MAX_VALUE else base + 1L
+    }
+
+    /**
+     * Mirror the good config to an APP-PRIVATE .bak the app process can ALWAYS
+     * refresh atomically (its own data dir, where it can create a sibling and
+     * rename — unlike sticky /data/local/tmp). This is the copy that stays
+     * CURRENT across a daemon-down OTA window; recoverFromBackup picks the
+     * higher-seq source between this and the sticky .bak.
+     *
+     * Daemon-skip: the daemon (UID 2000) cannot write into the app's 0700 dir
+     * and doesn't need to — it keeps the sticky .bak current. App-UID only.
+     * Best-effort; a failure never fails the save.
+     */
+    private fun writeAppPrivateBackup(config: JSONObject) {
+        if (android.os.Process.myUid() == SHELL_DAEMON_UID) return
+        try {
+            val dir = File(APP_PRIVATE_DIR)
+            if (!dir.exists()) dir.mkdirs()
+            val bak = File(APP_PRIVATE_BAK_PATH)
+            val tmp = File(APP_PRIVATE_BAK_PATH + ".tmp")
+            FileWriter(tmp).use { it.write(config.toString(2)) }
+            if (!tmp.renameTo(bak)) {
+                // App-private dir: rename should succeed (same fs, app-owned).
+                // If it somehow fails, drop the tmp rather than truncate the bak.
+                try { tmp.delete() } catch (_: Exception) {}
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "App-private backup skipped: ${e.message}")
+        }
+    }
+
+    /**
+     * Read the app-private .bak if present and parseable, else null. Used as a
+     * second recovery source (typically NEWER than the sticky .bak across a
+     * daemon-down session). App-UID only — the daemon can't read the 0700 dir.
+     */
+    private fun readAppPrivateBackup(): JSONObject? {
+        if (android.os.Process.myUid() == SHELL_DAEMON_UID) return null
+        return try {
+            val bak = File(APP_PRIVATE_BAK_PATH)
+            if (!bak.exists() || bak.length() == 0L) null
+            else JSONObject(bak.readText())
+        } catch (_: Exception) { null }
     }
     
     private fun saveConfigInternal(config: JSONObject): Boolean {
@@ -1106,6 +1450,34 @@ object UnifiedConfigManager {
     fun setRectifyStrength(strength: Int): Boolean {
         return updateValues("recording", mapOf(
             "rectifyStrength" to strength.coerceIn(0, 100)
+        ))
+    }
+
+    /**
+     * Shared clip segment length in minutes for BOTH the ACC-on dashcam and
+     * ACC-off / OEM surveillance flows. The UI exposes the control in each
+     * section but both read/write this single key, so changing it in one
+     * place applies to the other automatically (mirrors rectifyStrength).
+     *
+     * Clamped to [MIN_SEGMENT_DURATION_MINUTES..MAX_SEGMENT_DURATION_MINUTES]
+     * on read so a corrupt config value can never disable segment rotation.
+     */
+    @JvmStatic
+    fun getSegmentDurationMinutes(): Int {
+        val raw = getRecording().optInt("segmentDurationMinutes",
+            com.overdrive.app.util.Constants.SEGMENT_DURATION_MINUTES)
+        return raw.coerceIn(
+            com.overdrive.app.util.Constants.MIN_SEGMENT_DURATION_MINUTES,
+            com.overdrive.app.util.Constants.MAX_SEGMENT_DURATION_MINUTES)
+    }
+
+    /** Set the shared clip segment length in minutes (clamped to MIN..MAX). */
+    @JvmStatic
+    fun setSegmentDurationMinutes(minutes: Int): Boolean {
+        return updateValues("recording", mapOf(
+            "segmentDurationMinutes" to minutes.coerceIn(
+                com.overdrive.app.util.Constants.MIN_SEGMENT_DURATION_MINUTES,
+                com.overdrive.app.util.Constants.MAX_SEGMENT_DURATION_MINUTES)
         ))
     }
     
@@ -1745,15 +2117,44 @@ object UnifiedConfigManager {
             writer.println(req.toString())
             val line = reader.readLine()
                 ?: run {
-                    Log.w(TAG, "IPC $command got no response; falling back to local write")
-                    return null
+                    // We SENT the request (connect + write succeeded) but the
+                    // daemon died / the socket dropped before we read the ack.
+                    // The daemon may well have APPLIED the write atomically. Do
+                    // NOT blindly fall through to a redundant local non-atomic
+                    // re-write (that re-truncates the file to write bytes that
+                    // are likely already durable — reopening the tear window for
+                    // a write that already succeeded). Instead re-read from disk
+                    // and check whether our delta already landed; if so, report
+                    // success and skip the local write. Only fall back (null)
+                    // when the delta is genuinely absent.
+                    return if (deltaPresentOnDisk(section, payload)) {
+                        Log.w(TAG, "IPC $command got no ack but delta is on disk; treating as applied")
+                        // Same as the ok-branch: the daemon applied it, so keep
+                        // the app-private .bak current with the on-disk bytes.
+                        writeAppPrivateBackup(forceReload())
+                        true
+                    } else {
+                        Log.w(TAG, "IPC $command got no response and delta absent; falling back to local write")
+                        null
+                    }
                 }
             val ok = JSONObject(line).optBoolean("success", false)
             if (ok) {
                 // The daemon rewrote the file atomically in its own process.
                 // Drop our stale cache so the next read re-parses its bytes
                 // (honors the cross-UID forceReload-before-read invariant).
-                forceReload()
+                val fresh = forceReload()
+                // Keep the APP-PRIVATE .bak current with this daemon-applied
+                // write. CRITICAL: this is the COMMON path (daemon up), and it
+                // used to leave the app-private copy frozen at the last
+                // daemon-DOWN write / migration seed — so the "double-source"
+                // recovery was single-source in practice. Refresh it from the
+                // bytes the daemon just wrote (which carry the daemon-bumped
+                // configSeq) so the app-private .bak tracks live+sticky and can
+                // genuinely back-stop a torn/stale sticky .bak during an OTA.
+                // writeAppPrivateBackup is app-UID-only (daemon-skip) and atomic
+                // in the app's own dir; best-effort, never fails the write.
+                writeAppPrivateBackup(fresh)
             } else {
                 Log.w(TAG, "IPC $command for '$section' returned success=false")
             }
@@ -1767,6 +2168,35 @@ object UnifiedConfigManager {
             null
         } finally {
             try { socket?.close() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Best-effort check: are ALL keys of [payload] already present with the
+     * expected values inside [section] of the on-disk config? Used by
+     * [routeWriteIfApp] when the daemon ack was lost — if the daemon already
+     * applied the write atomically we can skip the redundant (truncation-prone)
+     * local re-write. Reads fresh from disk (the daemon write, if any, just
+     * landed). Conservative: any mismatch / read failure returns false so the
+     * caller falls back to the local write rather than dropping a real change.
+     */
+    private fun deltaPresentOnDisk(section: String, payload: JSONObject): Boolean {
+        return try {
+            val cf = File(CONFIG_PATH)
+            if (!cf.exists() || cf.length() == 0L) return false
+            val onDisk = JSONObject(cf.readText())
+            val sec = onDisk.optJSONObject(section) ?: return false
+            val keys = payload.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                if (!sec.has(k)) return false
+                // Compare by string form — JSONObject lacks deep value equals,
+                // and the wire payload round-trips through JSON anyway.
+                if (sec.get(k).toString() != payload.get(k).toString()) return false
+            }
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -1925,7 +2355,7 @@ object UnifiedConfigManager {
     fun forceReload(): JSONObject {
         synchronized(this) {
             cachedConfig = null
-            lastModified.set(0)
+            stampFreshness(0)
             return loadConfig()
         }
     }
@@ -1939,6 +2369,31 @@ object UnifiedConfigManager {
     // held across the whole critical section makes those writers mutually
     // exclude. World-RW so any daemon UID can acquire it.
     private const val LOCK_PATH = "$CONFIG_PATH.lock"
+
+    /**
+     * Choose the file to take the OS advisory lock on. Preference order:
+     *  1. The dedicated .lock file when it EXISTS — it has a STABLE inode (never
+     *     renamed), so every process locking it mutually excludes. This is the
+     *     normal path once any daemon has run init()/provisionLockFile.
+     *  2. Daemon UID with .lock absent → still target .lock (RandomAccessFile
+     *     creates it; the daemon owns the sticky dir).
+     *  3. App UID with .lock absent (can't create siblings in sticky dir) →
+     *     fall back to locking the EXISTING world-RW config file. This yields a
+     *     REAL cross-process lock instead of the old silent monitor-only
+     *     degradation. CONFIG_PATH's inode CAN be swapped by a daemon's atomic
+     *     rename, which would break exclusion — but a missing .lock implies no
+     *     daemon has initialized (it provisions .lock first), so there is no
+     *     concurrent daemon rename to race in this window. If even CONFIG_PATH
+     *     is absent, return .lock so RandomAccessFile throws and we degrade to
+     *     monitor-only exactly as before (no regression).
+     */
+    private fun lockTargetFor(): File {
+        val lockFile = File(LOCK_PATH)
+        if (lockFile.exists()) return lockFile
+        if (android.os.Process.myUid() == SHELL_DAEMON_UID) return lockFile
+        val cf = File(CONFIG_PATH)
+        return if (cf.exists()) cf else lockFile
+    }
 
     /**
      * Run [body] while holding BOTH the in-JVM monitor AND an exclusive OS
@@ -1968,7 +2423,20 @@ object UnifiedConfigManager {
             var channel: FileChannel? = null
             var lock: FileLock? = null
             try {
-                val lf = File(LOCK_PATH)
+                // Prefer the dedicated .lock file. But during the daemon-down
+                // OTA window the app UID can't CREATE it in sticky
+                // /data/local/tmp (and the killed daemon may not have
+                // re-provisioned it yet), so RandomAccessFile(lf,"rw") on a
+                // missing .lock throws → we'd silently degrade to monitor-only
+                // (no cross-process exclusion) exactly when a respawning daemon
+                // might also be writing → lost update / tear. Fall back to
+                // locking the EXISTING world-RW config file itself: the app can
+                // always OPEN it (0666) even though it can't create siblings, so
+                // it gets a REAL cross-process lock against the daemon (whose
+                // writes acquire the .lock — see note below) without needing to
+                // create anything. Both writers must agree on the lock target
+                // for exclusion to hold; see lockTargetFor().
+                val lf = lockTargetFor()
                 raf = RandomAccessFile(lf, "rw")
                 channel = raf.channel
                 // Blocking exclusive lock — contention is rare (a few daemons,
@@ -2026,7 +2494,7 @@ object UnifiedConfigManager {
                 applyDefaults(fresh)            // idempotent; folds legacy geocoding keys
                 if (saveConfigInternal(fresh)) {
                     cachedConfig = fresh
-                    lastModified.set(cf.lastModified())
+                    stampFreshness(cf.lastModified())
                     Log.i(TAG, "Migrated legacy geocoding schema to nested form (locked re-read)")
                 }
             } catch (e: Exception) {
@@ -2044,7 +2512,7 @@ object UnifiedConfigManager {
      */
     private fun loadConfigFresh(): JSONObject {
         cachedConfig = null
-        lastModified.set(0)
+        stampFreshness(0)
         return loadConfig()
     }
     

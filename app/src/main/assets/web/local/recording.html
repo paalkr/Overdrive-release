@@ -6,7 +6,7 @@
     <title data-i18n="app.recordings_title">Recordings - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js"></script>
+    <script src="../shared/app-shell.js?v=2"></script>
     <!--
       Bottom-tab manifest. 5 tabs grouping the settings cards:
         Status      — live recording status pill
@@ -30,7 +30,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=16">
+    <link rel="stylesheet" href="../shared/styles.css?v=17">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/jmuxer@2.0.4/dist/jmuxer.min.js"></script>
@@ -525,19 +525,29 @@
                                 </div>
                             </div>
                         </div>
+                        <!-- Clip Duration — shared key (recording.segmentDurationMinutes)
+                             read by BOTH the ACC-on dashcam and ACC-off / OEM
+                             surveillance axes, so this one control governs both. -->
                         <div class="setting-row">
                             <div class="setting-info">
                                 <div class="setting-name">
                                     <span data-i18n="recording.clip_duration">Clip Duration</span>
+                                    <span class="setting-badge" data-i18n="recording.applies_next_rotation">Next clip</span>
                                 </div>
-                                <div class="setting-desc" data-i18n="recording.clip_duration_desc">Length of each recorded video segment. Applies on next segment rotation.</div>
+                                <div class="setting-desc" data-i18n="recording.clip_duration_desc">Length of each recorded video segment. Applies to both driving (ACC on) and parked surveillance (ACC off) recordings, on the next segment rotation.</div>
                             </div>
                             <div class="setting-control">
                                 <div class="btn-group" id="clipDurationBtns">
-                                    <button class="btn-toggle active" data-value="2" onclick="RecSettings.setClipDuration(2)">2 min</button>
-                                    <button class="btn-toggle" data-value="5" onclick="RecSettings.setClipDuration(5)">5 min</button>
-                                    <button class="btn-toggle" data-value="10" onclick="RecSettings.setClipDuration(10)">10 min</button>
+                                    <button class="btn-toggle active" data-value="2" onclick="RecSettings.setClipDuration(2)" data-i18n="recording.clip_2min">2 min</button>
+                                    <button class="btn-toggle" data-value="5" onclick="RecSettings.setClipDuration(5)" data-i18n="recording.clip_5min">5 min</button>
+                                    <button class="btn-toggle" data-value="10" onclick="RecSettings.setClipDuration(10)" data-i18n="recording.clip_10min">10 min</button>
                                 </div>
+                            </div>
+                        </div>
+                        <div class="info-box-note">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                            <div class="info-note" data-i18n="recording.clip_duration_warning">
+                                Longer clips mean fewer, larger files — but an in-progress clip is only finalized when it rotates. On sudden power loss (e.g. battery cut on impact) the current clip can be lost, so a 10-minute setting risks up to 10 minutes of unsaved footage vs 2. Keep 2 min if your vehicle can lose power abruptly.
                             </div>
                         </div>
                         <div class="info-box">
@@ -857,7 +867,7 @@
     <script src="../shared/auth.js"></script>
     <script src="../shared/core.js"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/recording.js?v=index1"></script>
+    <script src="../shared/recording.js?v=storageslider1"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

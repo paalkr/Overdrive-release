@@ -48,6 +48,14 @@ public class GpsMonitor {
     // seconds old through turns on this HAL, so consumers that need wall-clock
     // truth per position (video sync, trip alignment) read this instead.
     private volatile long fixTime = 0;
+    // MONOTONIC since-boot fix timestamp (SystemClock.elapsedRealtime ms from the
+    // sidecar) — distinct from lastUpdate (send/receive-time, refreshed by the 4s
+    // keep-alive even when the fix is unchanged). Geo-tagging ages this against the
+    // daemon's OWN elapsedRealtime() so a stale re-sent fix reads stale, without
+    // crossing the device-RTC clock domain (wrong at cold boot). 0 = no monotonic
+    // basis (older sidecar, or cache-loaded after a reboot where it's incomparable);
+    // the gate then falls back to send-time aging.
+    private volatile long fixElapsedMs = 0;
     private volatile boolean isRunning = false;
     private volatile boolean loadedFromCache = false;
     private volatile long lastLoggedAt = 0;
@@ -88,10 +96,19 @@ public class GpsMonitor {
      * Called by SurveillanceIpcServer when GPS update arrives via IPC.
      */
     public void updateFromIpc(double lat, double lng, float speed, float heading, float accuracy, long time, double altitude) {
-        updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, time);
+        // Back-compat overload: wall-clock fix time defaults to the send time, and
+        // no monotonic fix time (0 sentinel → the geo gate falls back to send-time
+        // aging, prior behavior). New callers use the full form.
+        updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, time, 0L);
     }
 
-    public void updateFromIpc(double lat, double lng, float speed, float heading, float accuracy, long time, double altitude, long fixTime) {
+    /**
+     * Full form. Carries BOTH fix timestamps — they serve different consumers:
+     * fixTime (epoch ms, Location.getTime()) feeds gps_utc / per-point retiming;
+     * fixElapsedMs (elapsedRealtime ms) feeds the geo-tag staleness gate, immune
+     * to wall-clock jumps.
+     */
+    public void updateFromIpc(double lat, double lng, float speed, float heading, float accuracy, long time, double altitude, long fixTime, long fixElapsedMs) {
         // Reject invalid coordinates (0,0 is in the ocean, not a real location)
         if (lat == 0.0 && lng == 0.0) {
             return;
@@ -105,6 +122,7 @@ public class GpsMonitor {
         this.altitude = altitude;
         this.lastUpdate = time;
         this.fixTime = fixTime > 0 ? fixTime : time;
+        this.fixElapsedMs = fixElapsedMs;
         this.loadedFromCache = false; // We have live data now
 
         // Persist to cache file
@@ -142,6 +160,10 @@ public class GpsMonitor {
             json.put("accuracy", accuracy);
             json.put("altitude", altitude);
             json.put("time", lastUpdate);
+            // Deliberately NOT persisting fixElapsedMs: elapsedRealtime resets at
+            // reboot, so a value from a prior boot is meaningless to compare. A
+            // cache-loaded fix is loadedFromCache=true and the geo gate rejects it
+            // regardless, so it never needs a monotonic age.
 
             String content = json.toString();
             
@@ -230,6 +252,10 @@ public class GpsMonitor {
                 this.accuracy = (float) json.optDouble("accuracy", 0.0);
                 this.altitude = json.optDouble("altitude", 0.0);
                 this.lastUpdate = json.optLong("time", 0);
+                // No monotonic basis for a cache-loaded fix (elapsedRealtime is
+                // cross-boot-incomparable); leave 0. The fix is loadedFromCache=true
+                // so the geo gate rejects it without needing an age anyway.
+                this.fixElapsedMs = 0L;
                 return true;
             }
             return false;
@@ -255,6 +281,10 @@ public class GpsMonitor {
     public long getLastUpdate() { return lastUpdate; }
     /** The current fix's own timestamp (Location.getTime(), epoch ms); 0 if unknown. */
     public long getFixTime() { return fixTime; }
+    /** Monotonic since-boot fix timestamp (elapsedRealtime ms) — what geo-tagging
+     *  ages against the daemon's own elapsedRealtime(). 0 = no monotonic basis
+     *  (older sidecar / cache-loaded); callers then fall back to send-time aging. */
+    public long getFixElapsedMs() { return fixElapsedMs; }
     public String getProvider() { return "sidecar"; }
     public boolean isMoving() { return speed > 1.0f; }
 

@@ -3,6 +3,7 @@ package com.overdrive.app.server;
 import com.overdrive.app.notifications.CategoryRegistry;
 import com.overdrive.app.notifications.NotificationBus;
 import com.overdrive.app.notifications.NotificationEvent;
+import com.overdrive.app.notifications.NotificationStore;
 import com.overdrive.app.notifications.push.PushSubscription;
 import com.overdrive.app.notifications.push.SubscriptionStore;
 import com.overdrive.app.notifications.push.VapidKeyStore;
@@ -11,6 +12,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.OutputStream;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * HTTP routes for the Web Push subsystem.
@@ -23,6 +26,10 @@ import java.io.OutputStream;
  *   <li>GET  /api/push/subscriptions       — list registered devices for settings UI</li>
  *   <li>POST /api/push/preferences         — update muted categories / quiet hours</li>
  *   <li>POST /api/push/test                — fire a test notification to the requester</li>
+ *   <li>GET    /api/notifications/log         — paginated notification history (date/category/severity filters)</li>
+ *   <li>DELETE /api/notifications/log/{id}    — delete one logged notification (POST .../delete fallback)</li>
+ *   <li>POST   /api/notifications/log/bulk-delete — delete many by id array</li>
+ *   <li>DELETE /api/notifications/log         — clear the whole log (POST .../clear fallback)</li>
  * </ul>
  *
  * <p>All routes require auth (handled by the caller before dispatch).
@@ -32,17 +39,55 @@ public final class NotificationApiHandler {
     private static volatile CategoryRegistry registry;
     private static volatile SubscriptionStore subStore;
     private static volatile VapidKeyStore keyStore;
+    private static volatile NotificationStore logStore;
+
+    /** Max ids accepted in one bulk-delete request. */
+    private static final int MAX_BULK_IDS = 1000;
 
     /** Wire the dependencies once at daemon startup. */
     public static void init(CategoryRegistry r, SubscriptionStore s, VapidKeyStore k) {
         registry = r;
         subStore = s;
         keyStore = k;
+        logStore = NotificationStore.getInstance();
     }
 
     public static boolean handle(String method, String path, String body, OutputStream out) throws Exception {
         if (registry == null || subStore == null || keyStore == null) {
             HttpResponse.sendError(out, 503, "Notifications not initialized");
+            return true;
+        }
+
+        // Notification-log routes. These carry a query string (list filters) or a
+        // trailing id, so match on the query-stripped path and handle them before
+        // the exact-equals push routes below.
+        String logPath = path.contains("?") ? path.substring(0, path.indexOf('?')) : path;
+        if (logPath.equals("/api/notifications/log")) {
+            if (method.equals("GET")) return listLog(path, out);
+            if (method.equals("DELETE")) return clearLog(path, out);
+            HttpResponse.sendError(out, 405, "method not allowed");
+            return true;
+        }
+        if (logPath.equals("/api/notifications/log/clear")) {
+            if (method.equals("POST")) return clearLog(path, out);
+            HttpResponse.sendError(out, 405, "method not allowed");
+            return true;
+        }
+        if (logPath.equals("/api/notifications/log/bulk-delete")) {
+            if (method.equals("POST")) return bulkDeleteLog(body, out);
+            HttpResponse.sendError(out, 405, "method not allowed");
+            return true;
+        }
+        if (logPath.startsWith("/api/notifications/log/")) {
+            String rest = logPath.substring("/api/notifications/log/".length());
+            // POST /api/notifications/log/{id}/delete — DELETE fallback for the WebView.
+            if (rest.endsWith("/delete") && method.equals("POST")) {
+                return deleteLog(rest.substring(0, rest.length() - "/delete".length()), out);
+            }
+            if (method.equals("DELETE")) {
+                return deleteLog(rest, out);
+            }
+            HttpResponse.sendError(out, 405, "method not allowed");
             return true;
         }
 
@@ -74,6 +119,150 @@ public final class NotificationApiHandler {
         root.put("vapidPublicKey", keyStore.publicKeyB64Url());
         HttpResponse.sendJson(out, root.toString());
         return true;
+    }
+
+    // ==================== NOTIFICATION LOG ====================
+
+    /**
+     * GET /api/notifications/log — newest-first, paginated, optional filters:
+     *   from/to (epoch-ms), days (fallback window), group (category prefix,
+     *   e.g. "vehicle.charging"), severity (info/warn/critical),
+     *   page (1-based) / pageSize.
+     */
+    private static boolean listLog(String path, OutputStream out) throws Exception {
+        if (logStore == null) { HttpResponse.sendError(out, 503, "log unavailable"); return true; }
+        Map<String, String> q = parseQuery(path);
+
+        long now = System.currentTimeMillis();
+        long fromMs, toMs;
+        if (q.containsKey("from")) {
+            fromMs = Math.max(0L, parseLong(q.get("from"), 0));
+            toMs = q.containsKey("to") ? parseLong(q.get("to"), Long.MAX_VALUE) : Long.MAX_VALUE;
+        } else {
+            // Clamp days to [0, 36525] (~100y) so a garbage value can't wrap the
+            // (int) cast negative (→ future fromMs → empty log) or underflow.
+            long daysRaw = parseLong(q.get("days"), 0);
+            long days = Math.max(0L, Math.min(daysRaw, 36525L));   // 0 = all time
+            fromMs = days > 0 ? now - (days * 24L * 60 * 60 * 1000L) : 0;
+            toMs = Long.MAX_VALUE;
+        }
+
+        String group = emptyToNull(q.get("group"));
+        String severity = emptyToNull(q.get("severity"));
+
+        int pageSize = (int) parseLong(q.get("pageSize"), 20);
+        pageSize = Math.max(1, Math.min(pageSize, 200));
+        int page = (int) parseLong(q.get("page"), 1);
+        page = Math.max(1, page);
+        int offset = (page - 1) * pageSize;
+
+        // Atomic page+count in one lock acquisition so totalPages can't disagree
+        // with the returned rows under a concurrent insert/prune.
+        NotificationStore.Page pg = logStore.listWithCount(fromMs, toMs, group, severity, pageSize, offset);
+        JSONArray items = pg.items;
+        long total = pg.total;
+
+        JSONObject resp = new JSONObject();
+        resp.put("success", true);
+        resp.put("notifications", items);
+        resp.put("total", total);
+        resp.put("page", page);
+        resp.put("pageSize", pageSize);
+        resp.put("totalPages", (int) Math.ceil(total / (double) pageSize));
+        // Ship the category registry so the client can label/color/group rows
+        // without a second request (registry is small and already in memory).
+        try { resp.put("categories", new JSONObject(registry.rawJson()).optJSONArray("categories")); }
+        catch (Exception ignored) {}
+        HttpResponse.sendJson(out, resp.toString());
+        return true;
+    }
+
+    private static boolean deleteLog(String idStr, OutputStream out) throws Exception {
+        if (logStore == null) { HttpResponse.sendError(out, 503, "log unavailable"); return true; }
+        long id;
+        try { id = Long.parseLong(idStr.trim()); }
+        catch (Exception e) { HttpResponse.sendError(out, 400, "invalid id"); return true; }
+        boolean ok = logStore.deleteById(id);
+        JSONObject resp = new JSONObject();
+        resp.put("success", ok);
+        HttpResponse.sendJson(out, resp.toString());
+        return true;
+    }
+
+    private static boolean bulkDeleteLog(String body, OutputStream out) throws Exception {
+        if (logStore == null) { HttpResponse.sendError(out, 503, "log unavailable"); return true; }
+        if (body == null || body.isEmpty()) { HttpResponse.sendError(out, 400, "missing body"); return true; }
+        try {
+            JSONObject j = new JSONObject(body);
+            JSONArray arr = j.getJSONArray("ids");
+            // Hard cap so a hostile/oversized body can't drive a giant delete.
+            if (arr.length() > MAX_BULK_IDS) {
+                HttpResponse.sendError(out, 400, "too many ids (max " + MAX_BULK_IDS + ")");
+                return true;
+            }
+            // Robust per-element parse: skip non-integer elements rather than
+            // failing the whole batch (one bad id shouldn't strand the good ones).
+            java.util.ArrayList<Long> parsed = new java.util.ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                long v = arr.optLong(i, Long.MIN_VALUE);
+                if (v != Long.MIN_VALUE) parsed.add(v);
+            }
+            long[] ids = new long[parsed.size()];
+            for (int i = 0; i < ids.length; i++) ids[i] = parsed.get(i);
+            int removed = logStore.deleteBulk(ids);
+            JSONObject resp = new JSONObject();
+            resp.put("success", true);
+            resp.put("removed", removed);
+            HttpResponse.sendJson(out, resp.toString());
+        } catch (Exception e) {
+            HttpResponse.sendError(out, 400, "invalid ids: " + e.getMessage());
+        }
+        return true;
+    }
+
+    /** DELETE /api/notifications/log[?from=&to=] (or POST .../log/clear) — clear all or a window. */
+    private static boolean clearLog(String path, OutputStream out) throws Exception {
+        if (logStore == null) { HttpResponse.sendError(out, 503, "log unavailable"); return true; }
+        Map<String, String> q = parseQuery(path);
+        long fromMs = parseLong(q.get("from"), 0);
+        long toMs = q.containsKey("to") ? parseLong(q.get("to"), Long.MAX_VALUE) : Long.MAX_VALUE;
+        int removed = logStore.clear(fromMs, toMs);
+        JSONObject resp = new JSONObject();
+        resp.put("success", true);
+        resp.put("removed", removed);
+        HttpResponse.sendJson(out, resp.toString());
+        return true;
+    }
+
+    // ---- tiny query helpers (org.json only; no external deps) ----
+    private static Map<String, String> parseQuery(String path) {
+        Map<String, String> m = new HashMap<>();
+        int qi = path.indexOf('?');
+        if (qi < 0 || qi == path.length() - 1) return m;
+        String[] pairs = path.substring(qi + 1).split("&");
+        for (String pair : pairs) {
+            if (pair.isEmpty()) continue;
+            int eq = pair.indexOf('=');
+            try {
+                if (eq < 0) {
+                    m.put(java.net.URLDecoder.decode(pair, "UTF-8"), "");
+                } else {
+                    String k = java.net.URLDecoder.decode(pair.substring(0, eq), "UTF-8");
+                    String v = java.net.URLDecoder.decode(pair.substring(eq + 1), "UTF-8");
+                    m.put(k, v);
+                }
+            } catch (Exception ignored) { /* skip malformed pair */ }
+        }
+        return m;
+    }
+
+    private static long parseLong(String s, long dflt) {
+        if (s == null || s.isEmpty()) return dflt;
+        try { return Long.parseLong(s.trim()); } catch (Exception e) { return dflt; }
+    }
+
+    private static String emptyToNull(String s) {
+        return (s == null || s.isEmpty()) ? null : s;
     }
 
     private static boolean subscribe(String body, OutputStream out) throws Exception {

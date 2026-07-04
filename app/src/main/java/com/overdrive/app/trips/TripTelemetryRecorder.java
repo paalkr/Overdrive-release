@@ -38,6 +38,17 @@ public class TripTelemetryRecorder {
     private static final long FLUSH_INTERVAL_MS = 60_000;     // 60s
     private static final long MAX_BUFFER_BYTES = 10 * 1024 * 1024; // 10MB
 
+    // Distance fusion tunables.
+    // Reject a GPS fallback segment whose reported horizontal accuracy is worse
+    // than this — a 50 m-error fix can wander metres between ticks while parked.
+    private static final float GPS_ACCURACY_GATE_M = 50.0f;
+    // Floor below which a GPS fallback segment is treated as stationary jitter
+    // rather than travel (~2 m random walk at the typical fix noise level).
+    private static final double MIN_GPS_SEGMENT_KM = 0.002;
+    // Cap dt for speed integration so a scheduler stall / process resume can't
+    // turn one tick into a kilometre. Normal cadence is 200 ms.
+    private static final long MAX_INTEGRATION_DT_MS = 2_000;
+
     // Dependencies: existing singleton monitors
     private volatile TelemetryDataCollector telemetryDataCollector;
 
@@ -65,15 +76,31 @@ public class TripTelemetryRecorder {
     private long speedSumKmh = 0;
     private long speedSampleCount = 0;
     
-    // GPS distance tracking (running haversine sum).
+    // Live distance tracking (fused).
     // volatile: written only on the 5Hz sampler thread but read on the
-    // detector/finalize thread via getTotalDistanceKm() (the GPS-distance
-    // fallback). Single writer, so volatile fully resolves the cross-thread
-    // visibility — the finalize read sees the latest accumulated distance.
+    // detector/finalize thread via getTotalDistanceKm() (the live-distance
+    // fallback when the hardware odometer is unavailable). Single writer, so
+    // volatile fully resolves the cross-thread visibility — the finalize read
+    // sees the latest accumulated distance.
+    //
+    // Fusion strategy (SOTA for a vehicle with a wheel-derived speed bus):
+    //   • PRIMARY  = integrate CAN/wheel speed over dt (speedKmh × dt). This is
+    //     immune to GPS jitter while parked, multipath in urban canyons, and
+    //     signal loss in tunnels/garages — the classic failure modes of a pure
+    //     fix-to-fix haversine sum. Wheel speed reads ~0 when stopped, so idle
+    //     dwell contributes nothing instead of accreting drift.
+    //   • FALLBACK = accuracy-gated GPS haversine, used only for ticks where we
+    //     had no fresh dynamics snapshot (speed unknown). Gated on reported
+    //     horizontal accuracy and a minimum-segment floor so a noisy fix can't
+    //     manufacture phantom travel.
+    // The hardware odometer delta still overrides this entirely at finalize
+    // (TripDetector); this value is the live readout and the odometer-absent
+    // fallback.
     private volatile double totalDistanceKm = 0;
     private double lastLat = 0;
     private double lastLon = 0;
     private boolean hasLastGps = false;
+    private long lastSampleMs = 0;
 
     // GPS coverage tracking — how many samples landed valid lat/lon. Logged
     // at trip end so the daemon log alone tells us why a trip's map is blank
@@ -117,6 +144,7 @@ public class TripTelemetryRecorder {
         this.lastLat = 0;
         this.lastLon = 0;
         this.hasLastGps = false;
+        this.lastSampleMs = 0;
         this.sampleCountTotal = 0;
         this.sampleCountWithGps = 0;
 
@@ -243,7 +271,10 @@ public class TripTelemetryRecorder {
     }
 
     /**
-     * Get the total GPS distance recorded during this trip (km).
+     * Get the total live distance recorded during this trip (km).
+     * Fused: CAN/wheel-speed integration primary, accuracy-gated GPS fallback.
+     * Used as the live readout and as the finalize-time fallback when the
+     * hardware odometer delta is unavailable.
      */
     public double getTotalDistanceKm() {
         return totalDistanceKm;
@@ -312,6 +343,7 @@ public class TripTelemetryRecorder {
             double lon = gps.getLongitude();
             double altitude = gps.getAltitude();
             long gpsFixTime = gps.getFixTime();
+            float gpsAccuracy = gps.getAccuracy();
 
             // Read gear from GearMonitor
             int gearMode = GearMonitor.getInstance().getCurrentGear();
@@ -320,21 +352,49 @@ public class TripTelemetryRecorder {
                     now, speedKmh, accelPedal, brakePedal,
                     brakePedalPressed, gearMode, lat, lon, altitude, gpsFixTime);
 
-            // Track GPS distance (haversine) and coverage stats.
+            // ── Distance fusion (CAN-speed primary, accuracy-gated GPS fallback) ──
+            // dt since the previous sample, clamped so a scheduler stall or a
+            // process resume can't integrate one tick into a huge jump.
+            long dtMs = lastSampleMs > 0 ? (now - lastSampleMs) : 0;
+            if (dtMs < 0) dtMs = 0;
+            if (dtMs > MAX_INTEGRATION_DT_MS) dtMs = MAX_INTEGRATION_DT_MS;
+
             sampleCountTotal++;
-            if (lat != 0 && lon != 0) {
-                sampleCountWithGps++;
-                if (hasLastGps && lastLat != 0 && lastLon != 0) {
-                    double dist = haversineKm(lastLat, lastLon, lat, lon);
-                    // Filter out GPS jumps (>500m in 200ms is impossible at any speed)
-                    if (dist < 0.5) {
-                        totalDistanceKm += dist;
-                    }
+            boolean haveGps = lat != 0 && lon != 0;
+            if (haveGps) sampleCountWithGps++;
+
+            if (!dynamicsStale && dtMs > 0) {
+                // PRIMARY: integrate wheel/CAN speed. Reads ~0 km/h when stopped,
+                // so idle dwell adds nothing and GPS jitter is irrelevant. Robust
+                // through tunnels/garages where GPS drops out entirely.
+                //   km = (km/h) × (hours)
+                totalDistanceKm += speedKmh * (dtMs / 3_600_000.0);
+            } else if (haveGps && hasLastGps && lastLat != 0 && lastLon != 0) {
+                // FALLBACK: no fresh dynamics this tick (speed unknown). Use GPS
+                // haversine, but only when the fix is trustworthy and the segment
+                // is above the stationary-jitter floor.
+                // Require a positive, trustworthy accuracy. A live fix always
+                // carries a real horizontal accuracy (the sidecar populates it,
+                // same field RoadSense gates on); accuracy <= 0 means "unreported"
+                // — typically a cache-loaded fix with no live update yet — and is
+                // rejected rather than trusted as a perfect 0 m fix.
+                boolean accuracyOk = gpsAccuracy > 0 && gpsAccuracy <= GPS_ACCURACY_GATE_M;
+                double dist = haversineKm(lastLat, lastLon, lat, lon);
+                // Reject impossible jumps (>500m/tick) and sub-jitter wiggle.
+                if (accuracyOk && dist >= MIN_GPS_SEGMENT_KM && dist < 0.5) {
+                    totalDistanceKm += dist;
                 }
+            }
+
+            // Always advance the GPS anchor on a valid fix so the next fallback
+            // segment measures from here, even on ticks where CAN speed drove the
+            // accumulation (keeps the fallback honest if dynamics later go stale).
+            if (haveGps) {
                 lastLat = lat;
                 lastLon = lon;
                 hasLastGps = true;
             }
+            lastSampleMs = now;
 
             // Track stats — only from real readings; synthetic stale zeros would
             // drag the average down and never affect max anyway.

@@ -37,9 +37,9 @@ public class MqttConnectionConfig {
 
     // Full-resync options. Both re-publish EVERY discoverable key, not just changed ones,
     // so state lost to a connection drop (e.g. a gear→P transition dropped at a WiFi↔cellular
-    // handoff) gets corrected. Mirror Metro/Electro state-based send profiles.
-    // NOTE: in HA mode each key is its own retained topic, so a full sync is ~N messages
-    // (≈130 here). At 1s that is ~130 msg/s — heavy; prefer a larger interval.
+    // handoff) gets corrected — a state-based send profile (full snapshot at transitions).
+    // NOTE: in HA mode each key is its own retained topic, so a full sync is one message per
+    // discoverable key. At a 1s interval that is heavy; prefer a larger interval.
     public boolean heartbeatSendAll;     // Heartbeat always full-syncs on its own fixed cadence
                                          // (maxIntervalSeconds), independent of intervening
                                          // change-only publishes (no starvation).

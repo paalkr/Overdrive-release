@@ -213,6 +213,21 @@ class RecordingsFragment : Fragment() {
             placeContainsQuery = state.getString(KEY_PLACE_CONTAINS, "") ?: ""
         }
 
+        // Deep-link fallback: WebViewFragment routes an events-link it can't
+        // resolve to a specific clip here, passing the clip's `filter` type so
+        // we at least land on the right segment. Only honored on fresh creation
+        // (no saved state) so a rotation can't override the user's later choice.
+        if (savedInstanceState == null) {
+            when (arguments?.getString("filter")) {
+                // Sentry clips live in the Surveillance segment; proximity clips
+                // are recorded by the dashcam encoder and live in the DASHCAM
+                // segment (the Surveillance segment filters to RecordingType.SENTRY
+                // only, so proximity would land on an empty list there).
+                "sentry" -> currentSource = Source.SURVEILLANCE
+                "proximity", "normal" -> currentSource = Source.DASHCAM
+            }
+        }
+
         metricsExecutor = Executors.newSingleThreadExecutor { r ->
             Thread(r, "RecordingsMetrics").apply { isDaemon = true }
         }

@@ -240,7 +240,7 @@ public final class GeocodingResolver {
         Callable<PlaceResult> task = () -> {
             PlaceResult result = null;
             try {
-                result = doResolve(lat, lng, locale, flowFinal);
+                result = doResolve(lat, lng, locale, flowFinal, null);
             } catch (Throwable t) {
                 logger.warn("doResolve threw: " + t.getMessage());
             } finally {
@@ -298,7 +298,21 @@ public final class GeocodingResolver {
 
     public PlaceResult resolveBlocking(double lat, double lng, String flow) {
         if (!isFlowEnabled(flow)) return null;
-        return doResolve(lat, lng, LocaleManager.get(), flow);
+        return doResolve(lat, lng, LocaleManager.get(), flow, null);
+    }
+
+    /**
+     * Variant that reports whether the ONLINE (Nominatim) tier actually ran. The
+     * backfill sweep uses this to distinguish a GENUINE empty-address miss (our
+     * own token was consumed and Nominatim returned no address → mark unresolved)
+     * from a null where the online tier never executed (token raced away by a
+     * concurrent live resolve, active cooldown, offline mode → retry next tick, do
+     * NOT pin). {@code reachedNominatim[0]} is set true iff our call acquired the
+     * rate-limiter token and issued the HTTP request.
+     */
+    public PlaceResult resolveBlocking(double lat, double lng, String flow, boolean[] reachedNominatim) {
+        if (!isFlowEnabled(flow)) return null;
+        return doResolve(lat, lng, LocaleManager.get(), flow, reachedNominatim);
     }
 
     public interface ResolveCallback {
@@ -307,7 +321,7 @@ public final class GeocodingResolver {
 
     // ---- Tier orchestration ----------------------------------------------
 
-    private PlaceResult doResolve(double lat, double lng, String locale, String flow) {
+    private PlaceResult doResolve(double lat, double lng, String locale, String flow, boolean[] reachedNominatim) {
         // 1. SafeLocation overlay (synchronous, in-memory).
         PlaceResult sz = resolveSafeZone(lat, lng);
         if (sz != null) {
@@ -331,7 +345,7 @@ public final class GeocodingResolver {
 
         // 4. Nominatim (online, gated).
         if (isOnlineAllowed(flow)) {
-            PlaceResult n = resolveNominatim(lat, lng, locale);
+            PlaceResult n = resolveNominatim(lat, lng, locale, reachedNominatim);
             if (n != null) {
                 GeoCache.getInstance().put(lat, lng, n);
                 return n;
@@ -418,12 +432,15 @@ public final class GeocodingResolver {
 
     // ---- Tier C: Nominatim ------------------------------------------------
 
-    private PlaceResult resolveNominatim(double lat, double lng, String locale) {
+    private PlaceResult resolveNominatim(double lat, double lng, String locale, boolean[] reachedNominatim) {
         if (!NominatimRateLimiter.tryAcquire()) {
             // Either still in cooldown or another caller just used the token;
             // we'd rather skip than queue and risk piling up requests.
             return null;
         }
+        // Our call won the token and is about to issue the HTTP request — so a
+        // subsequent null IS a genuine reach-but-empty result, not a throttle.
+        if (reachedNominatim != null) reachedNominatim[0] = true;
         HttpURLConnection conn = null;
         try {
             String base = nominatimBaseUrl();

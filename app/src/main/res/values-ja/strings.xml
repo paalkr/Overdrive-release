@@ -1198,6 +1198,7 @@
     <string name="roadsense_map_search_action">検索</string>
     <string name="roadsense_map_searching">Searching…</string>
     <string name="roadsense_map_no_results">場所が見つかりません</string>
+    <string name="roadsense_map_search_network">検索サービスに接続できませんでした。ネットワーク接続またはプロキシを確認して、もう一度お試しください。</string>
     <string name="roadsense_map_pick_destination">目的地を選択</string>
     <string name="roadsense_map_routing">Finding route…</string>
     <string name="roadsense_map_route_failed">ルートが見つかりませんでした。もう一度やり直してください。</string>

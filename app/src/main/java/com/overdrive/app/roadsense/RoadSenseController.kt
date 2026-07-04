@@ -911,34 +911,58 @@ class RoadSenseController @JvmOverloads constructor(
 
         val cfg = RoadSenseConfig.snapshot(forceReload = false)
 
-        val pose = locationSource.latest(now)
-        if (pose == null) {
+        val rawPose = locationSource.latest(now)
+        if (rawPose == null) {
             // No fix: still heartbeat idle so the app overlay knows we're alive.
             visualSink.publishIdle()
             return
         }
+        // DISPLAY pose: forward-extrapolate the ~1–2 Hz fix to `now` so the hazard
+        // distance counts down smoothly between fixes (the map puck already glides
+        // via VehicleMotionEstimator; the raw fix is step-held flat, so an un-
+        // extrapolated range freezes then jumps — read as "the distance lags").
+        // Stateless + guarded (moving + good fix + capped horizon); outside the
+        // guard band it returns the raw pose unchanged. Detection localization and
+        // the GpsRingBuffer feed below deliberately keep the RAW fix.
+        //
+        // CRITICAL — display-only: the extrapolated pose is a constant-velocity dead-
+        // reckon that knows nothing about hazards, so it must NOT drive the AHEAD/CLEAR
+        // (selection / forward-cone / road-match) decision. While braking on approach
+        // the true position lags the dead-reckon, and an over-advanced pose can flip a
+        // not-yet-passed lead behind the cone — dropping the card a tick early and
+        // skipping the next cluster member. So ALL geometry/gating below (coverage,
+        // headingReliable, warnings.onTick selection, maybeSync) runs on the RAW fix;
+        // only the DISPLAYED range is smoothed (WarningCoordinator subtracts the
+        // forward-advance from the shown distance, clamped so it never crosses a hazard).
+        val pose = locationSource.forwardExtrapolated(rawPose, now)
         // Heading is reliable only when actually moving (GPS bearing is noise at
         // crawl); ApproachEngine SUPPRESSES warnings entirely when this is false
         // (can't tell our road/direction without a reliable bearing — R-EXT-4).
-        val headingReliable = pose.speedMps > HEADING_RELIABLE_MPS
+        // Judged on the RAW fix's speed (the extrapolation never changes speed anyway).
+        val headingReliable = rawPose.speedMps > HEADING_RELIABLE_MPS
 
         // Route coverage: record this tile (only while genuinely MOVING, so a parked
         // car with GPS jitter doesn't fabricate "passes") and publish its level so the
         // overlay's idle caption distinguishes a mapped road from a new one. The
         // supplier (lastCoverageLevel) is read by visualSink inside warnings.onTick.
-        if (pose.speedMps > HEADING_RELIABLE_MPS) {
-            if (coverage.record(pose.lat, pose.lng, now)) maybePersistCoverage(now)
+        // Uses the RAW fix so coverage reflects where we ACTUALLY are, not a guess.
+        if (rawPose.speedMps > HEADING_RELIABLE_MPS) {
+            if (coverage.record(rawPose.lat, rawPose.lng, now)) maybePersistCoverage(now)
         }
-        lastCoverageLevel = coverage.levelAt(pose.lat, pose.lng).ordinal
+        lastCoverageLevel = coverage.levelAt(rawPose.lat, rawPose.lng).ordinal
 
-        warnings.onTick(pose, cfg, headingReliable)
+        // Selection/geometry on the RAW fix; the extrapolated `pose` is handed in only
+        // to smooth the shown distance (counts down between fixes) — never to decide
+        // whether a hazard is still ahead.
+        warnings.onTick(rawPose, pose, cfg, headingReliable)
         // onTick always publishes overlay state on every DRIVING tick, so the app
         // overlay's 4 s staleness window never trips: a hazard ahead in a visual mode
         // writes the card via showApproach; nothing ahead (or AUDIO-only mode, which
         // shows no card) writes idle via clearApproach. Heartbeat covered in every mode.
 
-        // Crowdsource sync runs on a much slower cadence than the warn tick.
-        maybeSync(cfg, pose, now)
+        // Crowdsource sync runs on a much slower cadence than the warn tick. Uses the
+        // RAW fix — the tile neighbourhood it syncs must match where we truly are.
+        maybeSync(cfg, rawPose, now)
 
         // Persist the per-vehicle calibration on a slow throttle so it survives a
         // restart (off the 100 Hz path — this is the ~2 Hz warn tick).

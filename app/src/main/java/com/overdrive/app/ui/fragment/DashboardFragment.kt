@@ -928,8 +928,11 @@ class DashboardFragment : Fragment() {
     /**
      * Dialog with capacity input + model dropdown. POSTs to
      * /api/performance/soh/nominal and /api/models/selected.
+     *
+     * `internal` so the onboarding vehicle chapter can launch the real dialog via
+     * MainActivity.openVehicleProfileForOnboarding() rather than reimplementing it.
      */
-    private fun showVehicleCapacityDialog() {
+    internal fun showVehicleCapacityDialog() {
         val ctx = context ?: return
 
         // Inflate the M3 layout (outlined inputs + ExposedDropdownMenu).

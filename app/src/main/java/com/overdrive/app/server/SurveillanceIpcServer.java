@@ -859,46 +859,51 @@ public class SurveillanceIpcServer implements Runnable {
                 boolean detectPerson = config.optBoolean("detectPerson", sentryConfig.isDetectPerson());
                 boolean detectCar = config.optBoolean("detectCar", sentryConfig.isDetectCar());
                 boolean detectBike = config.optBoolean("detectBike", sentryConfig.isDetectBike());
-                
+                boolean detectAnimal = config.optBoolean("detectAnimal", sentryConfig.isDetectAnimal());
+
                 // Apply to running engine if available
                 if (sentry != null) {
-                    sentry.setObjectFilters(minSize, confidence, detectPerson, detectCar, detectBike);
+                    sentry.setObjectFilters(minSize, confidence, detectPerson, detectCar, detectBike, detectAnimal);
                 }
-                
+
                 // Update config object for persistence
                 sentryConfig.setMinObjectSize(minSize);
                 sentryConfig.setAiConfidence(confidence);
                 sentryConfig.setDetectPerson(detectPerson);
                 sentryConfig.setDetectCar(detectCar);
                 sentryConfig.setDetectBike(detectBike);
+                sentryConfig.setDetectAnimal(detectAnimal);
                 configChanged = true;
-                
+
                 logger.info("Sensitivity set to " + sensitivity + " (minObjectSize=" + minSize + ")");
             }
             
             // Apply object detection filters (direct minObjectSize override)
-            if (config.has("minObjectSize") || config.has("aiConfidence") || 
-                config.has("detectPerson") || config.has("detectCar") || config.has("detectBike")) {
-                
+            if (config.has("minObjectSize") || config.has("aiConfidence") ||
+                config.has("detectPerson") || config.has("detectCar") || config.has("detectBike") ||
+                config.has("detectAnimal")) {
+
                 float minSize = (float) config.optDouble("minObjectSize", sentryConfig.getMinObjectSize());
                 float confidence = (float) config.optDouble("aiConfidence", sentryConfig.getAiConfidence());
                 boolean detectPerson = config.optBoolean("detectPerson", sentryConfig.isDetectPerson());
                 boolean detectCar = config.optBoolean("detectCar", sentryConfig.isDetectCar());
                 boolean detectBike = config.optBoolean("detectBike", sentryConfig.isDetectBike());
-                
+                boolean detectAnimal = config.optBoolean("detectAnimal", sentryConfig.isDetectAnimal());
+
                 // Apply to running engine if available
                 if (sentry != null) {
-                    sentry.setObjectFilters(minSize, confidence, detectPerson, detectCar, detectBike);
+                    sentry.setObjectFilters(minSize, confidence, detectPerson, detectCar, detectBike, detectAnimal);
                 }
-                
+
                 // Update config object for persistence
                 sentryConfig.setMinObjectSize(minSize);
                 sentryConfig.setAiConfidence(confidence);
                 sentryConfig.setDetectPerson(detectPerson);
                 sentryConfig.setDetectCar(detectCar);
                 sentryConfig.setDetectBike(detectBike);
+                sentryConfig.setDetectAnimal(detectAnimal);
                 configChanged = true;
-                
+
                 logger.info("Object filters applied (sentry " + (sentry != null ? "running" : "not running") + ")");
             }
             
@@ -1014,7 +1019,8 @@ public class SurveillanceIpcServer implements Runnable {
                     boolean detectPerson = sentryConfig.isDetectPerson();
                     boolean detectCar = sentryConfig.isDetectCar();
                     boolean detectBike = sentryConfig.isDetectBike();
-                    sentry.setObjectFilters(minObjectSize, confidence, detectPerson, detectCar, detectBike);
+                    boolean detectAnimal = sentryConfig.isDetectAnimal();
+                    sentry.setObjectFilters(minObjectSize, confidence, detectPerson, detectCar, detectBike, detectAnimal);
                 }
                 
                 logger.info(String.format("Distance set via IPC: %s (minObjectSize=%.0f%%)",
@@ -1350,6 +1356,7 @@ public class SurveillanceIpcServer implements Runnable {
             config.put("detectPerson", sentryConfig.isDetectPerson());
             config.put("detectCar", sentryConfig.isDetectCar());
             config.put("detectBike", sentryConfig.isDetectBike());
+            config.put("detectAnimal", sentryConfig.isDetectAnimal());
             config.put("flashImmunity", sentryConfig.getFlashImmunity());
             config.put("preEventBufferSeconds", sentryConfig.getPreRecordSeconds());
             config.put("postEventBufferSeconds", sentryConfig.getPostRecordSeconds());
@@ -1395,6 +1402,7 @@ public class SurveillanceIpcServer implements Runnable {
             config.put("detectPerson", true);
             config.put("detectCar", true);
             config.put("detectBike", true);
+            config.put("detectAnimal", false);
             config.put("flashImmunity", 2);  // Default MEDIUM
             config.put("preEventBufferSeconds", 5);
             config.put("postEventBufferSeconds", 10);
@@ -1557,13 +1565,18 @@ public class SurveillanceIpcServer implements Runnable {
             float accuracy = (float) request.optDouble("accuracy", 0.0);
             double altitude = request.optDouble("altitude", 0.0);
             long time = request.optLong("time", System.currentTimeMillis());
-            // The fix's own timestamp (Location.getTime()); falls back to send
-            // time for older sidecars that don't ship it.
+            // The fix's own wall-clock timestamp (Location.getTime()); falls back to
+            // send time for older sidecars that don't ship it. Feeds gps_utc.
             long fixTime = request.optLong("fix_time", time);
+            // Monotonic since-boot fix timestamp for geo-tagging staleness — distinct
+            // from "time" (send-time). Older sidecars omit it → sentinel 0, which the
+            // daemon-side gate treats as "no monotonic basis" and falls back to the
+            // send-time age (prior behavior, no regression).
+            long fixElapsedMs = request.optLong("fixElapsedMs", 0L);
 
             // Directly update GpsMonitor
             com.overdrive.app.monitor.GpsMonitor.getInstance()
-                .updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, fixTime);
+                .updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, fixTime, fixElapsedMs);
             
         } catch (Exception e) {
             logger.error("Failed to update GPS", e);

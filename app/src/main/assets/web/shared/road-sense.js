@@ -373,6 +373,13 @@ BYD.roadSense = {
      * UCM section, not RoadSense hazard detection), so its cards (data-tab=
      * "blindspot") are NOT gated by the RoadSense master — they can be enabled,
      * disabled, and tuned independently while RoadSense is off.
+     *
+     * The Map tab (data-tab="map": hazard map, routing BYOK key, cluster
+     * projection) is likewise independent of hazard DETECTION — it is the
+     * navigation map + routing + cluster surface, all driven by pure daemon
+     * HTTP (/api/navmap/*) that works whether or not RoadSense is enabled. So
+     * those cards are exempt too: the map/routing/cluster settings stay editable
+     * with the RoadSense master off.
      */
     _applyMasterGate(masterOn) {
         document.querySelectorAll('.card').forEach(card => {
@@ -380,6 +387,9 @@ BYD.roadSense = {
             if (card.querySelector('#rsEnabled')) return;
             // Blind Spot is independent of the RoadSense master gate.
             if (card.getAttribute('data-tab') === 'blindspot') return;
+            // Map / routing / cluster are navigation surfaces, not hazard
+            // detection — keep them editable while RoadSense is off.
+            if (card.getAttribute('data-tab') === 'map') return;
             card.classList.toggle('rs-gated', !masterOn);
             // Block pointer + keyboard interaction on the controls when gated,
             // without touching their checked/value (so state survives a toggle).

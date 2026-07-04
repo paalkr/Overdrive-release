@@ -170,10 +170,14 @@ public class MqttConnectionStore {
             if (updates.has("topic")) existing.topic = updates.optString("topic");
             if (updates.has("clientId")) existing.clientId = updates.optString("clientId");
             if (updates.has("username")) existing.username = updates.optString("username");
-            // Only update password if explicitly provided (not masked)
+            // Only update the password when the user actually provides a new
+            // one. The edit form intentionally never prefills the stored secret,
+            // so a blank value on update means "keep the existing password" — it
+            // must not wipe it. (The "••" guard covers the older masked-echo
+            // contract.)
             if (updates.has("password")) {
                 String pwd = updates.optString("password");
-                if (!pwd.startsWith("••")) {
+                if (!pwd.isEmpty() && !pwd.startsWith("••")) {
                     existing.password = pwd;
                 }
             }

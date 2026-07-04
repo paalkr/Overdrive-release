@@ -4900,7 +4900,11 @@ public class StorageManager {
             // exit between write and rename orphans the .tmp next to a cam_/dvr_ clip.
             case "recordings":   return new String[]{".mp4.tmp", ".broken", ".json.tmp", ".srt.tmp"};
             case "surveillance": return new String[]{".mp4.tmp", ".broken", ".jpg.tmp", ".json.tmp", ".srt.tmp"};
-            case "proximity":    return new String[]{".mp4.tmp", ".broken"};
+            // .json.tmp added so the geo-backfill sidecar rewrite (SidecarGeoUpdater,
+            // which sweeps proximity dirs too) leaves no unreaped orphan on a
+            // SIGKILL in its write→rename window; .jpg.tmp mirrors the surveillance
+            // hero-thumb partial since proximity events write the same sidecar/thumb set.
+            case "proximity":    return new String[]{".mp4.tmp", ".broken", ".json.tmp", ".jpg.tmp", ".srt.tmp"};
             case "trips":        return new String[]{".jsonl.gz.tmp"};
             default:             return new String[]{};
         }

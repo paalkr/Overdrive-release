@@ -52,6 +52,7 @@ class SurveillanceConfigManager(
         private const val KEY_DETECT_PERSON = "detectPerson"
         private const val KEY_DETECT_CAR = "detectCar"
         private const val KEY_DETECT_BIKE = "detectBike"
+        private const val KEY_DETECT_ANIMAL = "detectAnimal"
         private const val KEY_PRE_RECORD_SECONDS = "preRecordSeconds"
         private const val KEY_POST_RECORD_SECONDS = "postRecordSeconds"
         private const val KEY_TG_SEND_START_PING = "telegramSendStartPing"
@@ -73,6 +74,7 @@ class SurveillanceConfigManager(
         private const val KEY_MOTION_HEATMAP = "motionHeatmap"
         private const val KEY_FILTER_DEBUG_LOG = "filterDebugLog"
         private const val KEY_SHADOW_FILTER = "shadowFilterMode"
+        private const val KEY_DISCARD_EMPTY_BRIGHT = "discardEmptyBrightMotionEvents"
     }
     
     /**
@@ -186,6 +188,7 @@ class SurveillanceConfigManager(
             put(KEY_DETECT_PERSON, config.isDetectPerson)
             put(KEY_DETECT_CAR, config.isDetectCar)
             put(KEY_DETECT_BIKE, config.isDetectBike)
+            put(KEY_DETECT_ANIMAL, config.isDetectAnimal)
             put(KEY_PRE_RECORD_SECONDS, config.preRecordSeconds)
             put(KEY_POST_RECORD_SECONDS, config.postRecordSeconds)
             put(KEY_TG_SEND_START_PING, config.isTelegramSendStartPing)
@@ -205,6 +208,7 @@ class SurveillanceConfigManager(
             put(KEY_CAMERA_LEFT, cameras[3])
             put(KEY_MOTION_HEATMAP, config.isMotionHeatmapEnabled)
             put(KEY_FILTER_DEBUG_LOG, config.isFilterDebugLogEnabled)
+            put(KEY_DISCARD_EMPTY_BRIGHT, config.isDiscardEmptyBrightMotionEvents)
             put(KEY_SHADOW_FILTER, config.shadowFilterMode)
 
             // Per-quadrant overrides (null = inherit). Persisted as a single
@@ -277,6 +281,7 @@ class SurveillanceConfigManager(
         if (json.has(KEY_DETECT_PERSON)) config.setDetectPerson(json.optBoolean(KEY_DETECT_PERSON, true))
         if (json.has(KEY_DETECT_CAR)) config.setDetectCar(json.optBoolean(KEY_DETECT_CAR, true))
         if (json.has(KEY_DETECT_BIKE)) config.setDetectBike(json.optBoolean(KEY_DETECT_BIKE, false))
+        if (json.has(KEY_DETECT_ANIMAL)) config.setDetectAnimal(json.optBoolean(KEY_DETECT_ANIMAL, false))
         if (json.has(KEY_PRE_RECORD_SECONDS)) config.setPreRecordSeconds(json.optInt(KEY_PRE_RECORD_SECONDS, 5))
         if (json.has(KEY_POST_RECORD_SECONDS)) config.setPostRecordSeconds(json.optInt(KEY_POST_RECORD_SECONDS, 10))
         if (json.has(KEY_TG_SEND_START_PING))
@@ -298,6 +303,7 @@ class SurveillanceConfigManager(
         if (json.has(KEY_CAMERA_LEFT)) config.setCameraEnabled(3, json.optBoolean(KEY_CAMERA_LEFT, true))
         if (json.has(KEY_MOTION_HEATMAP)) config.setMotionHeatmapEnabled(json.optBoolean(KEY_MOTION_HEATMAP, false))
         if (json.has(KEY_FILTER_DEBUG_LOG)) config.setFilterDebugLogEnabled(json.optBoolean(KEY_FILTER_DEBUG_LOG, false))
+        if (json.has(KEY_DISCARD_EMPTY_BRIGHT)) config.setDiscardEmptyBrightMotionEvents(json.optBoolean(KEY_DISCARD_EMPTY_BRIGHT, false))
         if (json.has(KEY_SHADOW_FILTER)) config.setShadowFilterMode(json.optInt(KEY_SHADOW_FILTER, 2))
         
         // Per-quadrant overrides

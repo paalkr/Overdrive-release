@@ -102,6 +102,13 @@ public class FoveatedCropper {
     private final int[] pboIds = new int[RING_SIZE];
     private final long[] fenceSyncs = new long[RING_SIZE];        // 0 = unused
     private final int[] pboQuadrant = new int[RING_SIZE];          // -1 = unused
+    // Foveated→block-grid affine {mapAx,mapBx,mapAy,mapBy} captured at QUEUE
+    // time (when crop() renders window N into slot ringHead). RING_SIZE=3 means
+    // the readback that COMPLETES belongs to an EARLIER crop() call's window,
+    // so the rect MUST be stored per-slot here and read back at drain time —
+    // not recomputed from the current call's centroid. Mirrors fenceSyncs[] /
+    // pboQuadrant[] exactly (same head/tail lifecycle).
+    private final float[][] ringCropAffine = new float[RING_SIZE][4];
     private static final int PBO_BYTES = CROP_SIZE * CROP_SIZE * 4;
     // Head = next slot to render+queue into; tail = next slot to attempt
     // readback from. The ring is empty when head == tail and slots in
@@ -229,17 +236,54 @@ public class FoveatedCropper {
     }
 
     /** Result of a crop call. {@link #rgb} may be null on the very first
-     *  invocation (no previous frame to read back) — caller falls back to mosaic. */
+     *  invocation (no previous frame to read back) — caller falls back to mosaic.
+     *
+     *  <p>Affine mapping foveated-pixel → 320×240 quadrant-block-grid:
+     *  a detection bbox coordinate {@code fx} (in this crop's 640-pixel native
+     *  space) maps to the motion block grid via
+     *  {@code blockGridX = mapAx * fx + mapBx}, and likewise
+     *  {@code blockGridY = mapAy * fy + mapBy}. These coefficients FOLD IN the
+     *  crop window's scale, origin offset within the quadrant, the per-role
+     *  flip, and the APA inset — everything {@link #crop} knows about the
+     *  producer layout — so the consumer never re-derives layout. They travel
+     *  WITH the pixels through the async ring, so the bbox is always mapped
+     *  using the SAME window the pixels came from (see class doc: the readback
+     *  that completes belongs to an EARLIER crop() call's window). */
     public static final class Result {
         public final byte[] rgb;
         public final int quadrant;
         public final int width;
         public final int height;
+        // Affine coefficients: blockGrid = mapA*foveatedPx + mapB (320×240 space).
+        public final float mapAx;
+        public final float mapBx;
+        public final float mapAy;
+        public final float mapBy;
         public Result(byte[] rgb, int quadrant, int w, int h) {
+            this(rgb, quadrant, w, h,
+                 // Identity-ish fallback (only reached if a legacy caller uses
+                 // the old ctor). 0.5 scale + no origin ≈ the OLD broken math,
+                 // but the consumer FAILS SAFE (keep detection) when it detects
+                 // an un-populated affine via the hasAffine() sentinel below.
+                 0f, 0f, 0f, 0f);
+        }
+        public Result(byte[] rgb, int quadrant, int w, int h,
+                      float mapAx, float mapBx, float mapAy, float mapBy) {
             this.rgb = rgb;
             this.quadrant = quadrant;
             this.width = w;
             this.height = h;
+            this.mapAx = mapAx;
+            this.mapBx = mapBx;
+            this.mapAy = mapAy;
+            this.mapBy = mapBy;
+        }
+        /** True iff a real foveated→block-grid affine was populated. A zero
+         *  X-scale (mapAx==0) can never be a legitimate crop mapping (the
+         *  window always covers non-zero width), so it doubles as the
+         *  "no rect data" sentinel the consumer fail-safes on. */
+        public boolean hasAffine() {
+            return mapAx != 0f;
         }
     }
 
@@ -369,6 +413,10 @@ public class FoveatedCropper {
         float quadLeft, quadTop;
         float quadRight, quadBottom;
         float centerX, centerY;
+        // Per-role flip in producer space. Only the corner layout mirrors; the
+        // legacy 4-strip path never flips (recorder paints upright strips).
+        // Hoisted out of the corner branch so the affine build below sees it.
+        float xFlipOut = 0f, yFlipOut = 0f;
         if (useCornerLayout) {
             // 2x2 mosaic: each role lives in a 0.5×0.5 corner of the
             // producer frame. The producer is roughly stripWidth/2 wide and
@@ -398,6 +446,8 @@ public class FoveatedCropper {
             // mirror the centroid before mapping into the 0.5×0.5 corner.
             float localX = (xFlip > 0.5f) ? (1.0f - camNormX) : camNormX;
             float localY = (yFlip > 0.5f) ? (1.0f - camNormY) : camNormY;
+            xFlipOut = xFlip;
+            yFlipOut = yFlip;
             centerX = quadLeft + localX * 0.5f;
             centerY = quadTop  + localY * 0.5f;
             // APA center inset (esco APACropFilter parity, mirror of
@@ -433,6 +483,53 @@ public class FoveatedCropper {
         // sample neighbouring cameras' pixels along the edges.
         cropLeft = Math.max(quadLeft,  Math.min(cropLeft, quadRight  - cropWidthNorm));
         cropTop  = Math.max(quadTop,   Math.min(cropTop,  quadBottom - cropHeightNorm));
+
+        // ---- Build the foveated-pixel → 320×240 block-grid affine ----
+        //
+        // This INVERTS crop()'s forward transform. The fragment shader samples
+        // producer UV as:
+        //     producerNormX = cropLeft + (fx/CROP_SIZE) * cropWidthNorm
+        //     producerNormY = cropTop  + (fy/CROP_SIZE) * cropHeightNorm
+        // (vTexCoord = fx/CROP_SIZE after the readback's Y-flip lands the crop
+        //  in top-left-origin pixels — the same convention YOLO/det coords use).
+        //
+        // Quadrant-local normalised coords come from the role bounds:
+        //     quadLocalX = (producerNormX - quadLeft) / (quadRight - quadLeft)
+        //     quadLocalY = (producerNormY - quadTop ) / (quadBottom - quadTop)
+        // then undo the per-role mirror (corner layout only), then × (320,240).
+        //
+        // All of cropLeft/cropTop/cropWidthNorm/quadLeft.. are POST-inset and
+        // POST-clamp here, so the folded coefficients are exact for the exact
+        // window we are about to render. Compose to a single affine so the
+        // consumer does only blockGridX = mapAx*fx + mapBx.
+        final float qWidthNorm  = Math.max(1e-6f, quadRight  - quadLeft);
+        final float qHeightNorm = Math.max(1e-6f, quadBottom - quadTop);
+        // quadLocalX = mX*fx + cX ; quadLocalY = mY*fy + cY
+        float mX = cropWidthNorm  / (CROP_SIZE * qWidthNorm);
+        float cX = (cropLeft - quadLeft) / qWidthNorm;
+        float mY = cropHeightNorm / (CROP_SIZE * qHeightNorm);
+        float cY = (cropTop  - quadTop)  / qHeightNorm;
+        float mapAx, mapBx, mapAy, mapBy;
+        if (xFlipOut > 0.5f) {
+            // quadLocalX' = 1 - (mX*fx + cX) → ×320
+            mapAx = -320.0f * mX;
+            mapBx =  320.0f * (1.0f - cX);
+        } else {
+            mapAx =  320.0f * mX;
+            mapBx =  320.0f * cX;
+        }
+        if (yFlipOut > 0.5f) {
+            mapAy = -240.0f * mY;
+            mapBy =  240.0f * (1.0f - cY);
+        } else {
+            mapAy =  240.0f * mY;
+            mapBy =  240.0f * cY;
+        }
+        // Guard against a degenerate zero X-scale (would collide with the
+        // Result.hasAffine() sentinel and make the consumer fail-safe). mX is
+        // cropWidthNorm/(640*qWidth) which is structurally > 0 for any real
+        // window, so this only trips on corrupt inputs — keep a tiny epsilon.
+        if (mapAx == 0f) mapAx = 1e-6f;
 
         int[] savedViewport = new int[4];
         GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, savedViewport, 0);
@@ -486,7 +583,10 @@ public class FoveatedCropper {
             }
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
             GLES20.glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
-            return new Result(dst, quadrant, CROP_SIZE, CROP_SIZE);
+            // Synchronous path: the bytes ARE this call's window, so the affine
+            // computed above is the exact match.
+            return new Result(dst, quadrant, CROP_SIZE, CROP_SIZE,
+                    mapAx, mapBx, mapAy, mapBy);
         }
 
         // ---- 2. Queue an async readback into the next PBO slot ----
@@ -510,6 +610,13 @@ public class FoveatedCropper {
             // tell us when the DMA has landed without blocking.
             fenceSyncs[ringHead] = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             pboQuadrant[ringHead] = quadrant;
+            // Stamp the affine for THIS window into the same slot the fence +
+            // quadrant go into. When this slot later drains, we read it back so
+            // the bbox is mapped with the window the pixels actually came from.
+            ringCropAffine[ringHead][0] = mapAx;
+            ringCropAffine[ringHead][1] = mapBx;
+            ringCropAffine[ringHead][2] = mapAy;
+            ringCropAffine[ringHead][3] = mapBy;
             ringHead = nextHead;
         } else {
             // Saturated ring — only attempt drain below.
@@ -530,6 +637,12 @@ public class FoveatedCropper {
                              || sig == GLES30.GL_CONDITION_SATISFIED);
             if (signaled) {
                 int q = pboQuadrant[ringTail];
+                // Read back the affine stamped when THIS slot was queued (an
+                // earlier crop() window than the current call's centroid).
+                float rAx = ringCropAffine[ringTail][0];
+                float rBx = ringCropAffine[ringTail][1];
+                float rAy = ringCropAffine[ringTail][2];
+                float rBy = ringCropAffine[ringTail][3];
                 // Map the PBO read-only and bulk-copy into our scratch
                 // byte[]. glMapBufferRange returns a Buffer whose backing
                 // memory is the GPU's PBO storage — direct DMA buffer.
@@ -559,7 +672,8 @@ public class FoveatedCropper {
                             dst[dstIdx++] = src[s + 2];
                         }
                     }
-                    result = new Result(dst, q, CROP_SIZE, CROP_SIZE);
+                    result = new Result(dst, q, CROP_SIZE, CROP_SIZE,
+                            rAx, rBx, rAy, rBy);
                 } else {
                     GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
                     GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
@@ -570,6 +684,10 @@ public class FoveatedCropper {
                 GLES30.glDeleteSync(fenceSyncs[ringTail]);
                 fenceSyncs[ringTail] = 0L;
                 pboQuadrant[ringTail] = -1;
+                ringCropAffine[ringTail][0] = 0f;
+                ringCropAffine[ringTail][1] = 0f;
+                ringCropAffine[ringTail][2] = 0f;
+                ringCropAffine[ringTail][3] = 0f;
                 ringTail = (ringTail + 1) % RING_SIZE;
             }
             // If sig == GL_TIMEOUT_EXPIRED we just leave the fence in
@@ -660,6 +778,10 @@ public class FoveatedCropper {
                 fenceSyncs[i] = 0L;
             }
             pboQuadrant[i] = -1;
+            ringCropAffine[i][0] = 0f;
+            ringCropAffine[i][1] = 0f;
+            ringCropAffine[i][2] = 0f;
+            ringCropAffine[i][3] = 0f;
         }
         if (pboIds[0] != 0) {
             GLES30.glDeleteBuffers(RING_SIZE, pboIds, 0);

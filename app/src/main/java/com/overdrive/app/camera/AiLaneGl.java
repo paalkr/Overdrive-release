@@ -67,6 +67,29 @@ public final class AiLaneGl {
         int getCameraTextureId();
         /** Monotonically increasing on each successful HAL frame bind. */
         long getFrameSeq();
+        /**
+         * False while the camera surface is being rebound/torn down on the
+         * encoder GL thread (restart / yield / closed). The camera OES texture's
+         * backing EGLImage is freed during that window, so the AI lane MUST NOT
+         * sample it — doing so faults inside the Adreno driver (use-after-free
+         * SIGSEGV in libGLESv2_adreno during readback). Default true keeps any
+         * other CameraState impl byte-identical.
+         */
+        default boolean isCameraTextureValid() { return true; }
+
+        /**
+         * Monitor that serializes mutation of the shared camera OES texture
+         * (the encoder thread's updateTexImage / SurfaceTexture release) against
+         * the AI lane's readback that SAMPLES it. The two run on different
+         * threads + EGL contexts but share one EXTERNAL_OES texname; a
+         * check-then-use validity flag cannot close the window where
+         * updateTexImage swaps the backing EGLImage mid-readback (or the HAL
+         * abandons the BufferQueue), which faults in the Adreno driver. BOTH
+         * sides synchronize on this object so the texture is never rebound/freed
+         * while a sample is in flight. Default = a per-instance lock (no
+         * cross-thread contract) so other CameraState impls stay correct.
+         */
+        default Object cameraTextureLock() { return this; }
     }
 
     private final EGLCore parentCore;
@@ -80,6 +103,8 @@ public final class AiLaneGl {
     // Pre-existing AI infrastructure that we now own GL-thread-wise.
     private GpuDownscaler downscaler;       // Owned externally, GL ops on us.
     private FoveatedCropper foveatedCropper;
+    /** Rate-limit for the lazy-wire diagnostic (logs why setFoveatedCropper didn't fire). */
+    private long lastFoveatedWireDiagMs = 0L;
     private SurveillanceEngineGpu sentry;
     private AiLaneWorker aiLaneWorker;
 
@@ -217,45 +242,138 @@ public final class AiLaneGl {
         if (cameraState == null) return;
         int textureId = cameraState.getCameraTextureId();
         if (textureId <= 0) return;
+        // CRITICAL (use-after-free guard): never sample the camera OES texture
+        // while the encoder thread is rebinding/tearing down the camera surface —
+        // its backing EGLImage is freed in that window and the Adreno driver
+        // null-derefs inside the readback draw (SIGSEGV in libGLESv2_adreno). This
+        // mirrors the encoder thread's own renderLoop guard. Gates BOTH PASS A
+        // (readback) and PASS B (foveated) since both bind/sample the OES texture.
+        if (!cameraState.isCameraTextureValid()) return;
 
-        // Frame-modulo gate. Cheap; same semantics as before.
-        if (readbackModulo > 1 && (seq % readbackModulo) != 0) {
-            // Even though we skip readback, still let the foveated mailbox
-            // drain — the foveated cropper has its own 150ms throttle and
-            // is what carries event-correlated work.
-            serviceFoveated(textureId);
-            return;
-        }
+        // ALL GL sampling of the shared camera OES texture happens UNDER the
+        // camera-texture lock so the encoder thread cannot run updateTexImage()
+        // (swap the backing EGLImage) or release the SurfaceTexture mid-sample —
+        // the use-after-free that SIGSEGVs the Adreno driver. We also re-check
+        // isCameraTextureValid() INSIDE the lock: a teardown that began before we
+        // acquired it will have cleared the flag, and once we hold the lock the
+        // encoder cannot start a new teardown until we release.
+        final Object camLock = cameraState.cameraTextureLock();
+        synchronized (camLock) {
+            if (!cameraState.isCameraTextureValid()) return;
 
-        // PASS A — mosaic 640×480 readback for V2 motion + actor pipeline.
-        // PBO + fence-sync inside readPixelsDirect makes this non-blocking
-        // even when the GPU's command queue is busy. With YOLO migrated
-        // off the GPU (CPU-only XNNPACK), the previous "Adreno mid-OpenCL"
-        // gate is no longer meaningful — the only contention left here is
-        // the AI worker still processing the prior frame, which the
-        // isBusy() check covers.
-        try {
-            if (sentry != null && sentry.isActive()
-                    && downscaler != null && aiLaneWorker != null) {
-                if (!aiLaneWorker.isBusy()) {
-                    byte[] smallFrame = downscaler.readPixelsDirect(textureId);
-                    if (smallFrame != null) {
-                        // Lazy-wire foveated cropper into the sentry on
-                        // first valid frame so it picks up the same OES tex.
-                        if (foveatedCropper != null && foveatedCropper.isInitialized()
-                                && sentry.getFoveatedCropper() == null) {
-                            sentry.setFoveatedCropper(foveatedCropper, textureId);
+            // Frame-modulo gate. Cheap; same semantics as before.
+            if (readbackModulo > 1 && (seq % readbackModulo) != 0) {
+                // Even though we skip readback, still let the foveated mailbox
+                // drain — the foveated cropper has its own 150ms throttle and
+                // is what carries event-correlated work.
+                serviceFoveated(textureId);
+                // GPU-barrier before releasing the lock on THIS exit path too:
+                // serviceFoveated can sample the OES texture, so its draw must
+                // complete before the encoder can rebind/free the buffer.
+                gpuSampleBarrier();
+                return;
+            }
+
+            // PASS A — mosaic 640×480 readback for V2 motion + actor pipeline.
+            // PBO + fence-sync inside readPixelsDirect makes this non-blocking
+            // even when the GPU's command queue is busy. With YOLO migrated
+            // off the GPU (CPU-only XNNPACK), the previous "Adreno mid-OpenCL"
+            // gate is no longer meaningful — the only contention left here is
+            // the AI worker still processing the prior frame, which the
+            // isBusy() check covers.
+            try {
+                if (sentry != null && sentry.isActive()
+                        && downscaler != null && aiLaneWorker != null) {
+                    if (!aiLaneWorker.isBusy()) {
+                        byte[] smallFrame = downscaler.readPixelsDirect(textureId);
+                        if (smallFrame != null) {
+                            // Lazy-wire foveated cropper into the sentry on
+                            // first valid frame so it picks up the same OES tex.
+                            if (foveatedCropper != null && foveatedCropper.isInitialized()
+                                    && sentry.getFoveatedCropper() == null) {
+                                sentry.setFoveatedCropper(foveatedCropper, textureId);
+                                logger.info("FOVEATED-DIAG: lazy-wired cropper into engine (textureId="
+                                        + textureId + ")");
+                            } else if (System.currentTimeMillis() - lastFoveatedWireDiagMs > 5000) {
+                                // DIAGNOSTIC: the wire is reachable but didn't fire —
+                                // log which sub-term blocked it (AiLaneGl's own view).
+                                lastFoveatedWireDiagMs = System.currentTimeMillis();
+                                logger.info("FOVEATED-DIAG: lazy-wire NOT firing: cropperNull="
+                                        + (foveatedCropper == null) + " cropperInit="
+                                        + (foveatedCropper != null && foveatedCropper.isInitialized())
+                                        + " engineAlreadyWired=" + (sentry.getFoveatedCropper() != null));
+                            }
+                            aiLaneWorker.submitFrame(smallFrame);
                         }
-                        aiLaneWorker.submitFrame(smallFrame);
                     }
                 }
+            } catch (Throwable t) {
+                logger.warn("AI lane readback error: " + t.getMessage());
+            }
+
+            // PASS B — service the foveated mailbox. Inside the lock: it samples
+            // the same OES texture (foveated crop binds GL_TEXTURE_EXTERNAL_OES),
+            // so it must be serialized against updateTexImage/release too.
+            serviceFoveated(textureId);
+
+            // CRASH FIX (GPU-timeline barrier): the OES-sampling draws above only
+            // QUEUE GPU work; the Java lock serializes CPU command ISSUANCE, not
+            // GPU EXECUTION. Without a barrier, this lock releases while the GPU
+            // sample of the camera EXTERNAL_OES texture is still pending, and the
+            // encoder thread then rebinds/frees that texture's backing buffer
+            // (consumeLatestImageAndBind) → use-after-free in libGLESv2_adreno.
+            // The barrier forces THIS lane's sample to COMPLETE on the GPU before
+            // we release camLock, so the encoder can never recycle a buffer that's
+            // still being read. See gpuSampleBarrier() for why a fence (not a full
+            // glFinish) is used.
+            gpuSampleBarrier();
+        }
+    }
+
+    /**
+     * Wait for THIS AI lane's just-queued OES-sampling draws to finish on the GPU
+     * before the caller releases cameraTextureLock — the barrier that prevents the
+     * encoder from recycling the camera buffer mid-sample (use-after-free).
+     *
+     * <p>Uses a GLES3 fence ({@code glFenceSync} + {@code glClientWaitSync}) rather
+     * than {@code glFinish()}. Both EGL contexts share one group on a single Adreno
+     * 610, so {@code glFinish} drains the ENTIRE share-group queue — including the
+     * encoder's heavy 5120×960 mosaic draw that the render thread just queued
+     * OUTSIDE this lock. Because the render thread re-acquires cameraTextureLock
+     * every frame around updateTexImage, a glFinish here parks the render/encoder
+     * thread for a full GPU drain on every AI tick → recording-fps drop + PTS
+     * jitter (the exact failure the engine's history documents and deliberately
+     * removed). A fence waits only until THIS lane's draws signal, leaving the
+     * encoder's queued mosaic untouched.
+     *
+     * <p>HARD-SAFETY FALLBACK: if the fence can't be created (driver fell back to
+     * GLES2 — EGLCore does this on some Adreno builds) OR the wait times out, we
+     * fall back to {@code glFinish()} so the use-after-free guarantee is NEVER
+     * weakened. Correctness first; the fence is purely a throughput optimization.
+     */
+    private void gpuSampleBarrier() {
+        try {
+            long fence = android.opengl.GLES30.glFenceSync(
+                    android.opengl.GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (fence != 0) {
+                int r = android.opengl.GLES30.glClientWaitSync(fence,
+                        android.opengl.GLES30.GL_SYNC_FLUSH_COMMANDS_BIT, 50_000_000L /* 50ms */);
+                android.opengl.GLES30.glDeleteSync(fence);
+                // TIMEOUT / lapsed → the sample may NOT have completed; fall back
+                // to a hard finish so we never release the lock early. (ALREADY/
+                // CONDITION/SIGNALED mean the wait succeeded.)
+                if (r == android.opengl.GLES30.GL_TIMEOUT_EXPIRED
+                        || r == android.opengl.GLES30.GL_WAIT_FAILED) {
+                    android.opengl.GLES20.glFinish();
+                }
+            } else {
+                // No fence (GLES2 fallback context) → hard finish.
+                android.opengl.GLES20.glFinish();
             }
         } catch (Throwable t) {
-            logger.warn("AI lane readback error: " + t.getMessage());
+            // Any failure in the fence path → guarantee correctness with glFinish.
+            try { android.opengl.GLES20.glFinish(); } catch (Throwable ignored) {}
         }
-
-        // PASS B — service the foveated mailbox.
-        serviceFoveated(textureId);
     }
 
     private void serviceFoveated(int textureId) {

@@ -122,7 +122,6 @@ public class OemDashcamPipeline {
     private int bitrate = DEFAULT_BITRATE;
     private String codecMimeType = MediaFormat.MIMETYPE_VIDEO_AVC;
     private int oemDashcamCameraId = -1;
-    private int segmentDurationMinutes = com.overdrive.app.util.Constants.SEGMENT_DURATION_MINUTES;
 
     // EGL + GL
     private EGLCore eglCore;
@@ -214,7 +213,12 @@ public class OemDashcamPipeline {
     private volatile Object cameraObj;
 
     // Recording encoder — H.265 @ recording quality, writes dvr_*.mp4.
-    private HardwareEventRecorderGpu encoder;
+    // volatile: assigned on the GL thread (initEglAndEncoder /
+    // reinitializeEncoder) but read from the API thread (updateSegmentDuration,
+    // isEncoderFormatAvailable, getEncoder, triggerEventRecording). Without it
+    // the JMM gives no happens-before edge, so the API thread could observe a
+    // stale/null reference. Mirrors GpuSurveillancePipeline.encoder.
+    private volatile HardwareEventRecorderGpu encoder;
     private Surface encoderSurface;
 
     // Threads. Earlier audit suggested consolidating the SurfaceTexture
@@ -436,6 +440,26 @@ public class OemDashcamPipeline {
         return running.get();
     }
 
+    /**
+     * Live-apply a new clip segment length (minutes) to the running OEM /
+     * surveillance encoder without a reinit. Takes effect on the next
+     * rotation. Called by the quality API when the user changes the shared
+     * Clip Duration control. No-op if the encoder isn't up.
+     */
+    public void updateSegmentDuration(int minutes) {
+        try {
+            int clamped = Math.max(
+                com.overdrive.app.util.Constants.MIN_SEGMENT_DURATION_MINUTES,
+                Math.min(com.overdrive.app.util.Constants.MAX_SEGMENT_DURATION_MINUTES, minutes));
+            HardwareEventRecorderGpu enc = encoder;
+            if (enc != null) {
+                enc.setSegmentDurationMs(clamped * 60_000L);
+            }
+        } catch (Throwable t) {
+            logger.warn("updateSegmentDuration failed: " + t.getMessage());
+        }
+    }
+
     /** True iff the pipeline has progressed far enough that downstream
      *  consumers can safely sample its EXTERNAL_OES texture and bind to
      *  its EGLCore. {@link #isRunning} flips true at the top of
@@ -474,14 +498,6 @@ public class OemDashcamPipeline {
      */
     public HardwareEventRecorderGpu getEncoder() {
         return encoder;
-    }
-
-    public void updateSegmentDuration(int durationMinutes) {
-        this.segmentDurationMinutes = durationMinutes;
-        HardwareEventRecorderGpu enc = encoder;
-        if (enc != null) {
-            enc.setSegmentDurationMs(java.util.concurrent.TimeUnit.MINUTES.toMillis(durationMinutes));
-        }
     }
 
     /** Trigger a continuous-recording segment. Filename is {@code dvr_*}.
@@ -851,6 +867,18 @@ public class OemDashcamPipeline {
             JSONObject cam = root.optJSONObject("camera");
             if (oem == null) oem = new JSONObject();
             if (rec == null) rec = new JSONObject();
+
+            // Axis selection — mirrors OemDashcamApiHandler's resolver: ACC OFF
+            // means we're serving the PARKED SURVEILLANCE axis, ACC ON the
+            // DRIVE-time recording axis. The surveillance axis honors the
+            // surveillance page's independent quality/fps knobs
+            // (recording.surveillanceQuality / camera.surveillanceTargetFps),
+            // falling back to the recording-axis chain when those are unset so
+            // a config predating the split is byte-identical. The recording
+            // axis is UNCHANGED. Codec is SHARED across both axes (device-compat
+            // choice, not a per-mode quality knob) so it does not branch here.
+            boolean surveillanceAxis = !com.overdrive.app.monitor.AccMonitor.isAccOn();
+
             // Codec — OEM-specific, fallback to legacy recording.codec.
             String codec = oem.has("codec")
                 ? oem.optString("codec", "H264")
@@ -858,24 +886,88 @@ public class OemDashcamPipeline {
             codecMimeType = "H265".equalsIgnoreCase(codec)
                 ? MediaFormat.MIMETYPE_VIDEO_HEVC
                 : MediaFormat.MIMETYPE_VIDEO_AVC;
-            int requestedFps = oem.has("fps")
+
+            // Recording-axis fps chain (also the surveillance-axis fallback).
+            int recAxisFps = oem.has("fps")
                 ? oem.optInt("fps", DEFAULT_FPS)
                 : rec.optInt("fps", DEFAULT_FPS);
+            int requestedFps;
+            if (surveillanceAxis) {
+                requestedFps = (cam != null)
+                    ? cam.optInt("surveillanceTargetFps", recAxisFps)
+                    : recAxisFps;
+            } else {
+                requestedFps = recAxisFps;
+            }
             fps = Math.max(15, Math.min(60, requestedFps));
 
-            // OEM tier — defaults STANDARD if neither key present.
-            String quality = (oem.has("recordingQuality")
-                    ? oem.optString("recordingQuality", "STANDARD")
-                    : rec.optString("recordingQuality", "STANDARD"))
+            // Recording-axis tier chain (also the surveillance-axis fallback).
+            String recAxisQuality = oem.has("recordingQuality")
+                ? oem.optString("recordingQuality", "STANDARD")
+                : rec.optString("recordingQuality", "STANDARD");
+            String quality = (surveillanceAxis
+                    ? rec.optString("surveillanceQuality", recAxisQuality)
+                    : recAxisQuality)
                 .toUpperCase(Locale.US);
             bitrate = bitrateForQuality(quality);
 
-            bitrate = applyBitrateBudgetCap(bitrate, oem, rec, cam);
-            int requestedDuration = rec.optInt("segmentDurationMinutes", com.overdrive.app.util.Constants.SEGMENT_DURATION_MINUTES);
-            segmentDurationMinutes = Math.max(com.overdrive.app.util.Constants.MIN_SEGMENT_DURATION_MINUTES,
-                Math.min(com.overdrive.app.util.Constants.MAX_SEGMENT_DURATION_MINUTES, requestedDuration));
+            bitrate = applyBitrateBudgetCap(bitrate, oem, rec, cam, surveillanceAxis);
         } catch (Throwable t) {
             logger.warn("applyRecordingConfigFromUcm failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Live-re-apply the fps + bitrate for the CURRENT axis (ACC on↔off) to an
+     * already-running pipeline WITHOUT a reinit — used at the ACC transition
+     * when the pipeline is kept warm across the boundary (e.g. the user has
+     * BOTH oemDashcam.recordingMode=continuous AND surveillanceMode=continuous,
+     * so recordingDesired never drops and {@code start()} is not re-called).
+     *
+     * <p>Re-resolves via {@link #applyRecordingConfigFromUcm()} (which reads the
+     * live ACC state) and pushes only the deltas: bitrate to the encoder
+     * ({@code setBitrate}, a MediaCodec setParameters — no gap) and fps to the
+     * camera HAL ({@code AvmCameraHelper.setCameraFps} — no reopen). Codec is
+     * axis-independent and never changes across an ACC edge, so no encoder
+     * reinit is ever needed here; a genuine codec change is a separate event
+     * that goes through the quality-mirror restart path.
+     *
+     * <p>No-op if the pipeline isn't running.
+     */
+    public void reapplyAxisProfileFromUcm() {
+        if (!running.get()) return;
+        int oldFps = fps;
+        int oldBitrate = bitrate;
+        applyRecordingConfigFromUcm();  // re-resolves fps/bitrate for the live axis
+        try {
+            if (bitrate != oldBitrate) {
+                HardwareEventRecorderGpu enc = encoder;
+                if (enc != null) {
+                    enc.setBitrate(bitrate);
+                }
+            }
+            if (fps != oldFps) {
+                Object cam = cameraObj;
+                if (cam != null) {
+                    AvmCameraHelper.setCameraFps(cam, fps);
+                }
+                // Also update the encoder's cached fps so its PTS re-anchor
+                // fallback interval and duration-fallback math track the new
+                // rate (MediaCodec KEY_FRAME_RATE can't change live, so this is
+                // just the bookkeeping int — mirrors the pano pipeline pairing
+                // camera.setTargetFps with encoder.setTargetFps).
+                HardwareEventRecorderGpu enc = encoder;
+                if (enc != null) {
+                    enc.setTargetFps(fps);
+                }
+            }
+            if (fps != oldFps || bitrate != oldBitrate) {
+                logger.info("OEM axis profile re-applied live: fps " + oldFps + "→" + fps
+                    + ", bitrate " + (oldBitrate / 1_000_000) + "→" + (bitrate / 1_000_000)
+                    + " Mbps (accOn=" + com.overdrive.app.monitor.AccMonitor.isAccOn() + ")");
+            }
+        } catch (Throwable t) {
+            logger.warn("reapplyAxisProfileFromUcm live-apply failed: " + t.getMessage());
         }
     }
 
@@ -911,7 +1003,8 @@ public class OemDashcamPipeline {
      * </ol>
      */
     private int applyBitrateBudgetCap(int requested, JSONObject oem,
-                                      JSONObject rec, JSONObject cam) {
+                                      JSONObject rec, JSONObject cam,
+                                      boolean surveillanceAxis) {
         try {
             int budget = oem == null ? 10_000_000
                 : oem.optInt("bitrateBudget", 10_000_000);
@@ -943,8 +1036,18 @@ public class OemDashcamPipeline {
             // the already-loaded recording section (passed in to avoid
             // a redundant disk read). Use the canonical codec-aware
             // table so OEM agrees with what pano actually uses.
+            //
+            // Axis-match the pano tier: when THIS pipeline serves the parked
+            // surveillance axis, the pano pipeline is likewise in SENTRY at its
+            // surveillanceQuality tier, so subtract THAT from the shared budget
+            // (not the drive-time recordingQuality). Falls back to the
+            // recording tier when the surveillance key is unset — byte-identical
+            // to the pre-split cap math. Codec is shared across axes.
             JSONObject panoRec = rec != null ? rec : new JSONObject();
-            String panoQuality = panoRec.optString("recordingQuality", "STANDARD")
+            String panoRecQuality = panoRec.optString("recordingQuality", "STANDARD");
+            String panoQuality = (surveillanceAxis
+                    ? panoRec.optString("surveillanceQuality", panoRecQuality)
+                    : panoRecQuality)
                 .toUpperCase(Locale.US);
             String panoCodec = panoRec.optString("codec", "H264").toUpperCase(Locale.US);
             int panoBps;
@@ -1060,7 +1163,6 @@ public class OemDashcamPipeline {
         runOnGlThreadAndWait(() -> {
             try {
                 encoder = new HardwareEventRecorderGpu(width, height, fps, bitrate, codecMimeType);
-                encoder.setSegmentDurationMs(java.util.concurrent.TimeUnit.MINUTES.toMillis(segmentDurationMinutes));
                 // Skip KEY_OPERATING_RATE so we don't over-subscribe the
                 // single Venus H.264 block when pano is also encoding.
                 // Pano keeps its pin (it's the primary recorder); OEM
@@ -1087,6 +1189,16 @@ public class OemDashcamPipeline {
                 // "Recording" indefinitely while the muxer was already
                 // dead and the .tmp was unrecoverable.
                 encoder.setWriterAbortListener(this::handleWriterAbort);
+                // Seed the clip segment length from the shared recording config
+                // so the OEM / ACC-off surveillance axis rotates at the same
+                // user-chosen interval (2/5/10 min) as the dashcam axis — one
+                // control, both axes (mirrors rectifyStrength sharing).
+                try {
+                    int segMin = UnifiedConfigManager.getSegmentDurationMinutes();
+                    encoder.setSegmentDurationMs(segMin * 60_000L);
+                } catch (Throwable t) {
+                    logger.warn("Failed to apply segment duration: " + t.getMessage());
+                }
                 encoder.init();
                 encoderSurface = encoder.getInputSurface();
                 if (encoderSurface == null) {

@@ -66,14 +66,33 @@ public class TelemetryDataCollector {
     // Polling
     private ScheduledExecutorService executor;
     private volatile TelemetrySnapshot latestSnapshot;
-    
-    // Recording mode: when true, polls at 200ms (5Hz) for overlay.
-    // When false, polls at 1000ms (1Hz) for trip telemetry / ABRP only.
+
+    // Lifecycle monitor. The singleton collector is shared across concurrent
+    // callers — pano (GpuSurveillancePipeline), OEM dashcam (OemDashcamPipeline),
+    // the trip recorder (TripAnalyticsManager) and the daemon all drive
+    // startPolling()/setOverlayRecordingActive()/stopPolling() from different
+    // threads. The (refcount, executor) pair plus overlayRecordingActive must
+    // mutate atomically: without this, two callers can both observe
+    // executor==null in startPolling()'s check-then-act and each create a
+    // "TelemetryPoller" — the second write to `executor` orphans the first
+    // thread (still scheduled, never shut down), so two pollers run forever,
+    // doubling the reflective BYD-HAL sweep and contending on the same
+    // non-thread-safe device handles. All five lifecycle methods take this
+    // monitor; poll()/pollInner() deliberately do NOT (they run on the
+    // executor thread and only touch volatiles), so the hot path never
+    // contends with lifecycle transitions.
+    private final Object pollingLock = new Object();
+
+    // Recording mode: when true, polls at POLL_INTERVAL_MS (2 Hz) for the
+    // video overlay. When false, polls at SLOW_POLL_INTERVAL_MS (1 Hz) for
+    // trip telemetry / ABRP only. Read on the executor thread; mutated under
+    // pollingLock via setOverlayRecordingActive().
     private volatile boolean overlayRecordingActive = false;
-    
+
     // Reference counting: polling stays alive as long as any consumer needs it
-    // (pipeline overlay, trip recorder, etc.)
-    private final java.util.concurrent.atomic.AtomicInteger pollingRefCount = 
+    // (pipeline overlay, trip recorder, etc.). Mutated under pollingLock so the
+    // count and the executor lifecycle stay coherent.
+    private final java.util.concurrent.atomic.AtomicInteger pollingRefCount =
         new java.util.concurrent.atomic.AtomicInteger(0);
 
     // Last-known-good values (used as fallback when a device call fails)
@@ -199,19 +218,17 @@ public class TelemetryDataCollector {
      * and it only stops when ALL callers have called stopPolling().
      */
     public void startPolling() {
-        int refs = pollingRefCount.incrementAndGet();
-        if (executor != null && !executor.isShutdown()) {
-            logger.info("Polling already running (refCount=" + refs + ")");
-            return;
+        synchronized (pollingLock) {
+            int refs = pollingRefCount.incrementAndGet();
+            if (executor != null && !executor.isShutdown()) {
+                logger.info("Polling already running (refCount=" + refs + ")");
+                return;
+            }
+            startExecutorLocked();
+            logger.info("Telemetry polling started at "
+                + (1000 / currentIntervalMs()) + " Hz (overlay="
+                + overlayRecordingActive + ", refCount=" + refs + ")");
         }
-        long interval = overlayRecordingActive ? POLL_INTERVAL_MS : SLOW_POLL_INTERVAL_MS;
-        executor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "TelemetryPoller");
-            t.setDaemon(true);
-            return t;
-        });
-        executor.scheduleAtFixedRate(this::poll, 0, interval, TimeUnit.MILLISECONDS);
-        logger.info("Telemetry polling started at " + (1000 / interval) + " Hz (overlay=" + overlayRecordingActive + ", refCount=" + refs + ")");
     }
 
     /**
@@ -219,29 +236,51 @@ public class TelemetryDataCollector {
      * When inactive, drops to 1Hz. Restarts the scheduler if the rate changes.
      */
     public void setOverlayRecordingActive(boolean active) {
-        if (this.overlayRecordingActive == active) return;
-        this.overlayRecordingActive = active;
-        logger.info("Overlay recording " + (active ? "ACTIVE (2Hz)" : "INACTIVE (1Hz)"));
-        // Restart scheduler at new rate if currently running
-        restartAtCurrentRate();
+        synchronized (pollingLock) {
+            if (this.overlayRecordingActive == active) return;
+            this.overlayRecordingActive = active;
+            logger.info("Overlay recording " + (active ? "ACTIVE (2Hz)" : "INACTIVE (1Hz)"));
+            // Restart scheduler at new rate if currently running
+            restartAtCurrentRateLocked();
+        }
     }
 
     /**
-     * Restarts the polling scheduler at the rate matching the current overlayRecordingActive state.
-     * No-op if the scheduler is not running.
+     * Restarts the polling scheduler at the rate matching the current
+     * overlayRecordingActive state. No-op if the scheduler is not running.
+     *
+     * <p>Caller MUST hold {@link #pollingLock}.
      */
-    private void restartAtCurrentRate() {
+    private void restartAtCurrentRateLocked() {
         if (executor == null || executor.isShutdown()) return;
         executor.shutdown();
         executor = null;
-        long interval = overlayRecordingActive ? POLL_INTERVAL_MS : SLOW_POLL_INTERVAL_MS;
+        startExecutorLocked();
+        logger.info("Telemetry polling restarted at " + (1000 / currentIntervalMs()) + " Hz");
+    }
+
+    /**
+     * Create the single-threaded scheduled executor and arm the poll task at
+     * the rate matching the current {@link #overlayRecordingActive} state.
+     *
+     * <p>Caller MUST hold {@link #pollingLock} and MUST have already ensured
+     * {@code executor} is null (or shut down) — this method overwrites it
+     * unconditionally. Centralising executor creation here is what makes the
+     * check-then-act in every lifecycle method race-free: only code holding
+     * the monitor can ever construct a "TelemetryPoller".
+     */
+    private void startExecutorLocked() {
+        long interval = currentIntervalMs();
         executor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "TelemetryPoller");
             t.setDaemon(true);
             return t;
         });
         executor.scheduleAtFixedRate(this::poll, 0, interval, TimeUnit.MILLISECONDS);
-        logger.info("Telemetry polling restarted at " + (1000 / interval) + " Hz");
+    }
+
+    private long currentIntervalMs() {
+        return overlayRecordingActive ? POLL_INTERVAL_MS : SLOW_POLL_INTERVAL_MS;
     }
 
     /**
@@ -249,36 +288,40 @@ public class TelemetryDataCollector {
      * If overlay recording was deactivated but other consumers remain, downgrades to 1Hz.
      */
     public void stopPolling() {
-        int refs = pollingRefCount.decrementAndGet();
-        if (refs < 0) {
-            pollingRefCount.set(0);
-            refs = 0;
-        }
-        if (refs > 0) {
-            logger.info("Polling stop requested but still needed (refCount=" + refs + ")");
-            // If overlay just stopped but trip recorder still needs polling, downgrade rate
-            if (!overlayRecordingActive) {
-                restartAtCurrentRate();
+        synchronized (pollingLock) {
+            int refs = pollingRefCount.decrementAndGet();
+            if (refs < 0) {
+                pollingRefCount.set(0);
+                refs = 0;
             }
-            return;
-        }
-        if (executor != null) {
-            executor.shutdown();
-            executor = null;
-            logger.info("Telemetry polling stopped (refCount=0)");
+            if (refs > 0) {
+                logger.info("Polling stop requested but still needed (refCount=" + refs + ")");
+                // If overlay just stopped but trip recorder still needs polling, downgrade rate
+                if (!overlayRecordingActive) {
+                    restartAtCurrentRateLocked();
+                }
+                return;
+            }
+            if (executor != null) {
+                executor.shutdown();
+                executor = null;
+                logger.info("Telemetry polling stopped (refCount=0)");
+            }
         }
     }
-    
+
     /**
      * Force stop polling regardless of reference count.
      * Used during daemon shutdown.
      */
     public void forceStopPolling() {
-        pollingRefCount.set(0);
-        if (executor != null) {
-            executor.shutdown();
-            executor = null;
-            logger.info("Telemetry polling force-stopped");
+        synchronized (pollingLock) {
+            pollingRefCount.set(0);
+            if (executor != null) {
+                executor.shutdown();
+                executor = null;
+                logger.info("Telemetry polling force-stopped");
+            }
         }
     }
 

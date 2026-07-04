@@ -157,6 +157,17 @@ public class PanoramicCameraGpu {
     private EGLCore eglCore;
     private android.opengl.EGLSurface dummySurface;  // Pbuffer for headless context
     private int cameraTextureId;
+    // CRASH FIX (cross-context use-after-free): the AI-lane GL thread (AiLaneGl,
+    // 2nd shared EGL context) samples cameraTextureId for readback/foveated while
+    // this render thread can rebind a new EGLImage onto the same id or free the
+    // prior gralloc buffer (consumeLatestImageAndBind / consumeSurfaceTextureFrame
+    // / releaseCameraConsumer). Sampling a freed/swapped backing buffer mid-readback
+    // faults the Adreno driver (SIGSEGV in libGLESv2_adreno). Both sides hold this
+    // monitor around their texture access; the AI lane (AiLaneGl.processOnce) also
+    // re-checks isCameraTextureValid() inside the lock + issues glFinish() before
+    // releasing, so the GPU sample completes before the encoder can recycle the
+    // buffer. See AiLaneGl.CameraState.cameraTextureLock()/isCameraTextureValid().
+    private final Object cameraTextureLock = new Object();
     // Camera consumer: ImageReader → AHardwareBuffer → EGLImage →
     // cameraTextureId. Bypasses SurfaceFlinger throttling that clamps the
     // SurfaceTexture path to ~8.5 fps on DiLink50 5.0UI builds (verified by
@@ -395,12 +406,40 @@ public class PanoramicCameraGpu {
 
     // Camera health monitor — detects stalled frames and triggers recovery
     private static final long FRAME_STALL_THRESHOLD_MS = 4000;  // 4 seconds without frames (HAL issue)
+    // Post-(re)open grace window. The BYD panoramic AVM HAL is documented (see
+    // the GL watchdog comment) to take ~5-8s to deliver the first frame after a
+    // camera open. Measured from lastCameraStartTime, the stall watchdog must not
+    // declare a frame stall inside this window — otherwise the 4s threshold trips
+    // before frame 1 can arrive and the camera is torn down and reopened in a loop
+    // that never escapes warmup (root cause of the sentry->drive recording blackout
+    // when ACC turns on while surveillance is still armed). 9s covers the worst-
+    // case 8s first-frame latency with margin while staying under the 10s GL-hang
+    // warmup timeout that bounds genuine deadlocks.
+    private static final long FRAME_STALL_WARMUP_GRACE_MS = 9000;
     // When native app is active, use a longer threshold to avoid false yields
     // from transient CPU/IO load. The HAL needs time to settle into sharing mode.
     private static final long FRAME_STALL_CONTENTION_THRESHOLD_MS = 3000;
     // Require consecutive stalls before yielding — a single stall could be transient
     private static final int CONTENTION_STALL_COUNT_TO_YIELD = 2;
     private volatile int consecutiveContentionStalls = 0;
+
+    // Escalation: count consecutive bare-reopen restarts that delivered ZERO
+    // frames. A bare close/reopen cannot recover a wedged AVM HAL co-consumer
+    // state (the sentry->drive blackout: 14 reopens, 0 frames, 2 min lost).
+    // Only a full teardown + com.byd.avc warmup recovers it. After this many
+    // back-to-back zero-frame reopens, escalate to the listener's warmup-routed
+    // restart instead of looping bare reopens forever. Incremented in
+    // restartCameraAfterError when the prior open never produced a frame;
+    // reset to 0 the moment a real frame arrives.
+    private static final int FRAME_STALL_RESTART_ESCALATE_THRESHOLD = 3;
+    private volatile int consecutiveZeroFrameRestarts = 0;
+    // Snapshot of frameCounter at the start of the current open. If frameCounter
+    // hasn't advanced past this by the next restart, that open delivered nothing.
+    private volatile long frameCounterAtOpen = 0;
+    // Set true while an escalation is in flight so the watchdog stops posting
+    // bare restartCameraAfterError() until the warmup-routed recovery completes
+    // (and resets it via notePipelineRestarted()).
+    private volatile boolean halRecoveryEscalated = false;
     
     // Flag to indicate camera restart is in progress — watchdog uses extended timeout.
     // P1 #11: AtomicBoolean so concurrent restartCameraAfterError + reopenCamera
@@ -415,6 +454,18 @@ public class PanoramicCameraGpu {
         void onPreYield();
         /** Called AFTER camera is re-acquired. Resume recording if needed. */
         void onPostReacquire();
+        /**
+         * Called when bare close/reopen restarts have repeatedly failed to
+         * revive frame delivery (FRAME_STALL_RESTART_ESCALATE_THRESHOLD
+         * consecutive reopens with zero frames). A bare reopen cannot recover
+         * a wedged AVM HAL co-consumer state — only a full pipeline teardown +
+         * com.byd.avc warmup can (observed empirically: the only thing that
+         * ever broke the sentry->drive reopen-loop blackout). The listener
+         * should route through its warmup-capable restart path
+         * (RecordingModeManager.activateModeWithWarmup-equivalent). Default
+         * no-op so existing listeners stay source-compatible.
+         */
+        default void onHalRecoveryNeeded() {}
     }
     private CameraYieldListener yieldListener;
     
@@ -760,6 +811,14 @@ public class PanoramicCameraGpu {
         final AiLaneGl.CameraState aiCameraState = new AiLaneGl.CameraState() {
             @Override public int getCameraTextureId() { return cameraTextureId; }
             @Override public long getFrameSeq()      { return cameraFrameSeq.get(); }
+            // Crash-fix: the AI lane must NOT sample the camera texture while the
+            // camera is yielded/closed/restarting (its backing EGLImage is being
+            // freed/swapped). cameraYielded / cameraObj==null / restartInProgress
+            // are all volatile/atomic — safe to read cross-thread.
+            @Override public boolean isCameraTextureValid() {
+                return !(cameraYielded || cameraObj == null || restartInProgress.get());
+            }
+            @Override public Object cameraTextureLock() { return cameraTextureLock; }
         };
 
         if (sentry != null) {
@@ -1492,6 +1551,14 @@ public class PanoramicCameraGpu {
 
     /** Idempotent teardown of whichever consumer is active. */
     private void releaseCameraConsumer() {
+        // Crash-fix (gap-closer): this runs on the GL render thread via
+        // recreateCameraSurface during live reacquire/auto-probe/restart while the
+        // AI lane is STILL alive — freeing the bound gralloc / releasing the
+        // SurfaceTexture here can race an in-flight AI-lane sample exactly like the
+        // rebind path. Hold cameraTextureLock across BOTH buffer-free sites (the
+        // top releasePreviousBoundImage AND the SurfaceTexture.release). Harmless
+        // when reached from releaseGl (AI lane already shut down there).
+        synchronized (cameraTextureLock) {
         // Release the held Image + HardwareBuffer FIRST so the gralloc slots
         // go back to the ImageReader pool before we close the reader.
         releasePreviousBoundImage();
@@ -1507,6 +1574,7 @@ public class PanoramicCameraGpu {
             try { cameraSurfaceTexture.setOnFrameAvailableListener(null); } catch (Throwable ignored) {}
             try { cameraSurfaceTexture.release(); } catch (Throwable ignored) {}
             cameraSurfaceTexture = null;
+        }
         }
         stFramePending = false;
         // Reset to identity so a stale matrix from the previous camera
@@ -1657,7 +1725,10 @@ public class PanoramicCameraGpu {
 
         cameraYielded = false;
         lastCameraStartTime = System.currentTimeMillis();
-        logger.info("Camera started (" + width + "x" + height + 
+        // Snapshot the frame counter at this open so the next restart can tell
+        // whether THIS open ever delivered a frame (zero-frame-reopen escalation).
+        frameCounterAtOpen = frameCounter;
+        logger.info("Camera started (" + width + "x" + height +
             ", id=" + cameraId + ", surfaceMode=" + cameraSurfaceMode + ")");
         
         // Update coordinator with actual camera ID
@@ -1933,19 +2004,24 @@ public class PanoramicCameraGpu {
                 irBindFailCount++;
                 return false;
             }
-            boolean bound = HardwareBufferTextureBinder
-                .bindHardwareBufferToTextureNative(hwBuffer, cameraTextureId);
-            if (!bound) {
-                logger.warn("bindHardwareBufferToTexture failed — dropping frame");
-                irBindFailCount++;
-                return false;
+            // Crash-fix: hold cameraTextureLock across the rebind + prev-buffer
+            // free so the AI lane cannot be mid-sampling the OLD backing buffer
+            // when we swap the EGLImage / free the gralloc it points at.
+            synchronized (cameraTextureLock) {
+                boolean bound = HardwareBufferTextureBinder
+                    .bindHardwareBufferToTextureNative(hwBuffer, cameraTextureId);
+                if (!bound) {
+                    logger.warn("bindHardwareBufferToTexture failed — dropping frame");
+                    irBindFailCount++;
+                    return false;
+                }
+                // Bind succeeded. NOW it's safe to release the previous image —
+                // the texture is no longer pointing at it.
+                releasePreviousBoundImage();
+                // Transfer ownership of this image+hwBuffer into the held slots.
+                currentBoundImage = image;
+                currentBoundHwBuffer = hwBuffer;
             }
-            // Bind succeeded. NOW it's safe to release the previous image —
-            // the texture is no longer pointing at it.
-            releasePreviousBoundImage();
-            // Transfer ownership of this image+hwBuffer into the held slots.
-            currentBoundImage = image;
-            currentBoundHwBuffer = hwBuffer;
             // Resolve the per-frame PTS. The BYD DiLink HAL on the PRIVATE
             // ImageReader path returns a stuck, different-epoch value for
             // Image.getTimestamp(), so nextFrameTimestampNs() ignores it and
@@ -1993,7 +2069,12 @@ public class PanoramicCameraGpu {
         SurfaceTexture st = cameraSurfaceTexture;
         if (st == null) return false;
         try {
-            st.updateTexImage();
+            // Crash-fix: updateTexImage swaps the backing EGLImage of
+            // cameraTextureId; hold cameraTextureLock so the AI lane isn't
+            // mid-sampling the prior buffer when it's recycled.
+            synchronized (cameraTextureLock) {
+                st.updateTexImage();
+            }
         } catch (IllegalStateException e) {
             // The BYD HAL can abandon the BufferQueue asynchronously (gear
             // transitions, AVM open/close). updateTexImage then throws ISE —
@@ -2529,6 +2610,7 @@ public class PanoramicCameraGpu {
             lastFrameTime = System.currentTimeMillis();
             firstFrameReceived = true;
             consecutiveContentionStalls = 0;  // Frames flowing — clear stall counter
+            consecutiveZeroFrameRestarts = 0; // Real frame arrived — reopen succeeded; clear escalation counter
             
             // SOTA: Full-matrix auto-probe at frame 15 (~2 sec).
             // Sweeps camera IDs 0-5 × surface modes 0-5 to find the first
@@ -3305,7 +3387,34 @@ public class PanoramicCameraGpu {
                             ? FRAME_STALL_CONTENTION_THRESHOLD_MS 
                             : FRAME_STALL_THRESHOLD_MS;
                         
-                        if (timeSinceFrame > stallThreshold) {
+                        // Post-(re)open warmup grace. The BYD AVM HAL takes ~5-8s
+                        // to deliver the first frame after any camera open (see GL
+                        // watchdog comment). The 4s stall threshold otherwise trips
+                        // before frame 1 can arrive — tearing the camera down and
+                        // reopening it in a loop that never escapes warmup (the
+                        // sentry->drive recording-blackout root cause when ACC turns
+                        // on while surveillance is still armed). Suppress the stall
+                        // until the grace window (measured from the most recent open)
+                        // elapses. lastFrameTime is deliberately NOT reset here: if
+                        // the HAL is genuinely dead, timeSinceFrame keeps growing and
+                        // the real stall path fires on the first tick past the grace
+                        // window instead of being perpetually re-deferred.
+                        long timeSinceCameraStart = lastCameraStartTime > 0
+                                ? now - lastCameraStartTime
+                                : Long.MAX_VALUE;
+                        if (timeSinceFrame > stallThreshold && halRecoveryEscalated) {
+                            // A warmup-routed recovery (onHalRecoveryNeeded) is in
+                            // flight. Don't post bare restarts on top of it — the
+                            // pipeline clears this latch via notePipelineRestarted()
+                            // once its full teardown + warmup restart completes.
+                            logger.info("Frame stall while HAL-recovery escalation in flight — "
+                                + "deferring to warmup-routed restart.");
+                        } else if (timeSinceFrame > stallThreshold
+                                && timeSinceCameraStart < FRAME_STALL_WARMUP_GRACE_MS) {
+                            logger.info("Frame stall suppressed — within post-open warmup grace ("
+                                + timeSinceCameraStart + "ms < " + FRAME_STALL_WARMUP_GRACE_MS
+                                + "ms; BYD HAL first-frame latency is 5-8s). Not restarting yet.");
+                        } else if (timeSinceFrame > stallThreshold) {
                             logger.warn("FRAME STALL: No frames for " + timeSinceFrame + "ms" +
                                 (nativeActive ? " (native app active)" : ""));
                             // Reset lastFrameTime to prevent repeated triggers
@@ -3810,6 +3919,64 @@ public class PanoramicCameraGpu {
             logger.info("Restart already in progress — skipping restartCameraAfterError");
             return;
         }
+
+        // RE-ENTRY GUARD: once we've escalated to the warmup-routed restart, that
+        // path released restartInProgress (below) so its own close/open isn't
+        // blocked — but it now OWNS the camera teardown on its worker thread
+        // (forceWarmupRestart → pipeline.stop() → camera.stop() → closeCamera).
+        // onCameraError is NOT gated on halRecoveryEscalated, so a fresh error
+        // could re-enter here, win the CAS, and fall through to a BARE
+        // close/reopen concurrent with that teardown — redundant HAL churn that
+        // can re-grab the wedged slot and perturb the warmup recovery. Bail out
+        // until notePipelineRestarted() clears the flag when warmup completes.
+        if (halRecoveryEscalated) {
+            logger.info("Restart skipped — HAL-recovery warmup restart in flight (owns camera teardown)");
+            restartInProgress.set(false);
+            return;
+        }
+
+        // ESCALATION (#3): a bare close/reopen cannot recover a wedged AVM HAL
+        // co-consumer state. Empirically the sentry->drive blackout looped 14
+        // bare reopens over 2 min with ZERO frames; only a full pipeline
+        // teardown + com.byd.avc warmup recovered it. Detect that loop here: if
+        // the PREVIOUS open produced no frames (frameCounter didn't advance past
+        // the snapshot taken at its open), count it; once we've stacked
+        // FRAME_STALL_RESTART_ESCALATE_THRESHOLD consecutive zero-frame reopens,
+        // stop looping and hand off to the listener's warmup-routed restart.
+        boolean priorOpenDeliveredNoFrame = (frameCounter == frameCounterAtOpen);
+        if (priorOpenDeliveredNoFrame) {
+            consecutiveZeroFrameRestarts++;
+        } else {
+            consecutiveZeroFrameRestarts = 0;
+        }
+        if (consecutiveZeroFrameRestarts >= FRAME_STALL_RESTART_ESCALATE_THRESHOLD
+                && yieldListener != null && !halRecoveryEscalated) {
+            halRecoveryEscalated = true;
+            logger.error("Frame-stall restart loop: " + consecutiveZeroFrameRestarts
+                + " consecutive reopens delivered ZERO frames — bare reopen cannot "
+                + "recover a wedged AVM HAL. Escalating to warmup-routed full restart.");
+            // Release the CAS so the warmup-routed restart (which does its own
+            // close/open) isn't blocked by our in-flight flag, then hand off.
+            restartInProgress.set(false);
+            try {
+                yieldListener.onHalRecoveryNeeded();
+            } catch (Throwable t) {
+                // The handler normally spawns a thread whose finally calls
+                // notePipelineRestarted() to clear this latch. If the dispatch
+                // itself throws (e.g. Thread.start() OOM/EAGAIN), that finally
+                // never runs and the latch would stick true forever — the stall
+                // watchdog's defer branch would then permanently suppress all
+                // bare restarts (drive-long blackout). Since a throw here means
+                // NO recovery is in flight, clear the latch so the watchdog can
+                // retry on the next stall tick. Defense-in-depth; the normal
+                // path still clears it via notePipelineRestarted().
+                halRecoveryEscalated = false;
+                logger.warn("onHalRecoveryNeeded() threw: " + t.getMessage()
+                    + " — cleared halRecoveryEscalated so stall watchdog can retry");
+            }
+            return;
+        }
+
         logger.info("Restarting camera after error/stall...");
 
         // audit avc-yield (round 3, finding 9): a stickily-true coordinator
@@ -3943,7 +4110,18 @@ public class PanoramicCameraGpu {
             
             // Update heartbeat after successful open
             lastGlThreadHeartbeat = System.currentTimeMillis();
-            
+
+            // Reset the frame-stall clock to the reopen instant. Otherwise the
+            // stall watchdog measures timeSinceFrame from the LAST pre-restart
+            // frame, so it re-declares a stall within ~1 tick of this reopen
+            // (the 4s threshold was already exceeded before we got here) and
+            // tears the fresh camera straight back down — the unbreakable
+            // reopen loop. Pairing this with the post-open warmup grace
+            // (FRAME_STALL_WARMUP_GRACE_MS) gives the BYD HAL its full 5-8s
+            // first-frame latency before any stall can fire again. startCamera
+            // already set lastCameraStartTime; align lastFrameTime to it.
+            lastFrameTime = System.currentTimeMillis();
+
             // Restart encoder drainer now that camera is open again
             if (encoder != null) {
                 encoder.restartDrainerAfterCameraClose();
@@ -4154,6 +4332,15 @@ public class PanoramicCameraGpu {
             // Reset heartbeat after a successful reopen so the next watchdog
             // tick measures from a known-good baseline.
             lastGlThreadHeartbeat = System.currentTimeMillis();
+            // Reset the frame-stall clock to the reopen instant too — same
+            // reason as restartCameraAfterError: this is the ACC-ON
+            // surveillance->drive reopen, after which lastFrameTime still
+            // points at the last sentry-era frame. Without this, the stall
+            // watchdog fires within ~1 tick and the just-reopened camera is
+            // torn down before its 5-8s first-frame warmup can complete
+            // (the recording-blackout reopen loop). startCamera set
+            // lastCameraStartTime; align lastFrameTime to it.
+            lastFrameTime = System.currentTimeMillis();
             logger.info("Camera reopened successfully");
 
         } catch (Exception e) {
@@ -4629,6 +4816,18 @@ public class PanoramicCameraGpu {
      */
     public void setCameraYieldListener(CameraYieldListener listener) {
         this.yieldListener = listener;
+    }
+
+    /**
+     * Clears the zero-frame-reopen escalation latch. The pipeline MUST call
+     * this after it has handled onHalRecoveryNeeded() (i.e. performed its
+     * warmup-routed restart), so a later independent HAL wedge in the same
+     * drive can escalate again instead of being permanently suppressed.
+     * Also resets the zero-frame counter — the warmup restart is a fresh start.
+     */
+    public void notePipelineRestarted() {
+        consecutiveZeroFrameRestarts = 0;
+        halRecoveryEscalated = false;
     }
     
     /**

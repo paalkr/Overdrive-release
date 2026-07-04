@@ -137,7 +137,7 @@
         }
     }
 
-    async function postSubscription(sub) {
+    async function postSubscription(sub, opts) {
         var json = sub.toJSON();
         var label = inferLabel();
         var body = {
@@ -145,11 +145,24 @@
             keys: json.keys,
             label: label
         };
+        // Force-flag: only set when the user explicitly clicks "Enable" or
+        // "Re-enable on this device". Without it, the server tombstone
+        // window blocks silent re-creates that the user just removed.
+        if (opts && opts.force) body.force = true;
         var r = await authedFetch('/api/push/subscribe', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
+        if (r.status === 410) {
+            // Server has a fresh tombstone for this id. Surface it as a
+            // distinct error type so the silent self-heal can also drop the
+            // browser-side subscription (otherwise we'd loop: server says
+            // "no", browser still has live sub, next page load tries again).
+            var err = new Error('subscribe POST 410 (tombstoned)');
+            err.tombstoned = true;
+            throw err;
+        }
         if (!r.ok) throw new Error('subscribe POST ' + r.status);
         return r.json();
     }
@@ -263,7 +276,22 @@
                     // would throw AbortError silently and leave the user
                     // in "permission granted, no sub" state forever.
                     var sub = await ensureSubscription(reg, meta.vapidPublicKey);
-                    await postSubscription(sub);
+                    try {
+                        await postSubscription(sub);
+                    } catch (e) {
+                        if (e && e.tombstoned) {
+                            // Server explicitly says "user removed this; do
+                            // not auto-resubscribe." Drop the local push
+                            // subscription so we stop generating live tokens
+                            // tied to a forgotten id. Without this, every
+                            // page load would round-trip to the server and
+                            // get a 410 forever until the tombstone expires.
+                            log('silent resubscribe blocked by server tombstone — dropping local subscription');
+                            try { await sub.unsubscribe(); } catch (_) {}
+                            return;
+                        }
+                        throw e;
+                    }
                     log('silent resubscribe complete');
                 });
             } catch (e) {
@@ -316,7 +344,11 @@
                     return { ok: false, reason: 'subscribe-failed', error: errString(e) };
                 }
                 try {
-                    var resp = await postSubscription(sub);
+                    // User-driven Enable click — force past any server-side
+                    // tombstone left by a recent Remove. Without force=true
+                    // a user who immediately re-enables would get 410 and
+                    // be stuck for 30 minutes.
+                    var resp = await postSubscription(sub, { force: true });
                     return { ok: true, id: resp.id };
                 } catch (e) {
                     return { ok: false, reason: 'register-failed', error: errString(e) };

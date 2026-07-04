@@ -419,10 +419,30 @@ public class GpuPipelineConfig {
      *   2. The current RecordingQuality tier resolved against the active codec.
      */
     public int getEffectiveBitrate() {
+        return getEffectiveBitrateForQuality(recordingQuality);
+    }
+
+    /**
+     * Gets the effective bitrate (bps) for an EXPLICIT quality tier, applying
+     * the same precedence as {@link #getEffectiveBitrate()}:
+     *   1. customBitrate if explicitly set (>0) — AdaptiveBitrate controller's
+     *      thermal/network scaling. This ALWAYS wins, for both the ACC-on and
+     *      ACC-off (surveillance) flows, so a thermal throttle is never
+     *      overridden by a per-mode tier.
+     *   2. The supplied tier resolved against the active (shared) codec.
+     *
+     * <p>Used by the surveillance flow to resolve the ACC-off tier
+     * (recording.surveillanceQuality) without disturbing the ACC-on
+     * recordingQuality field. {@code quality} must be non-null; a null (e.g. a
+     * failed enum parse upstream) falls back to the configured recordingQuality
+     * so the caller can never accidentally zero the bitrate.
+     */
+    public int getEffectiveBitrateForQuality(RecordingQuality quality) {
         if (customBitrate > 0) {
             return customBitrate;
         }
-        return recordingQuality.getBitrateForCodec(videoCodec);
+        RecordingQuality q = (quality != null) ? quality : recordingQuality;
+        return q.getBitrateForCodec(videoCodec);
     }
     
     /**

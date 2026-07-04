@@ -1228,6 +1228,7 @@
     <string name="roadsense_map_search_action">Искать</string>
     <string name="roadsense_map_searching">Поиск…</string>
     <string name="roadsense_map_no_results">Места отсутствуют</string>
+    <string name="roadsense_map_search_network">Не удалось подключиться к службе поиска. Проверьте соединение или прокси и повторите попытку.</string>
     <string name="roadsense_map_pick_destination">Выберите место назначения</string>
     <string name="roadsense_map_routing">Поиск маршрута…</string>
     <string name="roadsense_map_route_failed">Не удалось найти маршрут. Попробуйте еще раз.</string>

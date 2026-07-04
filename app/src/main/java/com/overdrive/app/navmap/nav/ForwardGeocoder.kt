@@ -1,37 +1,105 @@
 package com.overdrive.app.navmap.nav
 
 import android.util.Log
+import com.overdrive.app.navmap.NavMapConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
  * Forward geocoder (free-text place name -> coordinates) for the RoadSense map
  * search box.
  *
- * <p>Primary provider is **Photon** (Komoot, OSM-backed, free, autocomplete-
- * friendly); on empty/error it falls back to **Nominatim**. Both are public
- * OSM services reached over the open internet from the app process — via
- * [MapNetworking] so the calls are PROXY-AWARE (sing-box / Tailscale) and
- * LANGUAGE-AWARE (results in the user's chosen app language). Per OSM usage
- * policy a descriptive `User-Agent` is sent (added by [MapNetworking.builder]).
+ * <p>Resolution order, best-coverage-first, each step degrading gracefully to
+ * the next so the search box NEVER gets worse than today:
+ *
+ * <ol>
+ *   <li><b>Smart input (offline, no network)</b> — [CoordinateInputParser]
+ *       resolves raw `lat,lng`, Plus Codes, and pasted map-share URLs directly.
+ *       This is the "reach-any-place" path: it works even for places no geocoder
+ *       has, because the user already supplied the coordinate. On submit
+ *       ([search]) it ALSO expands shortened Google links (`maps.app.goo.gl`,
+ *       `goo.gl/maps`) by following the redirect over the proxy-aware client.</li>
+ *   <li><b>Stadia Maps geocoding (BYOK)</b> — when the user's routing endpoint is
+ *       a Stadia host and a routing key is configured (the common case, since the
+ *       default routing provider IS Stadia), the SAME key authenticates Stadia's
+ *       Pelias geocoder. Better addressing / ranking / typo-tolerance than the
+ *       public OSM services, at zero extra config. See [NavMapConfig].</li>
+ *   <li><b>Photon</b> (Komoot, OSM-backed, free, autocomplete-friendly).</li>
+ *   <li><b>Nominatim</b> (submit only — public policy forbids per-keystroke).</li>
+ * </ol>
+ *
+ * <p>All network providers reach public OSM/Stadia services over the open
+ * internet via [MapNetworking] so the calls are PROXY-AWARE (sing-box /
+ * Tailscale) and LANGUAGE-AWARE (results in the user's chosen app language). Per
+ * OSM usage policy a descriptive `User-Agent` is sent (added by
+ * [MapNetworking.builder]).
  *
  * <p>Semantics mirror [com.overdrive.app.navmap.RoadSenseHazardApiClient]:
  * lazy OkHttp client, all methods SYNC (the Activity runs them off the UI
  * thread), and NEVER throwing — any failure returns an empty list so the
- * search box degrades gracefully. Search-on-submit is the intended usage
- * (this is not wired to per-keystroke calls).
+ * search box degrades gracefully.
  */
 object ForwardGeocoder {
 
     private const val TAG = "ForwardGeocoder"
 
+    /**
+     * Why the LAST [search] returned no result, so the caller can show a SPECIFIC message
+     * instead of a flat "No places found" (which is indistinguishable from a genuine
+     * zero-hit query — the symptom that made a network/proxy failure read as "search never
+     * works"). Mirrors [ValhallaRouteClient.lastError].
+     *   NONE     — last search SUCCEEDED (≥1 result) / never run
+     *   TIMEOUT  — a provider connect/read timed out (slow network or proxy hop)
+     *   NETWORK  — other transport failure (DNS / connection reset / proxy down / blocked host)
+     *   EMPTY    — every provider responded but none had a hit (a real zero-result query)
+     * Best-effort + @Volatile (one foreground submit at a time, like ValhallaRouteClient).
+     */
+    enum class SearchError { NONE, TIMEOUT, NETWORK, EMPTY }
+
+    @Volatile
+    var lastError: SearchError = SearchError.NONE
+        private set
+
+    /** Set the transport error if NONE yet recorded for this search (don't downgrade a
+     *  TIMEOUT to NETWORK or clobber an earlier provider's classification). */
+    private fun noteTransportFailure(t: Throwable) {
+        if (lastError == SearchError.NONE || lastError == SearchError.EMPTY) {
+            lastError = if (t is java.net.SocketTimeoutException ||
+                (t.message?.contains("timeout", ignoreCase = true) == true)
+            ) SearchError.TIMEOUT else SearchError.NETWORK
+        }
+    }
+
+    /** True once a TRANSPORT failure (not an HTTP non-2xx / clean-empty) has been recorded
+     *  for the in-flight search — [search] short-circuits the remaining providers then, so a
+     *  dead network path doesn't serialize three ~12 s provider waits (~36 s) before failing. */
+    private fun hadTransportFailure(): Boolean =
+        lastError == SearchError.TIMEOUT || lastError == SearchError.NETWORK
+
     private const val PHOTON_BASE = "https://photon.komoot.io/api/"
     private const val PHOTON_REVERSE_BASE = "https://photon.komoot.io/reverse"
     private const val NOMINATIM_BASE = "https://nominatim.openstreetmap.org/search"
+
+    /** Stadia geocoding paths (autocomplete is v2; forward search is v1). */
+    private const val STADIA_AUTOCOMPLETE_PATH = "/geocoding/v2/autocomplete"
+    private const val STADIA_SEARCH_PATH = "/geocoding/v1/search"
+
+    /** Hosts we recognise as Stadia (so a generic-BYOK endpoint elsewhere is NOT
+     *  sent our key, and an EU customer keeps traffic on the EU host). */
+    private val STADIA_HOSTS = setOf("api.stadiamaps.com", "api-eu.stadiamaps.com")
+
+    /**
+     * Photon focus-bias strength (0..1+). Photon already accepts a `lat`/`lon`
+     * focus point but, without this, the bias is weak; ~0.4 meaningfully pulls
+     * nearby matches up the ranking without drowning a strong far-away match.
+     */
+    private const val PHOTON_BIAS_SCALE = "0.4"
 
     /** Required by OSM usage policy (identifies the client). */
     private const val USER_AGENT = MapNetworking.USER_AGENT
@@ -53,6 +121,15 @@ object ForwardGeocoder {
             .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(12, TimeUnit.SECONDS)
             .writeTimeout(8, TimeUnit.SECONDS)
+            // Hard ceiling on the WHOLE call incl. redirects. The per-connect/read
+            // timeouts bound ONE hop, but expandShortLink() follows OkHttp's default
+            // redirect chain (up to ~20 hops) — without a callTimeout an adversarial /
+            // slow chain could stack 20×(connect+read) and tie up the submit path for
+            // minutes. Sized ABOVE one full slow-proxy hop (connect 8s + read 12s = 20s)
+            // so it never clips a single valid-but-slow geocode/route GET through the
+            // sing-box CONNECT handshake, while still bounding the redirect stack to a
+            // couple of hops (a normal share-link expand is one or two fast 30x hops).
+            .callTimeout(24, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
             .build()
     }
@@ -60,9 +137,10 @@ object ForwardGeocoder {
     /**
      * Forward-geocode [query], returning up to [limit] results best-first.
      *
-     * <p>Tries Photon first; if Photon yields no results (or errors), falls
-     * back to Nominatim. Never throws — returns an empty list on any failure
-     * or for a blank query.
+     * <p>Order: offline smart-input (coords / Plus Code / map URL, incl. short-link
+     * expansion) → Stadia (if BYOK key on a Stadia endpoint) → Photon → Nominatim.
+     * Each step falls through to the next on empty/error. Never throws — returns an
+     * empty list on any failure or for a blank query.
      *
      * @param query the free-text place/address to search (e.g. "Eiffel Tower")
      * @param limit maximum number of results to return (default 5)
@@ -80,19 +158,55 @@ object ForwardGeocoder {
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
         val n = if (limit < 1) 1 else limit
+        // Reset the per-search error; providers set it via noteTransportFailure on a
+        // transport throw. A clean all-empty walk finalizes to EMPTY at the end.
+        lastError = SearchError.NONE
 
+        // 1) Offline smart-input — exact coordinate the user already supplied.
+        CoordinateInputParser.parse(q, focusLat, focusLng)?.let { return listOf(it) }
+        // 1b) Submit-only: a shortened share link needs a redirect to reveal coords.
+        if (looksLikeShortLink(q)) {
+            expandShortLink(q)?.let { expanded ->
+                CoordinateInputParser.parse(expanded, focusLat, focusLng)?.let { return listOf(it) }
+            }
+        }
+
+        // 2) Stadia geocoding (reuses the routing BYOK key when the endpoint is Stadia).
+        stadiaCreds()?.let { (base, key) ->
+            val stadia = searchStadia(base, key, q, n, focusLat, focusLng)
+            if (stadia.isNotEmpty()) return stadia
+        }
+        // FAST-FAIL: if Stadia hit a TRANSPORT failure (timeout/network — e.g. the proxy
+        // can't reach the host), don't serialize Photon(≤12s)+Nominatim(≤12s) behind it —
+        // the same network path will fail too. Surface the transport error now instead of
+        // a ~36 s hang ending in "No places found". (An HTTP non-2xx / clean-empty from
+        // Stadia does NOT set the flag, so a Stadia key/quota issue still falls through.)
+        if (hadTransportFailure()) return emptyList()
+
+        // 3) Photon, then 4) Nominatim — unchanged public-OSM fallbacks.
         val photon = searchPhoton(q, n, focusLat, focusLng)
         if (photon.isNotEmpty()) return photon
+        if (hadTransportFailure()) return emptyList()
 
-        return searchNominatim(q, n)
+        val nominatim = searchNominatim(q, n)
+        if (nominatim.isNotEmpty()) return nominatim
+
+        // Every provider responded (or had a non-transport miss) but none had a hit, and no
+        // transport failure was recorded → a genuine zero-result query. Mark EMPTY so the
+        // caller shows "No places found" rather than a network message.
+        if (!hadTransportFailure()) lastError = SearchError.EMPTY
+        return emptyList()
     }
 
     /**
-     * Type-ahead autocomplete for the search box — Photon ONLY (never Nominatim).
-     * Photon is purpose-built for "search as you type" with typo tolerance; the
-     * public Nominatim instance forbids per-keystroke querying, so the autocomplete
-     * path must not touch it. The Activity calls this on a debounce (~300ms) with
-     * in-flight cancellation; this method stays SYNC + never-throws like the rest.
+     * Type-ahead autocomplete for the search box. Offline smart-input first (so a
+     * pasted coordinate / Plus Code / full map URL resolves with no network), then
+     * Stadia autocomplete when configured, else Photon — **never Nominatim**
+     * (Photon is purpose-built for "search as you type"; the public Nominatim
+     * instance forbids per-keystroke querying). The Activity calls this on a
+     * debounce (~300ms) with in-flight cancellation; this method stays SYNC +
+     * never-throws like the rest. Short-link expansion is NOT done here (it needs
+     * a network round-trip per keystroke) — that happens on submit in [search].
      *
      * @param query partial text typed so far
      * @param limit max suggestions (default 6 — a Gmap-style short list)
@@ -106,7 +220,138 @@ object ForwardGeocoder {
     ): List<SearchResult> {
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
-        return searchPhoton(q, if (limit < 1) 1 else limit, focusLat, focusLng)
+        val n = if (limit < 1) 1 else limit
+
+        CoordinateInputParser.parse(q, focusLat, focusLng)?.let { return listOf(it) }
+
+        stadiaCreds()?.let { (base, key) ->
+            val stadia = stadiaAutocomplete(base, key, q, n, focusLat, focusLng)
+            if (stadia.isNotEmpty()) return stadia
+        }
+        return searchPhoton(q, n, focusLat, focusLng)
+    }
+
+    // ── Stadia Maps (BYOK Pelias geocoder) ───────────────────────────────────
+
+    /**
+     * Resolve the Stadia geocoding base + key from the routing BYOK config, or
+     * null if not usable. Usable ONLY when a routing key is set AND the configured
+     * routing endpoint is a recognised Stadia host — generic BYOK lets the user
+     * point routing at any Valhalla provider, and we must not send their key to
+     * Stadia geocoding (it wouldn't work, and shouldn't be sent) unless it IS a
+     * Stadia account. EU customers keep their host (api-eu.stadiamaps.com).
+     */
+    private fun stadiaCreds(): Pair<String, String>? {
+        return try {
+            val cfg = NavMapConfig.fromUnifiedConfig()
+            val key = cfg.routingApiKey
+            if (key.isEmpty()) return null
+            // URI(...).host is null for a scheme-less endpoint ("api.stadiamaps.com/..."),
+            // which a user may paste. Re-parse with a "//" authority prefix in that case so
+            // a scheme-less Stadia endpoint still resolves its host (and Stadia geocoding
+            // still activates) instead of silently falling through to Photon.
+            val ep = cfg.routingEndpoint
+            val host = (URI(ep).host ?: URI("//" + ep).host)?.lowercase(Locale.US) ?: return null
+            if (host !in STADIA_HOSTS) return null
+            Pair("https://$host", key)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** Stadia forward search (`/geocoding/v1/search`). Never throws. */
+    internal fun searchStadia(
+        base: String, key: String, query: String, limit: Int,
+        focusLat: Double?, focusLng: Double?
+    ): List<SearchResult> = stadiaGet(
+        buildStadiaUrl(base + STADIA_SEARCH_PATH, key, query, limit, focusLat, focusLng), "search"
+    )
+
+    /** Stadia autocomplete (`/geocoding/v2/autocomplete`). Never throws. */
+    internal fun stadiaAutocomplete(
+        base: String, key: String, query: String, limit: Int,
+        focusLat: Double?, focusLng: Double?
+    ): List<SearchResult> = stadiaGet(
+        buildStadiaUrl(base + STADIA_AUTOCOMPLETE_PATH, key, query, limit, focusLat, focusLng), "autocomplete"
+    )
+
+    /**
+     * Build a Stadia geocoding URL. Stadia/Pelias param names DIFFER from Photon:
+     * `text` (not `q`), `focus.point.lat`/`focus.point.lon` (not `lat`/`lon`),
+     * `size` (not `limit`), `lang`. Pure function — exposed for unit testing.
+     */
+    internal fun buildStadiaUrl(
+        endpoint: String, key: String, query: String, limit: Int,
+        focusLat: Double?, focusLng: Double?
+    ): String {
+        val sb = StringBuilder(endpoint)
+            .append("?text=").append(enc(query))
+            .append("&size=").append(if (limit < 1) 1 else limit)
+            .append("&lang=").append(enc(MapNetworking.lang))
+        if (focusLat != null && focusLng != null) {
+            sb.append("&focus.point.lat=").append(focusLat)
+                .append("&focus.point.lon=").append(focusLng)
+        }
+        sb.append("&api_key=").append(enc(key))
+        return sb.toString()
+    }
+
+    /** Execute a Stadia GeoJSON GET and parse it (same FeatureCollection shape as Photon). */
+    private fun stadiaGet(url: String, tag: String): List<SearchResult> {
+        return try {
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept-Language", MapNetworking.acceptLanguage)
+                .get()
+                .build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    // 401/403 = wrong/expired key, 429 = quota — just fall through to
+                    // Photon; the routing path already surfaces a key problem to the user.
+                    Log.w(TAG, "Stadia $tag -> HTTP ${resp.code}")
+                    return emptyList()
+                }
+                val bodyStr = resp.body?.string() ?: return emptyList()
+                parsePhoton(bodyStr)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Stadia $tag failed: ${t.message}")
+            noteTransportFailure(t)
+            emptyList()
+        }
+    }
+
+    // ── Short-link expansion (submit only) ───────────────────────────────────
+
+    /** True for shortened Google Maps links that hide their coordinates behind a redirect. */
+    internal fun looksLikeShortLink(s: String): Boolean {
+        val l = s.lowercase(Locale.US)
+        return l.contains("maps.app.goo.gl") || l.contains("goo.gl/maps")
+    }
+
+    /**
+     * Follow a shortened share link's redirect(s) and return the FINAL expanded
+     * URL (which carries the real `@lat,lng` / `!3d!4d` coordinates), or null. Uses
+     * the proxy-aware client so it works behind sing-box/Tailscale. OkHttp follows
+     * redirects by default, so the final [okhttp3.Response.request] URL is the
+     * destination; we don't need the body. Never throws.
+     */
+    private fun expandShortLink(shortUrl: String): String? {
+        return try {
+            val req = Request.Builder()
+                .url(shortUrl)
+                .header("User-Agent", USER_AGENT)
+                .get()
+                .build()
+            http.newCall(req).execute().use { resp ->
+                // The final request URL after following redirects is the expanded link.
+                resp.request.url.toString()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "expandShortLink failed: ${t.message}")
+            null
+        }
     }
 
     /**
@@ -132,6 +377,9 @@ object ForwardGeocoder {
                 .append("&lang=").append(enc(MapNetworking.lang))
             if (focusLat != null && focusLng != null) {
                 sb.append("&lat=").append(focusLat).append("&lon=").append(focusLng)
+                    // Strengthen the focus bias so nearby matches rank above distant
+                    // same-name places (Photon's default bias is weak without this).
+                    .append("&location_bias_scale=").append(PHOTON_BIAS_SCALE)
             }
             val req = Request.Builder()
                 .url(sb.toString())
@@ -149,6 +397,7 @@ object ForwardGeocoder {
             }
         } catch (t: Throwable) {
             Log.w(TAG, "searchPhoton failed: ${t.message}")
+            noteTransportFailure(t)
             emptyList()
         }
     }
@@ -230,15 +479,17 @@ object ForwardGeocoder {
             }
         } catch (t: Throwable) {
             Log.w(TAG, "searchNominatim failed: ${t.message}")
+            noteTransportFailure(t)
             emptyList()
         }
     }
 
     /**
-     * Parse a Photon GeoJSON FeatureCollection. Each `feature.geometry`
+     * Parse a Photon/Stadia GeoJSON FeatureCollection. Each `feature.geometry`
      * is a Point with `coordinates = [lng, lat]`; `feature.properties` carries
-     * name/street/city/state/country which we assemble into a readable label.
-     * Pure function — exposed for unit testing.
+     * name/street/city/state/country (Photon) or a ready-made `label` (Stadia/
+     * Pelias) which we assemble into a readable label. Pure function — exposed
+     * for unit testing.
      */
     internal fun parsePhoton(json: String): List<SearchResult> {
         val out = ArrayList<SearchResult>()
@@ -265,11 +516,18 @@ object ForwardGeocoder {
     }
 
     /**
-     * Build a readable label from Photon `properties`, e.g.
-     * "name, city, country", skipping blank/duplicate parts. Falls back to
-     * street when there's no name. Pure function — exposed for unit testing.
+     * Build a readable label from feature `properties`. Stadia/Pelias supplies a
+     * canonical pre-built `label` ("Eiffel Tower, Paris, France") — prefer it when
+     * present. Otherwise (Photon has no `label`) assemble "name, city, country",
+     * skipping blank/duplicate parts and falling back to street when there's no
+     * name. Pure function — exposed for unit testing.
      */
     internal fun buildPhotonLabel(props: JSONObject): String {
+        // Stadia/Pelias canonical display string — Photon never sets this, so this
+        // branch only affects the Stadia path (and keeps Photon byte-identical).
+        val ready = props.optString("label", "").trim()
+        if (ready.isNotEmpty()) return ready
+
         val name = props.optString("name", "").trim()
         val street = props.optString("street", "").trim()
         val city = props.optString("city", "").trim()

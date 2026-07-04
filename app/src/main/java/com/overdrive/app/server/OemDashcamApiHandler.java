@@ -222,6 +222,18 @@ public class OemDashcamApiHandler {
                     if (existing == null || !existing.isRunning()) {
                         existing = startPipeline();
                         if (existing == null) return;
+                    } else {
+                        // Pipeline is ALREADY warm — start() (and its
+                        // applyRecordingConfigFromUcm axis resolve) will NOT
+                        // re-run. This is the ACC on↔off warm-handover case
+                        // (e.g. recordingMode=continuous AND
+                        // surveillanceMode=continuous, so recordingDesired never
+                        // drops across the edge). Live-re-apply the fps/bitrate
+                        // for the NOW-current axis so a drive→park transition
+                        // switches OEM from the recording tier to the
+                        // surveillance tier (and back) without a reinit. No-op
+                        // when the resolved axis profile is unchanged.
+                        try { existing.reapplyAxisProfileFromUcm(); } catch (Throwable ignored) {}
                     }
                     // Wedge if format isn't ready AND we need recording —
                     // we'll wait OUTSIDE the lock then re-enter to start
@@ -342,31 +354,6 @@ public class OemDashcamApiHandler {
         String rec = com.overdrive.app.config.UnifiedConfigManager.getOemRecordingMode();
         String surv = com.overdrive.app.config.UnifiedConfigManager.getOemSurveillanceMode();
 
-        // FIX (dvr_ clips with OEM recording "disabled"): if there is no
-        // configured OEM camera id, the recording-mode picker is HIDDEN in the
-        // web UI (recording.js gates the whole mode-selector on
-        // oemDashcamCameraId >= 0). On such a vehicle the user sees the OEM
-        // controls as "Off"/absent and has NO way to change them — yet a
-        // persisted recordingMode/surveillanceMode (e.g. left over from a
-        // legacy migration) would still drive dvr_*.mp4 here. Treat "no OEM
-        // camera id" as a hard Off for BOTH axes so the resolver can never
-        // record from a camera the user cannot see or control. resolveOemDashcamId
-        // returns the saved/auto id; < 0 means explicitly disabled or
-        // unresolvable. This is the structural guarantee behind the user-visible
-        // "Off"; the migration change (continuous -> smart) reduces how often a
-        // stale mode exists in the first place.
-        int oemId = com.overdrive.app.config.UnifiedConfigManager.resolveOemDashcamId();
-        if (oemId < 0) {
-            if (!"off".equals(rec) || !"off".equals(surv)) {
-                com.overdrive.app.daemon.CameraDaemon.log(
-                    "OemDashcam: no OEM camera id (id=" + oemId + ") — forcing both axes Off "
-                    + "(was rec=" + rec + " surv=" + surv + "); the mode picker is hidden on "
-                    + "this vehicle so a stale persisted mode must not record dvr_*.mp4");
-            }
-            rec = "off";
-            surv = "off";
-        }
-
         boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
 
         // Surveillance-axis suppression: the user's safe-zone / schedule /
@@ -402,17 +389,24 @@ public class OemDashcamApiHandler {
         if ("continuous".equals(surv) && !accOn && !survSuppressed) recordingDesired = true;
         if ("smart".equals(rec) && isPanoDashcamRecording()) recordingDesired = true;
 
-        // DIAGNOSTIC (root-cause confirm for "dvr_ clips while OEM recording
-        // shows Off"): one line that ties every dvr_ start/stop decision to the
-        // exact resolved inputs. If the user sees dvr_ clips, this shows which
-        // axis is actually non-off and why recordingDesired flipped true —
-        // distinguishing a stale persisted mode, a surveillance-axis clip, and
-        // the smart-mirror-of-pano case, without needing a repro.
-        if (recordingDesired) {
+        // DIAGNOSTIC (root-cause confirm for "dvr_ clips while the OEM Dashcam
+        // UI shows Off"): the dvr_*.mp4 writer is reached ONLY when an OEM axis
+        // is non-off here, yet the user reports both axes reading Off in the UI
+        // — which means the PERSISTED rec/surv the daemon resolves may diverge
+        // from what the web pickers display (e.g. a legacy-migrated mode, or a
+        // page that rendered its 'off' default before /api/oem-dashcam/config
+        // hydrated). Log the resolved truth on EVERY resolve (not only when
+        // recordingDesired) so a single drive reveals exactly which persisted
+        // axis is driving dvr_ — no repro needed. Only logged when an axis is
+        // non-off OR recording is desired, so a genuinely-off vehicle stays
+        // quiet (no per-tick spam from the 30s self-heal ticker).
+        if (recordingDesired || !"off".equals(rec) || !"off".equals(surv)) {
             com.overdrive.app.daemon.CameraDaemon.log(
-                "OemDashcam resolve: recordingDesired=TRUE (rec=" + rec + " surv=" + surv
-                + " accOn=" + accOn + " survSuppressed=" + survSuppressed
-                + " panoRecording=" + isPanoDashcamRecording() + ") — will write dvr_*.mp4");
+                "OemDashcam resolve: recordingDesired=" + recordingDesired
+                + " (persisted rec=" + rec + " surv=" + surv + " accOn=" + accOn
+                + " survSuppressed=" + survSuppressed
+                + " panoRecording=" + isPanoDashcamRecording() + ")"
+                + (recordingDesired ? " — will write dvr_*.mp4" : ""));
         }
 
         // Keep-warm follows the same axis split: rec=smart needs a warm pipeline

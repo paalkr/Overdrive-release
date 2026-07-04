@@ -17,7 +17,6 @@ BYD.recording = {
         // index.html — recording settings page no longer renders it.
         recordingCodec: 'H264',
         cameraFps: 15,
-        segmentDurationMinutes: 2,
         // Server-supplied for UI dynamic rendering (filled by loadConfig):
         cameraFpsActual: null,
         cameraFpsClampNote: null,
@@ -40,7 +39,11 @@ BYD.recording = {
         // Shared with surveillance page via UnifiedConfigManager
         // recording.rectifyStrength. Default 0 here so the dirty-diff
         // baseline is a real number even before loadConfig() fires.
-        rectifyStrength: 0
+        rectifyStrength: 0,
+        // Clip segment length in minutes (2/5/10). Shared with the
+        // surveillance page via recording.segmentDurationMinutes — one control
+        // governs both ACC-on dashcam and ACC-off surveillance rotation.
+        segmentDurationMinutes: 2
     },
     storageInfo: {
         sdCardAvailable: false,
@@ -136,7 +139,14 @@ BYD.recording = {
             if (data.success) {
                 // Check if config actually changed (via timestamp)
                 const newTimestamp = data.lastModified || 0;
-                if (newTimestamp > this.lastConfigTimestamp) {
+                // Mid-flight guard: this block writes config + re-baselines
+                // savedConfig + updateUI() after the await above. A quality/
+                // fps/clip edit started during that await would otherwise be
+                // clobbered by the server value and its dirty diff erased
+                // (graying out Apply). Bail without advancing lastConfigTimestamp
+                // so the next reload re-attempts once the edit is saved. Mirrors
+                // the guards in the other re-sync blocks and surveillance.js.
+                if (newTimestamp > this.lastConfigTimestamp && !this.hasUnsavedChanges) {
                     this.config.recordingQuality = data.recordingQuality || 'STANDARD';
                     this.config.recordingCodec = data.recordingCodec || 'H264';
                     this.config.cameraFps = data.cameraFps || 15;
@@ -145,6 +155,9 @@ BYD.recording = {
                     this.config.recordingQualityOptions = data.recordingQualityOptions || {};
                     this.config.activeRecordingEstimate = data.activeRecordingEstimate || null;
                     this.config.nativeResolution = data.nativeResolution || null;
+                    if (typeof data.segmentDurationMinutes === 'number') {
+                        this.config.segmentDurationMinutes = data.segmentDurationMinutes;
+                    }
                     this.savedConfig = JSON.parse(JSON.stringify(this.config));
                     this.lastConfigTimestamp = newTimestamp;
                     this.updateUI();
@@ -178,12 +191,45 @@ BYD.recording = {
                 // MUST re-read it too — otherwise a change made on the
                 // surveillance page won't reflect here until a full
                 // navigation / reload of the recording page.
-                if (proxData.config.recording &&
+                //
+                // Guard on !hasUnsavedChanges (same as the clip-duration block
+                // below and surveillance.js's rectify re-sync): this runs after
+                // the /api/settings/unified await, so a mid-flight drag of the
+                // rectify slider would otherwise be clobbered by the stale server
+                // value — leaving config out of sync with the DOM and the dirty
+                // diff, silently discarding the pending edit.
+                if (!this.hasUnsavedChanges &&
+                    proxData.config.recording &&
                     typeof proxData.config.recording.rectifyStrength === 'number') {
                     var rsRefresh = proxData.config.recording.rectifyStrength;
                     if (rsRefresh < 0) rsRefresh = 0;
                     if (rsRefresh > 100) rsRefresh = 100;
                     this.config.rectifyStrength = rsRefresh;
+                }
+                // Shared clip duration (same key feeds both axes). The quality
+                // endpoint above is timestamp-gated and may miss a same-second
+                // change made on the surveillance page, so re-sync by value
+                // here — mirrors surveillance.js's reloadConfig.
+                //
+                // Guard on !hasUnsavedChanges: reloadConfig() may have been
+                // entered while clean (passing the line-134 guard) and then
+                // suspended at an await while the user clicked a Clip Duration
+                // button. Without this re-check, the in-flight resume would
+                // revert the user's pending pick to the stale server value and
+                // gray out Apply. The entry guard only covers entry; this
+                // covers the mid-flight race.
+                if (!this.hasUnsavedChanges &&
+                    proxData.config.recording &&
+                    typeof proxData.config.recording.segmentDurationMinutes === 'number') {
+                    var sdRefresh = proxData.config.recording.segmentDurationMinutes;
+                    if (sdRefresh !== 2 && sdRefresh !== 5 && sdRefresh !== 10) sdRefresh = 2;
+                    if (sdRefresh !== this.config.segmentDurationMinutes) {
+                        this.config.segmentDurationMinutes = sdRefresh;
+                        if (this.savedConfig) this.savedConfig.segmentDurationMinutes = sdRefresh;
+                        document.querySelectorAll('#clipDurationBtns .btn-toggle').forEach(function (btn) {
+                            btn.classList.toggle('active', btn.dataset.value === String(sdRefresh));
+                        });
+                    }
                 }
                 // Hide rectify card on dilink4 — same gate as initial load.
                 try {
@@ -219,7 +265,16 @@ BYD.recording = {
         await this.loadOemDashcam();
         await this.loadRecordingLayout();
 
-        // Update UI with all reloaded settings
+        // Update UI with all reloaded settings.
+        //
+        // Re-check hasUnsavedChanges: reloadConfig() is async with several
+        // awaited fetches after the line-134 entry guard. If the user edited
+        // any field (e.g. clicked a Clip Duration button) while this call was
+        // suspended at an await, re-baselining savedConfig here and calling
+        // updateUI() (which hard-disables Apply) would silently discard that
+        // pending edit. Skip the re-baseline when there are unsaved changes so
+        // the user's in-flight edit and the enabled Apply button survive.
+        if (this.hasUnsavedChanges) return;
         this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
     },
@@ -235,16 +290,18 @@ BYD.recording = {
                 this.config.recordingQuality = data.recordingQuality || 'STANDARD';
                 this.config.recordingCodec = data.recordingCodec || 'H264';
                 this.config.cameraFps = data.cameraFps || 15;
-                this.config.segmentDurationMinutes = data.segmentDurationMinutes || 2;
                 this.config.cameraFpsActual = data.cameraFpsActual || null;
                 this.config.cameraFpsClampNote = data.cameraFpsClampNote || null;
                 this.config.recordingQualityOptions = data.recordingQualityOptions || {};
                 this.config.activeRecordingEstimate = data.activeRecordingEstimate || null;
                 this.config.nativeResolution = data.nativeResolution || null;
+                if (typeof data.segmentDurationMinutes === 'number') {
+                    this.config.segmentDurationMinutes = data.segmentDurationMinutes;
+                }
                 this.lastConfigTimestamp = data.lastModified || Date.now();
             }
         } catch (e) {}
-        
+
         // Load recording mode
         try {
             const modeResp = await fetch('/api/recording/mode');
@@ -308,8 +365,17 @@ BYD.recording = {
             const resp = await fetch('/api/settings/storage');
             const data = await resp.json();
             if (data.success) {
-                this.config.recordingsLimitMb = data.recordingsLimitMb || 500;
-                this.config.recordingsStorageType = data.recordingsStorageType || 'INTERNAL';
+                // Dirty-guard the user-editable picker fields. loadStorageSettings
+                // is called from reloadConfig() (periodic 10s + visibility), and
+                // without this guard a reload that lands right after Apply (which
+                // clears hasUnsavedChanges) would overwrite the just-saved slider
+                // value with a stale server read and snap the slider back. The
+                // storageInfo/ceiling fields below are display-only and always
+                // refresh. Mirrors the clip-duration mid-flight guard above.
+                if (!this.hasUnsavedChanges) {
+                    this.config.recordingsLimitMb = data.recordingsLimitMb || 500;
+                    this.config.recordingsStorageType = data.recordingsStorageType || 'INTERNAL';
+                }
                 // Active (resolved) type may differ from configured when the
                 // chosen external volume is unavailable/full and recordings
                 // fell back to internal. Used to surface the fallback banner.
@@ -931,7 +997,7 @@ BYD.recording = {
         document.querySelectorAll('#fpsBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === String(this.config.cameraFps)));
         document.querySelectorAll('#clipDurationBtns .btn-toggle').forEach(btn =>
-            btn.classList.toggle('active', btn.dataset.value === String(this.config.segmentDurationMinutes || 2)));
+            btn.classList.toggle('active', btn.dataset.value === String(this.config.segmentDurationMinutes)));
 
         // Tier metadata (Mbps, GB/hr, qualityEquivalent) comes from the
         // recordingQualityOptions block in /api/quality. UI re-renders the
@@ -1066,13 +1132,16 @@ BYD.recording = {
         this.markChanged();
     },
 
+    /** Clip segment length (minutes: 2/5/10). Shared key — applies to both
+     *  recording axes. Persisted on Apply via the quality POST; takes effect
+     *  on the next segment rotation (no encoder reinit). */
     setClipDuration(minutes) {
-        const parsed = parseInt(minutes, 10);
-        if (this.config.segmentDurationMinutes === parsed) return;
-        this.config.segmentDurationMinutes = parsed;
-        document.querySelectorAll('#clipDurationBtns .btn-toggle').forEach(btn =>
-            btn.classList.toggle('active', btn.dataset.value === String(minutes)));
-        this.renderActiveEstimate();
+        var m = parseInt(minutes, 10);
+        if (m !== 2 && m !== 5 && m !== 10) m = 2;
+        this.config.segmentDurationMinutes = m;
+        document.querySelectorAll('#clipDurationBtns .btn-toggle').forEach(function (btn) {
+            btn.classList.toggle('active', btn.dataset.value === String(m));
+        });
         this.markChanged();
     },
 
@@ -1103,13 +1172,7 @@ BYD.recording = {
     formatEstimate(est) {
         if (!est) return '—';
         const parts = [BYD.i18n.t('recording.unit_mbps', {n: (est.bitrateMbps != null ? est.bitrateMbps : '—')})];
-        const durationMin = this.config.segmentDurationMinutes || 2;
-        if (est.mbPerMinute != null) {
-            const mbPerSegment = Math.round(est.mbPerMinute * durationMin * 10) / 10;
-            parts.push(BYD.i18n.t('recording.unit_mb_per_segment', {n: mbPerSegment, min: durationMin}));
-        } else if (est.mbPer2Min != null) {
-            parts.push(BYD.i18n.t('recording.unit_mb_per_2min', {n: est.mbPer2Min}));
-        }
+        if (est.mbPer2Min != null) parts.push(BYD.i18n.t('recording.unit_mb_per_2min', {n: est.mbPer2Min}));
         if (est.qualityEquivalent) parts.push(est.qualityEquivalent);
         return parts.join(' · ');
     },
@@ -1245,8 +1308,7 @@ BYD.recording = {
                             codec: this.config.recordingCodec,
                             quality: this.config.recordingQuality,
                             recordingQuality: this.config.recordingQuality,
-                            rectifyStrength: rectifyToSave,
-                            segmentDurationMinutes: this.config.segmentDurationMinutes
+                            rectifyStrength: rectifyToSave
                         }
                     })
                 });
@@ -1284,6 +1346,34 @@ BYD.recording = {
                 });
                 if (!storageResp.ok) throw new Error('storage ' + storageResp.status);
                 storageData = await storageResp.json();
+                // The daemon answers HTTP 200 with {success:false} when a
+                // requested storage-TYPE change is rejected (target volume
+                // unavailable). The server handles the type change FIRST and
+                // returns before touching the limit, so on rejection neither
+                // field was committed — revert both optimistic fields to the
+                // last-applied baseline, re-render, and throw so the catch shows
+                // an error toast instead of a false "applied" + baking the
+                // rejected value into savedConfig.
+                if (storageData && storageData.success === false) {
+                    if (this.savedConfig) {
+                        this.config.recordingsStorageType = this.savedConfig.recordingsStorageType;
+                        this.config.recordingsLimitMb = this.savedConfig.recordingsLimitMb;
+                    }
+                    this.updateStorageLimitUI();
+                    this.updateStorageTypeUI();
+                    throw new Error(storageData.error || 'storage change rejected');
+                }
+                // Re-sync config to the value the daemon actually committed
+                // (it clamps to the active volume ceiling). This closes the
+                // stale-read window: the savedConfig snapshot below — and any
+                // reload that fires after — now baseline off the true persisted
+                // value instead of the optimistic pre-save number.
+                if (typeof storageData.recordingsLimitMb === 'number') {
+                    this.config.recordingsLimitMb = storageData.recordingsLimitMb;
+                }
+                if (storageData.recordingsStorageType) {
+                    this.config.recordingsStorageType = storageData.recordingsStorageType;
+                }
             } else if (activeTab === 'oem') {
                 const oemMode = this.config.oemRecordingMode || 'off';
                 let oemErr = null;
@@ -1341,7 +1431,7 @@ BYD.recording = {
             let severity = 'success';
             if (activeTab === 'quality' && qualityRejectedFields.length) {
                 const fields = qualityRejectedFields.join(', ');
-                const submittedQualityFieldCount = 3; // recordingQuality, recordingCodec, cameraFps
+                const submittedQualityFieldCount = 4; // recordingQuality, recordingCodec, cameraFps, segmentDurationMinutes
                 if (qualityRejectedFields.length >= submittedQualityFieldCount) {
                     msg = 'No changes applied — values rejected: ' + fields;
                     severity = 'error';

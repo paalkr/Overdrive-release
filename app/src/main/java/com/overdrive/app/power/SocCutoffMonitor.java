@@ -304,7 +304,17 @@ public final class SocCutoffMonitor {
             org.json.JSONObject section = root != null
                     ? root.optJSONObject("power") : null;
             if (section != null && section.has("lowSocCutoffPercent")) {
-                return section.optInt("lowSocCutoffPercent", DEFAULT_CUTOFF_PERCENT);
+                int pct = section.optInt("lowSocCutoffPercent", DEFAULT_CUTOFF_PERCENT);
+                // Clamp a hand-edited / corrupted value to a sane band. The UI
+                // POST already clamps 0..30, but this read is the LAST line of
+                // defence on a safety path: an out-of-band high value (e.g. 1000
+                // from a bad edit) would make `pct <= cutoff` always true and
+                // self-shut-down the head unit on the next SoC tick. Floor 0
+                // preserves "0 = Off"; ceil 100 (a valid SoC max) is the highest
+                // a cutoff can meaningfully be.
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+                return pct;
             }
         } catch (Throwable ignored) {}
         return DEFAULT_CUTOFF_PERCENT;

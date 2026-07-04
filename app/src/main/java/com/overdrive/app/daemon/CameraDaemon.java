@@ -67,6 +67,7 @@ public class CameraDaemon {
     public static final int FRAME_RATE = 25;
     public static final int BITRATE = 4_000_000;
     public static final int KEYFRAME_INTERVAL = 2;
+    public static final long SEGMENT_DURATION_MS = 2 * 60 * 1000;
     
     // Streaming config (SIM-optimized)
     public static final int STREAM_WIDTH = 640;
@@ -204,6 +205,9 @@ public class CameraDaemon {
     // ==================== TRIP ANALYTICS ====================
     private static volatile com.overdrive.app.trips.TripAnalyticsManager tripAnalyticsManager;
     private static volatile java.util.concurrent.CompletableFuture<Void> tripAnalyticsInitFuture;
+
+    // ==================== CHARGING ANALYTICS ====================
+    private static volatile com.overdrive.app.charging.ChargingSessionManager chargingSessionManager;
 
     // ==================== DATA LAYER (RecordingsIndex parallel kick) ====================
     // Completes when the parallel RecordingsIndex.init() + warmupAsync kick
@@ -1649,6 +1653,10 @@ public class CameraDaemon {
      * the LMK or SIGABRT kill lands.
      */
     private static java.util.concurrent.ScheduledExecutorService memoryLogScheduler;
+    // Dedicated scheduler for the geo backfill sweep — kept OFF memoryLogScheduler
+    // because the sweep does blocking Nominatim I/O that must not stall the memory
+    // watchdog / cache-prune / index-reconcile ticks.
+    private static java.util.concurrent.ScheduledExecutorService geoBackfillScheduler;
 
     public static void startPeriodicMemoryLogging() {
         if (memoryLogScheduler != null) return;
@@ -1696,7 +1704,37 @@ public class CameraDaemon {
                     + t.getClass().getSimpleName() + ": " + t.getMessage());
             }
         }, 60, 60, java.util.concurrent.TimeUnit.MINUTES);
+
         log("Periodic memory monitor started (5-minute cadence); recording cache prune + index reconcile armed (60-minute cadence)");
+
+        // Geo place-name backfill — re-resolves recordings that have a GPS fix
+        // but no resolved place (cache-miss at record time with no working async
+        // retry; see GeoBackfillSweep). Bounded per-tick + age-gated + online-gated;
+        // cheap stat-only pass on a steady-state library. 10-minute cadence: prompt
+        // enough that a just-recorded first-visit clip gets tagged soon, light on
+        // the Nominatim budget.
+        //
+        // DEDICATED scheduler (NOT memoryLogScheduler): the sweep does SYNCHRONOUS
+        // Nominatim I/O (resolveBlocking, ~10s worst case on a routable-but-dead
+        // endpoint before the rate-limiter cooldown kicks in). The shared scheduler
+        // also runs the leak/OOM memory watchdog + cache prune + index reconcile;
+        // a stuck geocode tick on it would stall those. Its own single thread keeps
+        // the blocking I/O off the watchdog's cadence. Same try/catch guard so one
+        // bad tick (flapping SD, network burp) can't cancel the recurring task.
+        geoBackfillScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "GeoBackfill");
+            t.setDaemon(true);
+            return t;
+        });
+        geoBackfillScheduler.scheduleAtFixedRate(() -> {
+            try {
+                com.overdrive.app.geo.GeoBackfillSweep.run();
+            } catch (Throwable t) {
+                log("Geo backfill tick failed: "
+                    + t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
+        }, 5, 10, java.util.concurrent.TimeUnit.MINUTES);
+        log("Geo backfill armed on dedicated thread (10-minute cadence)");
     }
 
     private static void logMemoryStatus() {
@@ -1760,7 +1798,14 @@ public class CameraDaemon {
             try { memoryLogScheduler.shutdownNow(); } catch (Exception ignored) {}
             memoryLogScheduler = null;
         }
-        
+        // Stop the geo backfill scheduler too (symmetric) — shutdownNow interrupts
+        // an in-flight resolveBlocking so no wasted blocking network I/O / sidecar
+        // write runs during teardown.
+        if (geoBackfillScheduler != null) {
+            try { geoBackfillScheduler.shutdownNow(); } catch (Exception ignored) {}
+            geoBackfillScheduler = null;
+        }
+
         // Write disable sentinel FIRST — this tells the shell watchdog wrapper
         // to NOT restart the daemon after we exit. Without this, the wrapper
         // sees exit code 0 and respawns us immediately.
@@ -1797,7 +1842,10 @@ public class CameraDaemon {
         try { com.overdrive.app.monitor.GpsMonitor.getInstance().stop(); } catch (Exception ignored) {}
         try { com.overdrive.app.monitor.GearMonitor.getInstance().stop(); } catch (Exception ignored) {}
         try { com.overdrive.app.monitor.PerformanceMonitor.getInstance().stop(); } catch (Exception ignored) {}
+        // Stop the charging fast-sampler BEFORE closing the H2 DB it writes to.
+        try { if (chargingSessionManager != null) chargingSessionManager.shutdown(); } catch (Exception ignored) {}
         try { com.overdrive.app.monitor.SocHistoryDatabase.getInstance().stop(); } catch (Exception ignored) {}
+        try { com.overdrive.app.notifications.NotificationStore.getInstance().stop(); } catch (Exception ignored) {}
         
         // Stop services. Both the trip analytics + recordings index inits
         // run on parallel threads (see main()); join with a short timeout
@@ -2152,9 +2200,24 @@ public class CameraDaemon {
                     com.overdrive.app.monitor.PerformanceMonitor.getInstance().stop();
                 } catch (Exception e) { /* may not be initialized */ }
                 
-                // 4. Close SOC History Database (H2 JDBC connection + scheduler)
+                // 4. Close SOC History Database (H2 JDBC connection + scheduler).
+                // Stop the geo backfill scheduler so an in-flight blocking
+                // resolveBlocking / sidecar write doesn't run during teardown.
+                try {
+                    if (geoBackfillScheduler != null) {
+                        geoBackfillScheduler.shutdownNow();
+                        geoBackfillScheduler = null;
+                    }
+                } catch (Exception ignored) { /* best-effort */ }
+                // Stop the charging fast-sampler first so it can't write mid-close.
+                try {
+                    if (chargingSessionManager != null) chargingSessionManager.shutdown();
+                } catch (Exception e) { /* may not be initialized */ }
                 try {
                     com.overdrive.app.monitor.SocHistoryDatabase.getInstance().stop();
+                } catch (Exception e) { /* may not be initialized */ }
+                try {
+                    com.overdrive.app.notifications.NotificationStore.getInstance().stop();
                 } catch (Exception e) { /* may not be initialized */ }
                 
                 // 5. Stop services (MQTT, ABRP, Trip Analytics).
@@ -2362,7 +2425,11 @@ public class CameraDaemon {
     public static com.overdrive.app.trips.TripAnalyticsManager getTripAnalyticsManager() {
         return tripAnalyticsManager;
     }
-    
+
+    public static com.overdrive.app.charging.ChargingSessionManager getChargingSessionManager() {
+        return chargingSessionManager;
+    }
+
     // ==================== STREAMING CONTROL (REMOVED - VPS functionality removed) ====================
     
     /**
@@ -3031,6 +3098,17 @@ public class CameraDaemon {
             // to arm. Holding the lock makes "set flag + enable + verify" atomic
             // w.r.t. every other lock-event source.
             synchronized (CameraDaemon.class) {
+                // FAST-PATH EXIT: if a lock source already detected the lock and
+                // armed us during the grace window (the common case — OTA reports
+                // LOCKED within ~1s of ACC-off), this force-arm is a redundant
+                // no-op. Exit quietly instead of logging the misleading
+                // "TIMEOUT ... force-arming regardless of lock state" line, which
+                // reads as "we never saw the lock" when in fact we armed instantly.
+                // Checked inside the monitor so it's consistent with applyLockEvent.
+                if (doorLockListenerArmed) {
+                    log("LOCK GATE: already armed via lock detection — force-arm deadline is a no-op");
+                    return;
+                }
                 if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
                     log("LOCK GATE TIMEOUT: ACC turned ON before force-arm — not arming");
                     return;
@@ -3670,6 +3748,14 @@ public class CameraDaemon {
                         log("Starting pipeline for sentry mode...");
                         try { gpuPipeline.start(); } catch (Exception e) {
                             log("Pipeline start failed: " + e.getMessage());
+                            // FIX (cold-boot arming race): arming did NOT complete,
+                            // but lastDispatchedAccIsOff was already set true at :3533.
+                            // Without clearing it, every subsequent ACC-OFF heartbeat
+                            // short-circuits at the dedup guard (:3451) and arming is
+                            // never retried — aiProcessed stays 0 forever. Clear the
+                            // flag so the next heartbeat re-runs the full dispatch.
+                            log("WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs sentry arming");
+                            lastDispatchedAccIsOff = null;
                             return;
                         }
                     }
@@ -3716,6 +3802,17 @@ public class CameraDaemon {
                 }
                 log("ERROR: Failed to start pipeline for sentry: " + errorMsg);
                 e.printStackTrace();
+                // FIX (cold-boot arming race, observed 2026-06-28): a transient
+                // encoder-init failure (MediaCodec.createInputSurface IllegalStateException
+                // at cold boot) can null gpuPipeline between the :3516 guard and the
+                // setRecordingMode() lambda at :3695, throwing an NPE here. We caught it,
+                // but lastDispatchedAccIsOff was already set true at :3533 — so every
+                // 60s ACC-OFF heartbeat afterward hits the dedup no-op (:3451) and arming
+                // is never retried (aiProcessed=0 forever). Mirror the ACC-ON self-heal
+                // (:3867/:3916/:3956): clear the dedup flag so the next heartbeat re-runs
+                // the full sentry-arming dispatch once initSurveillance recovers the pipeline.
+                log("WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs sentry arming");
+                lastDispatchedAccIsOff = null;
             }
         } else {
             // ACC ON. We intentionally leave the SD-card watchdog running here:
@@ -4878,6 +4975,24 @@ public class CameraDaemon {
         com.overdrive.app.notifications.push.VapidSigner signer =
                 new com.overdrive.app.notifications.push.VapidSigner(keyStore, "");
 
+        // Persistent notification log (Notifications ▸ Log tab). Dedicated H2
+        // store; the HistorySink writes EVERY bus event so history captures all
+        // categories with no per-publisher change. Init before subscribing so
+        // the sink never sees an uninitialized store.
+        com.overdrive.app.notifications.NotificationStore notifStore =
+                com.overdrive.app.notifications.NotificationStore.getInstance();
+        try {
+            notifStore.init();
+        } catch (Exception e) {
+            log("NotificationStore init failed (log tab will be empty): " + e.getMessage());
+        }
+
+        // Subscribe HistorySink FIRST so it receives the NotificationBus
+        // pre-subscribe buffer flush (the bus replays boot-window events only to
+        // the first sink) — a door-open / charging-fault during startup then
+        // still lands in the persisted log.
+        com.overdrive.app.notifications.NotificationBus.get()
+                .subscribe(new com.overdrive.app.notifications.sinks.HistorySink(notifStore, registry));
         com.overdrive.app.notifications.NotificationBus.get()
                 .subscribe(new com.overdrive.app.notifications.sinks.LogSink());
         com.overdrive.app.notifications.NotificationBus.get()
@@ -5063,6 +5178,20 @@ public class CameraDaemon {
             socDb.start();
 
             log("SOC History Database initialized successfully");
+
+            // Charging Analytics — fast in-session power sampler + rollups. The
+            // discrete session edges are recorded by SocHistoryDatabase itself
+            // (on the 2-min SoC tick); this manager only adds the fine-grained
+            // ramp sampler driven by ChargingDetector's fused charging edge.
+            try {
+                com.overdrive.app.charging.ChargingSessionManager csm =
+                    new com.overdrive.app.charging.ChargingSessionManager();
+                csm.init(sharedAppContext);
+                chargingSessionManager = csm;
+                log("Charging Analytics initialized successfully");
+            } catch (Exception e) {
+                log("Charging Analytics init failed: " + e.getMessage());
+            }
 
             // Fix stale kWh records from before PHEV capacity was correctly
             // detected. Runs on a background thread — this is a one-shot data

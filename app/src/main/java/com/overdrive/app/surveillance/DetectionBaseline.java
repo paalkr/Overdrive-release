@@ -84,9 +84,15 @@ public class DetectionBaseline {
     // longer and we're better off treating the spot as fresh.
     private static final long BASELINE_ENTRY_MAX_AGE_MS = 2 * 60 * 60 * 1000L;  // 2 hours
 
-    // COCO class IDs that are NEVER promotable (living things)
-    // 0=person, 15=cat, 16=dog, 14=bird
-    private static final int[] NEVER_PROMOTE_CLASSES = {0, 14, 15, 16};
+    // COCO class IDs that are NEVER promotable (living things). A living
+    // thing must never become "static background", because — like a
+    // motionless person — a motionless animal is still a subject of interest
+    // and must keep triggering when detection is enabled. This covers
+    // 0=person plus the full COCO animal range 14-23 (bird, cat, dog, horse,
+    // sheep, cow, elephant, bear, zebra, giraffe). Note: when the user has
+    // animal detection disabled (default), YOLO never returns 14-23, so the
+    // 17-23 additions are a no-op for the default configuration.
+    private static final int[] NEVER_PROMOTE_CLASSES = {0, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
 
     /**
      * Map a COCO class ID to its canonical baseline class. YOLO occasionally
