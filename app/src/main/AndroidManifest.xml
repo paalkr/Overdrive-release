@@ -9,6 +9,10 @@
     <!-- SOTA: Required for Android 11+ to see files created by other UIDs (daemon) -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ACCESS_NETWORK_STATE: read network state (NetworkMonitor). CHANGE_NETWORK_STATE:
+         requestNetwork() for the MQTT "pin to cellular" option. Both normal/install-time. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
