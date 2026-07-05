@@ -204,36 +204,6 @@ public class ProxyHelper {
     }
 
     /**
-     * Plain SocketFactory whose sockets egress over the given cellular Network,
-     * regardless of the system default network. Used for plain tcp:// brokers
-     * when a connection has "pin to cellular" enabled. The Network's own
-     * SocketFactory binds every socket it creates to that network.
-     */
-    public static SocketFactory getCellularSocketFactory(android.net.Network network) {
-        return network.getSocketFactory();
-    }
-
-    /**
-     * SSLSocketFactory that lays TLS over a TCP socket bound to the given
-     * cellular Network. Mirrors {@link ProxiedSslSocketFactory} but sources the
-     * underlying socket from the Network's SocketFactory instead of a SOCKS
-     * proxy, so the broker connection always egresses over cellular even when
-     * WiFi is the default network. Reuses {@link DeferredSslSocket} for Paho's
-     * no-arg createSocket() sequencing.
-     */
-    public static SSLSocketFactory getCellularSslSocketFactory(android.net.Network network, boolean trustAll) {
-        try {
-            SSLSocketFactory baseSsl = trustAll
-                    ? getTrustAllSslFactory()
-                    : (SSLSocketFactory) SSLSocketFactory.getDefault();
-            return new NetworkBoundSslSocketFactory(baseSsl, network.getSocketFactory());
-        } catch (Exception e) {
-            // Fall back to a non-bound default factory rather than failing the connect.
-            return (SSLSocketFactory) SSLSocketFactory.getDefault();
-        }
-    }
-
-    /**
      * SocketFactory that creates sockets routed through the sing-box SOCKS proxy.
      * Paho MQTT uses SocketFactory to create its TCP connections, so this is the
      * cleanest way to proxy MQTT traffic without modifying Paho internals.
@@ -361,75 +331,6 @@ public class ProxyHelper {
             // Paho may call this variant directly — layer TLS on the provided socket.
             // If 's' is our DeferredSslSocket, unwrap to the real underlying socket first
             // so we don't nest SSLSocket inside SSLSocket.
-            Socket raw = (s instanceof DeferredSslSocket) ? ((DeferredSslSocket) s).getInnerSocket() : s;
-            return sslFactory.createSocket(raw, host, port, autoClose);
-        }
-
-        @Override
-        public String[] getDefaultCipherSuites() {
-            return sslFactory.getDefaultCipherSuites();
-        }
-
-        @Override
-        public String[] getSupportedCipherSuites() {
-            return sslFactory.getSupportedCipherSuites();
-        }
-    }
-
-    /**
-     * SSLSocketFactory that lays TLS over a TCP socket bound to a specific
-     * Network (cellular). Same shape as {@link ProxiedSslSocketFactory}, but the
-     * underlying socket comes from the Network's own SocketFactory (which binds
-     * every socket to that network) instead of a SOCKS proxy. Reuses
-     * {@link DeferredSslSocket} for the no-arg createSocket() path.
-     */
-    static class NetworkBoundSslSocketFactory extends SSLSocketFactory {
-
-        private final SSLSocketFactory sslFactory;
-        private final SocketFactory base; // network.getSocketFactory()
-
-        NetworkBoundSslSocketFactory(SSLSocketFactory sslFactory, SocketFactory base) {
-            this.sslFactory = sslFactory;
-            this.base = base;
-        }
-
-        @Override
-        public Socket createSocket() throws java.io.IOException {
-            // Unconnected, network-bound socket; DeferredSslSocket connects it and
-            // upgrades to TLS on startHandshake().
-            return new DeferredSslSocket(base.createSocket(), sslFactory);
-        }
-
-        @Override
-        public Socket createSocket(String host, int port) throws java.io.IOException {
-            Socket raw = base.createSocket(host, port); // connected + network-bound
-            return sslFactory.createSocket(raw, host, port, true);
-        }
-
-        @Override
-        public Socket createSocket(String host, int port, java.net.InetAddress localHost, int localPort)
-                throws java.io.IOException {
-            Socket raw = base.createSocket(host, port, localHost, localPort);
-            return sslFactory.createSocket(raw, host, port, true);
-        }
-
-        @Override
-        public Socket createSocket(java.net.InetAddress host, int port) throws java.io.IOException {
-            Socket raw = base.createSocket(host, port);
-            return sslFactory.createSocket(raw, host.getHostName(), port, true);
-        }
-
-        @Override
-        public Socket createSocket(java.net.InetAddress address, int port,
-                                   java.net.InetAddress localAddress, int localPort)
-                throws java.io.IOException {
-            Socket raw = base.createSocket(address, port, localAddress, localPort);
-            return sslFactory.createSocket(raw, address.getHostName(), port, true);
-        }
-
-        @Override
-        public Socket createSocket(Socket s, String host, int port, boolean autoClose)
-                throws java.io.IOException {
             Socket raw = (s instanceof DeferredSslSocket) ? ((DeferredSslSocket) s).getInnerSocket() : s;
             return sslFactory.createSocket(raw, host, port, autoClose);
         }

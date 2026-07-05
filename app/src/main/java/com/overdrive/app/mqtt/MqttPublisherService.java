@@ -141,63 +141,7 @@ public class MqttPublisherService implements MqttCallback {
             boolean isSsl = config.isSsl();
             boolean isWebSocket = brokerUri.startsWith("ws://") || brokerUri.startsWith("wss://");
 
-            // --- Pin-to-cellular (per-connection, default off) ---
-            // Bind this broker connection's egress to a dedicated cellular Network so it
-            // survives WiFi<->cellular handover. A pinned connection must NEVER use WiFi —
-            // if cellular isn't available we ABORT (return false) and let the publish-cycle
-            // backoff retry, rather than falling back to WiFi. WebSocket can't be pinned
-            // (Paho's WS module bypasses the SocketFactory), so it's also refused.
-            boolean cellularRouted = false;
-            if (config.pinToCellular) {
-                if (isWebSocket) {
-                    lastError = "pinToCellular: WebSocket transport can't be pinned — refusing WiFi";
-                    logger.warn(lastError);
-                    consecutiveFailures++;
-                    try { newClient.close(); } catch (Exception ignored) {}
-                    return false;
-                }
-                com.overdrive.app.monitor.NetworkMonitor.ensureCellularNetworkRequested();
-                android.net.Network cell = com.overdrive.app.monitor.NetworkMonitor.getCellularNetwork();
-                // Brief bounded wait: requestNetwork()'s callback is async and usually lands
-                // within ~1s when the cellular radio is up, so the first attempt can bind
-                // cleanly without a failed cycle. ~3s ceiling so a genuinely cellular-less
-                // moment (no signal/SIM) just defers to the backoff retry below.
-                for (int i = 0; i < 15 && cell == null; i++) {
-                    try { Thread.sleep(200); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
-                    cell = com.overdrive.app.monitor.NetworkMonitor.getCellularNetwork();
-                }
-                if (cell == null) {
-                    // No cellular network. Do NOT fall back to WiFi — abort; the publish-cycle
-                    // backoff re-invokes connect() and it'll bind once cellular returns.
-                    lastError = "pinToCellular: no cellular network available — refusing WiFi; will retry";
-                    logger.warn(lastError);
-                    consecutiveFailures++;
-                    try { newClient.close(); } catch (Exception ignored) {}
-                    return false;
-                }
-                if (!com.overdrive.app.monitor.NetworkMonitor.isCellularValidated()) {
-                    // Cellular is present but has NO validated internet (typical case: an
-                    // IWLAN bearer whose carrier tunnel is down — observed 2026-07-04).
-                    // Binding would spin on a dead socket with an empty lastError. Treat
-                    // as no-cellular: abort with a named reason, backoff-retry.
-                    lastError = "pinToCellular: cellular present but not validated (no internet on bearer) — refusing WiFi; will retry";
-                    logger.warn(lastError);
-                    consecutiveFailures++;
-                    try { newClient.close(); } catch (Exception ignored) {}
-                    return false;
-                }
-                System.clearProperty("socksProxyHost");
-                System.clearProperty("socksProxyPort");
-                if (isSsl) {
-                    options.setSocketFactory(ProxyHelper.getCellularSslSocketFactory(cell, config.trustAllCerts));
-                } else {
-                    options.setSocketFactory(ProxyHelper.getCellularSocketFactory(cell));
-                }
-                cellularRouted = true;
-                logger.info("MQTT pinned to cellular Network: " + cell);
-            }
-
-            if (!cellularRouted && ProxyHelper.isProxyAvailable()) {
+            if (ProxyHelper.isProxyAvailable()) {
                 if (isWebSocket && isSsl) {
                     // WSS + Proxy: Paho 1.2.0+ has a bug (eclipse/paho.mqtt.java#573) where
                     // WebSocketSecureNetworkModule bypasses the SocketFactory and calls
@@ -227,7 +171,7 @@ public class MqttPublisherService implements MqttCallback {
                     // Plain TCP + Proxy: ProxiedSocketFactory works fine.
                     options.setSocketFactory(ProxyHelper.getMqttSocketFactory());
                 }
-            } else if (!cellularRouted) {
+            } else {
                 // No proxy — clear any leftover system SOCKS properties from a previous
                 // connection attempt where the proxy was active.
                 System.clearProperty("socksProxyHost");

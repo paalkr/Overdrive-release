@@ -55,11 +55,6 @@ public class MqttConnectionConfig {
     // entities are discovered and inbound command topics (<base>/<key>/set) are honored.
     public boolean allowControl;           // Master safety toggle (default off)
 
-    // Pin this connection's socket to the cellular transport (TRANSPORT_CELLULAR) even when
-    // WiFi is the default network. Avoids the MQTT drop during WiFi<->cellular handover by
-    // binding the broker connection to a dedicated cellular Network. Default off.
-    public boolean pinToCellular;
-
     // Defaults
     private static final int DEFAULT_PORT = 1883;
     private static final int DEFAULT_QOS = 0;
@@ -75,7 +70,6 @@ public class MqttConnectionConfig {
     private static final boolean DEFAULT_ALLOW_CONTROL = false;
     private static final boolean DEFAULT_HEARTBEAT_SEND_ALL = false;
     private static final boolean DEFAULT_FLUSH_ON_STATE_CHANGE = true;
-    private static final boolean DEFAULT_PIN_TO_CELLULAR = false;
 
     /**
      * Create a new connection config with defaults.
@@ -103,7 +97,6 @@ public class MqttConnectionConfig {
         this.allowControl = DEFAULT_ALLOW_CONTROL;
         this.heartbeatSendAll = DEFAULT_HEARTBEAT_SEND_ALL;
         this.flushOnStateChange = DEFAULT_FLUSH_ON_STATE_CHANGE;
-        this.pinToCellular = DEFAULT_PIN_TO_CELLULAR;
     }
 
     /** True when this connection should accept inbound control commands and discover control entities. */
@@ -220,7 +213,6 @@ public class MqttConnectionConfig {
             json.put("allowControl", allowControl);
             json.put("heartbeatSendAll", heartbeatSendAll);
             json.put("flushOnStateChange", flushOnStateChange);
-            json.put("pinToCellular", pinToCellular);
         } catch (Exception ignored) {}
         return json;
     }
@@ -266,7 +258,6 @@ public class MqttConnectionConfig {
         config.allowControl = json.optBoolean("allowControl", DEFAULT_ALLOW_CONTROL);
         config.heartbeatSendAll = json.optBoolean("heartbeatSendAll", DEFAULT_HEARTBEAT_SEND_ALL);
         config.flushOnStateChange = json.optBoolean("flushOnStateChange", DEFAULT_FLUSH_ON_STATE_CHANGE);
-        config.pinToCellular = json.optBoolean("pinToCellular", DEFAULT_PIN_TO_CELLULAR);
         if (config.minIntervalSeconds < 1) config.minIntervalSeconds = 1;
         if (config.maxIntervalSeconds < config.minIntervalSeconds) {
             config.maxIntervalSeconds = config.minIntervalSeconds;

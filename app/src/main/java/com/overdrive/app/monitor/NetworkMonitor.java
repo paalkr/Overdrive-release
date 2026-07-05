@@ -4,7 +4,6 @@ import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
 import android.net.LinkProperties;
 import android.net.LinkAddress;
 import android.net.wifi.WifiInfo;
@@ -40,89 +39,11 @@ public class NetworkMonitor {
     private static volatile Context appContext;
     private static volatile boolean shellFallbackLogged = false;
 
-    // --- Dedicated cellular Network (for MQTT "pin to cellular") ---
-    // Held for the process lifetime once requested. requestNetwork keeps the
-    // cellular radio up for this request even while WiFi is the default network,
-    // so sockets created from this Network's SocketFactory always egress over
-    // cellular. Requires CHANGE_NETWORK_STATE.
-    private static volatile Network cellularNetwork;
-    private static volatile boolean cellularRequested = false;
-    private static ConnectivityManager.NetworkCallback cellularCallback;
-
     public static void init(Context context) {
         appContext = context;
         CameraDaemon.log("NetworkMonitor: init with context=" +
                 (context != null ? context.getClass().getSimpleName() : "null"));
         refresh();
-    }
-
-    /**
-     * Lazily register a request for a dedicated cellular Network. Idempotent —
-     * the first call registers a callback that stores the Network when it
-     * becomes available; later calls are no-ops. Safe to call on every MQTT
-     * connect attempt. Returns immediately; the Network may not be available
-     * until the callback fires (caller falls back to the default transport
-     * for that attempt and retries).
-     */
-    public static synchronized void ensureCellularNetworkRequested() {
-        if (cellularRequested || appContext == null) return;
-        try {
-            ConnectivityManager cm = (ConnectivityManager)
-                    appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) {
-                CameraDaemon.log("NetworkMonitor: cellular request — ConnectivityManager null");
-                return;
-            }
-            NetworkRequest req = new NetworkRequest.Builder()
-                    .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .build();
-            cellularCallback = new ConnectivityManager.NetworkCallback() {
-                @Override public void onAvailable(Network network) {
-                    cellularNetwork = network;
-                    CameraDaemon.log("NetworkMonitor: cellular Network available: " + network);
-                }
-                @Override public void onLost(Network network) {
-                    if (network.equals(cellularNetwork)) {
-                        cellularNetwork = null;
-                        CameraDaemon.log("NetworkMonitor: cellular Network lost");
-                    }
-                }
-            };
-            cm.requestNetwork(req, cellularCallback);
-            cellularRequested = true;
-            CameraDaemon.log("NetworkMonitor: requested dedicated cellular Network");
-        } catch (Throwable t) {
-            CameraDaemon.log("NetworkMonitor: cellular request failed: " + t.getMessage());
-        }
-    }
-
-    /** The dedicated cellular Network, or null if not yet available. */
-    public static Network getCellularNetwork() {
-        return cellularNetwork;
-    }
-
-    /**
-     * Whether the dedicated cellular Network currently has VALIDATED internet.
-     * "Available" is not enough: an IWLAN bearer can be CONNECTED with dead
-     * internet (observed 2026-07-04: lastValidated=false while parked on home
-     * WiFi — a pinned MQTT socket bound to it and span on connect forever).
-     * Callers should treat available-but-unvalidated as no-cellular and retry.
-     */
-    public static boolean isCellularValidated() {
-        Network cell = cellularNetwork;
-        if (cell == null || appContext == null) return false;
-        try {
-            ConnectivityManager cm = (ConnectivityManager)
-                    appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) return false;
-            NetworkCapabilities caps = cm.getNetworkCapabilities(cell);
-            return caps != null
-                    && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
-        } catch (Throwable t) {
-            CameraDaemon.log("NetworkMonitor: validated check failed: " + t.getMessage());
-            return false;
-        }
     }
 
     /**
