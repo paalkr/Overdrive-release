@@ -1,8 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Keep-alive AccessibilityService config.
+
+    Historically this service was lifecycle-only (no events, no window content) —
+    its sole job was to keep the process un-killable. Phase 2a adds a once-per-
+    install "auto-enable autostart" routine (AutoStartEnabler) that drives BYD's
+    com.byd.appstartmanagement dialog via the a11y APIs, so the config now also
+    grants window-content retrieval, interactive-window access and gestures.
+
+    canRetrieveWindowContent + flagRetrieveInteractiveWindows are what let
+    getWindows() reach BYD's dialog window (getRootInActiveWindow returns the
+    launcher, not the dialog — verified). canPerformGestures backs the
+    dispatchGesture coordinate-tap fallback. Window events let us notice the
+    dialog appear (the enabler primarily polls, so these are belt-and-suspenders).
+-->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
-    android:accessibilityEventTypes=""
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
     android:notificationTimeout="5000"
-    android:canRetrieveWindowContent="false"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
     android:settingsActivity="com.overdrive.app.ui.MainActivity" />

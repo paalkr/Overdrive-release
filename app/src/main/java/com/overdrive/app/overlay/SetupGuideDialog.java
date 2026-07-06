@@ -172,14 +172,33 @@ public class SetupGuideDialog {
      *   3. ACTION_APPLICATION_DETAILS_SETTINGS for OverDrive (legacy fallback)
      *   4. ACTION_APPLICATION_SETTINGS / ACTION_SETTINGS
      */
+    /** BYD AppStartManagement package — the privileged "Deaktiver Autostart" app. */
+    public static final String BYD_APPSTART_PKG = "com.byd.appstartmanagement";
+
+    /**
+     * The canonical explicit intent for BYD's autostart-management dialog
+     * (the "Deaktiver Autostart" screen with the per-app switches).
+     *
+     * Shared with {@code AutoStartEnabler}, which drives this same screen via the
+     * AccessibilityService to auto-flip OverDrive's switch after each reinstall.
+     * Kept in sync with the canonical deep link in {@link #openAutoStartSettings}.
+     * Includes FLAG_ACTIVITY_NEW_TASK so it can be launched from a non-Activity
+     * context (the a11y service). Throws ActivityNotFoundException at startActivity
+     * time on firmware without this component — callers must catch it.
+     */
+    public static Intent buildAppStartManagementIntent() {
+        Intent i = new Intent();
+        i.setComponent(new ComponentName(
+                BYD_APPSTART_PKG,
+                "com.byd.appstartmanagement.frame.AppStartManagement"));
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        return i;
+    }
+
     private static void openAutoStartSettings(Context context) {
         // 1) Canonical BYD deep link.
         try {
-            Intent direct = new Intent();
-            direct.setComponent(new ComponentName(
-                    "com.byd.appstartmanagement",
-                    "com.byd.appstartmanagement.frame.AppStartManagement"));
-            direct.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            Intent direct = buildAppStartManagementIntent();
             context.startActivity(direct);
             return;
         } catch (Exception e) {

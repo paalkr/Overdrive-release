@@ -40,15 +40,24 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
         Log.i(TAG, "AccessibilityService connected — process is now protected");
 
-        // Minimal config — we don't need to observe any events
+        // Config. Historically this was a lifecycle-only service (eventTypes=0,
+        // flags=0). Phase 2a's AutoStartEnabler needs window-content retrieval, so
+        // we now KEEP the capabilities declared in accessibility_service_config.xml
+        // instead of zeroing them. We OR in the window-retrieval flags rather than
+        // overwrite, so the XML-loaded flags survive. canRetrieveWindowContent is a
+        // capability (not a flag) granted from the XML at bind time — it can't be
+        // set here. Keep-alive is unaffected: process protection comes from the
+        // service binding itself, not from these fields.
         AccessibilityServiceInfo info = getServiceInfo();
         if (info == null) {
             info = new AccessibilityServiceInfo();
         }
-        info.eventTypes = 0; // No events
+        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                | AccessibilityEvent.TYPE_WINDOWS_CHANGED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
         info.notificationTimeout = 5000;
-        info.flags = 0;
+        info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                | AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
         setServiceInfo(info);
 
         // No foreground notification needed — DaemonKeepaliveService already has one.
@@ -59,6 +68,15 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             DaemonStartupManager.Companion.startOnBoot(getApplicationContext());
         } catch (Exception e) {
             Log.w(TAG, "Daemon startup from A11y service: " + e.getMessage());
+        }
+
+        // Phase 2a: once per (re)install, auto-flip OverDrive's BYD autostart
+        // switch OFF so autostart-after-reboot keeps working. No-op on ordinary
+        // reboots (fingerprint match) and idempotent if already OFF.
+        try {
+            new AutoStartEnabler(this).maybeRunForNewInstall();
+        } catch (Exception e) {
+            Log.w(TAG, "AutoStartEnabler trigger failed: " + e.getMessage());
         }
     }
 
