@@ -12,8 +12,10 @@ import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.overdrive.app.R;
+import com.overdrive.app.services.KeepAliveAccessibilityService;
 
 /**
  * First-launch and post-update setup guide.
@@ -96,9 +98,50 @@ public class SetupGuideDialog {
                 }));
         }
 
-        // Step 2: Auto-start restriction
-        TextView btnAutoStart = view.findViewById(R.id.btnOpenAutoStart);
-        btnAutoStart.setOnClickListener(v -> openAutoStartSettings(context));
+        // Step 2: Auto-start restriction.
+        // If the KeepAlive AccessibilityService is bound, drive the BYD
+        // "Deaktiver Autostart" switch automatically (button-triggered — never
+        // auto-run). Otherwise fall back to the manual deep-link, which is the
+        // pre-existing behaviour.
+        final TextView btnAutoStart = view.findViewById(R.id.btnOpenAutoStart);
+        final View ivAutoStartCheck = view.findViewById(R.id.ivAutoStartCheck);
+        btnAutoStart.setOnClickListener(v -> {
+            KeepAliveAccessibilityService svc = KeepAliveAccessibilityService.getInstance();
+            if (svc == null) {
+                // A11y service not enabled/bound — can't drive the dialog; open
+                // the manual settings deep-link (today's behaviour).
+                Log.i(TAG, "a11y service not bound — manual autostart deep-link");
+                openAutoStartSettings(context);
+                return;
+            }
+            // Working state while the enabler drives the BYD dialog.
+            btnAutoStart.setEnabled(false);
+            btnAutoStart.setText(context.getString(R.string.setup_autostart_enabling));
+            svc.runAutoStartEnabler((success, result) -> {
+                // Callback is posted on the main thread by the service, so these
+                // UI mutations are safe.
+                if (success) {
+                    Log.i(TAG, "autostart auto-enable done (result=" + result + ")");
+                    btnAutoStart.setText(context.getString(R.string.setup_autostart_enabled));
+                    btnAutoStart.setEnabled(false);
+                    if (ivAutoStartCheck != null) {
+                        ivAutoStartCheck.setVisibility(View.VISIBLE);
+                    }
+                } else {
+                    // NO_DIALOG / NO_ROW / FLIP_UNCONFIRMED / NOT_THIS_FIRMWARE /
+                    // busy(null) — re-enable, tell the user, and fall back to the
+                    // manual deep-link so they can flip it by hand.
+                    Log.w(TAG, "autostart auto-enable failed (result=" + result
+                            + ") — falling back to manual settings");
+                    btnAutoStart.setEnabled(true);
+                    btnAutoStart.setText(context.getString(R.string.setup_autostart_button));
+                    Toast.makeText(context,
+                            context.getString(R.string.setup_autostart_failed),
+                            Toast.LENGTH_LONG).show();
+                    openAutoStartSettings(context);
+                }
+            });
+        });
 
         // Step 3: Overlay permission
         TextView btnOverlay = view.findViewById(R.id.btnOpenOverlay);

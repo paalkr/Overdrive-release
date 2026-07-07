@@ -221,6 +221,9 @@
     <string name="setup_autostart_title">Disable Auto-Start Restriction</string>
     <string name="setup_autostart_body">Tap below to open BYD Auto-Start. Find OverDrive in the list and uncheck the box. BYD wipes this on every install — you\'ll redo it after updates.</string>
     <string name="setup_autostart_button">Open BYD Auto-Start</string>
+    <string name="setup_autostart_enabling">Enabling autostart…</string>
+    <string name="setup_autostart_enabled">Autostart enabled ✓</string>
+    <string name="setup_autostart_failed">Couldn\'t enable autostart automatically — opening BYD Auto-Start so you can do it by hand.</string>
     <string name="setup_overlay_title">Allow Display Over Other Apps</string>
     <string name="setup_overlay_body">Enable this to show a floating status indicator for recording and trip tracking on top of other apps.</string>
     <string name="setup_overlay_button">Open Overlay Settings</string>

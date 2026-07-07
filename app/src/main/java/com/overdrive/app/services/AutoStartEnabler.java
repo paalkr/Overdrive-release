@@ -3,10 +3,7 @@ package com.overdrive.app.services;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.ActivityNotFoundException;
-import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.pm.PackageInfo;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.os.Build;
@@ -25,36 +22,32 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Auto-re-enables OverDrive's autostart after each (re)install.
+ * Re-enables OverDrive's autostart by driving the BYD "Deaktiver Autostart" dialog.
  *
  * <p>BYD's DiLink firmware blocks any /data app from autostarting at boot unless
  * its per-app value in {@code com.byd.appstartmanagement} ("Deaktiver Autostart")
  * is toggled OFF. That value is RESET (app re-blocked) on every install/update but
- * PERSISTS across ordinary reboots. So this routine runs ONCE PER INSTALL — the
- * first time the a11y service connects after a new install fingerprint — and does
- * nothing on plain reboots.
+ * PERSISTS across ordinary reboots.
+ *
+ * <p>This runs ONLY when the user deliberately taps the autostart button in the
+ * setup wizard ({@link com.overdrive.app.overlay.SetupGuideDialog}), which appears
+ * once per fresh install with the user present and the display on. There is no
+ * auto-run: the earlier onServiceConnected + install-fingerprint trigger was
+ * removed because it re-fired on every a11y reconnect / app churn and repeatedly
+ * popped the BYD dialog.
  *
  * <p>The dialog is a {@code mShowToOwnerOnly} window above the launcher, so
  * {@code getRootInActiveWindow()} returns the launcher, not the dialog. Only
  * {@link AccessibilityService#getWindows()} (with flagRetrieveInteractiveWindows)
- * reaches its nodes. This first build doubles as the plan's V1 verification that
- * getWindows() actually surfaces the dialog — hence the verbose logging.
+ * reaches its nodes — hence the verbose logging.
  *
- * <p>Delegated to from {@link KeepAliveAccessibilityService}; takes the service as
- * its accessibility context. Single-flight guarded; never throws to the caller.
+ * <p>Driven from {@link KeepAliveAccessibilityService#runAutoStartEnabler}, which
+ * calls {@link #run()} on a background thread and posts the {@link Result} back on
+ * the main thread. Single-flight guarded; never throws to the caller.
  */
 public class AutoStartEnabler {
 
     private static final String TAG = "AutostartEnabler";
-
-    /**
-     * Feature flag. Default enabled. A full settings UI is out of scope for
-     * Phase 2a; flip this to false to disable the auto-enable behaviour entirely.
-     */
-    public static final boolean FEATURE_ENABLED = true;
-
-    private static final String PREFS_NAME = "overdrive_autostart";
-    private static final String KEY_APPLIED_FINGERPRINT = "applied_install_fingerprint";
 
     // BYD dialog package (the row-and-switch screen).
     private static final String BYD_APPSTART_PKG = SetupGuideDialog.BYD_APPSTART_PKG;
@@ -78,58 +71,40 @@ public class AutoStartEnabler {
     }
 
     // ---------------------------------------------------------------------
-    // Public entry points
+    // Public entry point
     // ---------------------------------------------------------------------
 
     /**
-     * Run the enabler on a background thread IF this is a new install (fingerprint
-     * mismatch) and the feature is enabled. Safe to call from onServiceConnected
-     * (main thread) — it offloads the blocking work itself.
+     * Drive the enabler once, synchronously, on the CALLER's thread — must NOT be
+     * the main thread (it blocks on getWindows() polling). Callers should invoke
+     * this from {@link KeepAliveAccessibilityService#runAutoStartEnabler}, which
+     * provides the background worker and posts the result back on the main thread.
+     *
+     * <p>Single-flight guarded so a double-tap can't double-run. Returns the final
+     * {@link Result}, or {@code null} if another run was already in flight.
      */
-    public void maybeRunForNewInstall() {
-        if (!FEATURE_ENABLED) {
-            log("feature disabled (FEATURE_ENABLED=false) — skipping");
-            return;
-        }
-        final Context ctx = service.getApplicationContext();
-        final String current = currentFingerprint(ctx);
-        final String applied = readAppliedFingerprint(ctx);
-        log("fingerprint check: current=" + current + " applied=" + applied);
-        if (current != null && current.equals(applied)) {
-            log("fingerprint matches (ordinary reboot / no reinstall) — nothing to do");
-            return;
-        }
-        log("fingerprint mismatch — a (re)install happened, running enabler once");
-        new Thread(this::runBlocking, "autostart-enabler").start();
-    }
-
-    // ---------------------------------------------------------------------
-    // Core state machine (background thread)
-    // ---------------------------------------------------------------------
-
-    private void runBlocking() {
+    public Result run() {
         if (!RUNNING.compareAndSet(false, true)) {
             log("another enabler run is already in flight — aborting this one");
-            return;
+            return null;
         }
+        Result last = Result.NO_DIALOG;
         try {
-            // Light, non-blocking UX guard: log the ACC state but still proceed.
-            // This runs right after a (re)install, which is a user-initiated app
-            // launch (foreground moment the user just triggered), so a brief
-            // dialog flash here is acceptable. We do NOT gate on parked/ACC —
-            // gating risks never running when the value is already reset.
+            // Log the ACC state for diagnostics; do NOT gate on it. This is a
+            // deliberate, user-initiated tap in the setup wizard (display on,
+            // user present), so a brief dialog flash is expected and fine.
             log("UX context: accOn=" + AccMonitor.isAccOn()
                     + " inSentry=" + AccMonitor.isInSentryMode()
-                    + " (not gating; proceeding)");
+                    + " (button-triggered; proceeding)");
 
             boolean success = false;
             for (int attempt = 1; attempt <= MAX_ATTEMPTS && !success; attempt++) {
                 log("attempt " + attempt + "/" + MAX_ATTEMPTS);
-                Result r = attemptOnce();
-                log("attempt " + attempt + " result=" + r);
-                if (r == Result.SUCCESS || r == Result.ALREADY_OFF) {
+                last = attemptOnce();
+                log("attempt " + attempt + " result=" + last);
+                if (last == Result.SUCCESS || last == Result.ALREADY_OFF) {
                     success = true;
-                } else if (r == Result.NOT_THIS_FIRMWARE) {
+                } else if (last == Result.NOT_THIS_FIRMWARE) {
                     // No appstartmanagement component — never going to work here.
                     log("appstartmanagement not present on this firmware — no retry");
                     break;
@@ -139,25 +114,20 @@ public class AutoStartEnabler {
             // Always close the dialog, whatever happened.
             closeDialog();
 
-            if (success) {
-                String fp = currentFingerprint(service.getApplicationContext());
-                writeAppliedFingerprint(service.getApplicationContext(), fp);
-                log("SUCCESS — persisted install fingerprint=" + fp);
-            } else {
-                // TODO(phase2b): post a user notification "Autostart not
-                // auto-enabled; tap to fix" deep-linking to the dialog. Not
-                // implemented in 2a — we only log the failure here.
-                log("FAILED after " + MAX_ATTEMPTS + " attempt(s) — fingerprint NOT persisted "
-                        + "(will retry on next service connect); notification hook TODO (phase 2b)");
-            }
+            log(success
+                    ? "SUCCESS — autostart switch is OFF (result=" + last + ")"
+                    : "FAILED after " + MAX_ATTEMPTS + " attempt(s) (result=" + last
+                            + ") — caller falls back to manual settings");
+            return last;
         } catch (Throwable t) {
-            log("runBlocking threw: " + t);
+            log("run threw: " + t);
+            return last;
         } finally {
             RUNNING.set(false);
         }
     }
 
-    private enum Result {
+    public enum Result {
         SUCCESS,          // switch flipped ON->OFF and confirmed
         ALREADY_OFF,      // switch was already OFF (idempotent no-op)
         NOT_THIS_FIRMWARE,// appstartmanagement activity missing -> abort, no retry
@@ -166,7 +136,7 @@ public class AutoStartEnabler {
         FLIP_UNCONFIRMED  // clicked but state didn't confirm OFF
     }
 
-    private Result attemptOnce() {
+    public Result attemptOnce() {
         // (a) Guard: service must be connected (getWindows returns [] otherwise).
         List<AccessibilityWindowInfo> pre = service.getWindows();
         if (pre == null) {
@@ -464,45 +434,6 @@ public class AutoStartEnabler {
         } catch (Throwable t) {
             log("closeDialog failed: " + t);
         }
-    }
-
-    // ---------------------------------------------------------------------
-    // Fingerprint (once-per-install gate)
-    // ---------------------------------------------------------------------
-
-    /**
-     * Install fingerprint that changes on EVERY (re)install even when versionCode
-     * is unchanged: the /data/app code path (regenerated each install) plus
-     * lastUpdateTime as a belt. Deliberately NOT keyed on versionCode — dev
-     * rebuilds reuse it.
-     */
-    private String currentFingerprint(Context ctx) {
-        String codePath = null;
-        try {
-            codePath = ctx.getPackageCodePath();
-        } catch (Throwable t) {
-            log("getPackageCodePath failed: " + t);
-        }
-        long lastUpdate = 0L;
-        try {
-            PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
-            lastUpdate = pi.lastUpdateTime;
-        } catch (Throwable t) {
-            log("lastUpdateTime lookup failed: " + t);
-        }
-        return codePath + "|" + lastUpdate;
-    }
-
-    private SharedPreferences prefs(Context ctx) {
-        return ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-    }
-
-    private String readAppliedFingerprint(Context ctx) {
-        return prefs(ctx).getString(KEY_APPLIED_FINGERPRINT, null);
-    }
-
-    private void writeAppliedFingerprint(Context ctx, String fp) {
-        prefs(ctx).edit().putString(KEY_APPLIED_FINGERPRINT, fp).apply();
     }
 
     // ---------------------------------------------------------------------
