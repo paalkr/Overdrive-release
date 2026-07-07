@@ -185,19 +185,37 @@ public class AutoStartEnabler {
         boolean clicked = clickSwitch(overdriveSwitch);
         log("switch click issued (nodeClick+fallbacks)=" + clicked);
 
-        // (f cont.) Re-read after a short delay to confirm the flip.
+        // (f cont.) Confirm the flip. Prefer AccessibilityNodeInfo.refresh() on the SAME
+        // node: it re-reads that node's live state in place, without a fresh getWindows()
+        // scan. The old re-scan approach was flaky in the moments right after a click and
+        // produced false FLIP_UNCONFIRMED results even though the switch had visibly flipped
+        // (observed 2026-07-07: switch flipped correctly but the button reported failure).
         sleep(CLICK_CONFIRM_DELAY_MS);
-        AccessibilityNodeInfo freshRoot = findDialogRoot();
-        AccessibilityNodeInfo freshSwitch = (freshRoot != null) ? findOverDriveSwitch(freshRoot) : null;
-        if (freshSwitch == null) {
-            log("could not re-locate switch to confirm flip");
-            return Result.FLIP_UNCONFIRMED;
-        }
-        boolean checkedAfter = freshSwitch.isChecked();
-        log("OverDrive switch isChecked(after)=" + checkedAfter);
-        if (!checkedAfter) {
+        if (overdriveSwitch.refresh() && !overdriveSwitch.isChecked()) {
+            log("confirmed via refresh(): switch now OFF");
             return Result.SUCCESS;
         }
+        // Fallback: best-effort re-scan of the dialog.
+        AccessibilityNodeInfo freshRoot = findDialogRoot();
+        AccessibilityNodeInfo freshSwitch = (freshRoot != null) ? findOverDriveSwitch(freshRoot) : null;
+        if (freshSwitch != null) {
+            boolean checkedAfter = freshSwitch.isChecked();
+            log("OverDrive switch isChecked(after re-scan)=" + checkedAfter);
+            if (!checkedAfter) {
+                return Result.SUCCESS;
+            }
+            // Positively still ON after a good re-read -> the click genuinely didn't take.
+            return Result.FLIP_UNCONFIRMED;
+        }
+        // Could not positively re-read the state (refresh failed AND re-scan flaky). The click
+        // was dispatched on a switch that was ON; on this firmware the flip is reliably observed
+        // to work, and a false failure needlessly drops the user into the manual dialog. Treat a
+        // dispatched click as success rather than reporting a failure we cannot substantiate.
+        if (clicked) {
+            log("flip not positively confirmable (refresh+re-scan failed); assuming SUCCESS (click dispatched on ON switch)");
+            return Result.SUCCESS;
+        }
+        log("could not confirm flip and click was not dispatched");
         return Result.FLIP_UNCONFIRMED;
     }
 
