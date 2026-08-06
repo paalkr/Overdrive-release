@@ -16,7 +16,7 @@ import java.lang.reflect.Method;
  * camera apps (reverse camera, dashcam, AVM parking view) because the service
  * knows about our session and can arbitrate buffer queues properly.
  * 
- * Transaction codes from BYD AutoCommander decompilation:
+ * Transaction codes from the OEM vehicle-control app (decompiled):
  *   1  = openCamera(cameraId)
  *   2  = closeCamera()
  *   3  = startPreview()
@@ -444,7 +444,7 @@ public class BinderCameraBackend {
     // ==================== Full Camera Start (convenience) ====================
 
     /**
-     * Full camera startup sequence matching the commander pattern.
+     * Full camera startup sequence matching the OEM camera pattern.
      * Opens camera, sets surface, configures size/fps, starts preview.
      * 
      * @param cameraId Camera ID to open

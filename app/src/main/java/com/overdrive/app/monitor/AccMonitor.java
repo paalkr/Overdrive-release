@@ -178,12 +178,45 @@ public class AccMonitor {
             } catch (Throwable t) {
                 CameraDaemon.log("notifyAccEdge ACC-off stop failed: " + t.getMessage());
             }
-            // ACC-OFF: ALSO force-close any TRANSIENT blind-spot cluster projection
-            // so the gauges are restored IMMEDIATELY (not after the 8s linger). No-op
-            // if the projection was never opened (controller singleton null) or is
-            // already closed. The BS turn loop is gated against re-opening after an
-            // authoritative ACC-off (see GpuSurveillancePipeline.bsTurnTick), so this
-            // close is not re-asserted by the next 250ms tick mid-blink.
+            // ACC-OFF: reconcile any driver-cluster APP CAST (move-app-to-cluster). Its
+            // "castapp" sustained hold is dropped by the forceClose below (which clears
+            // all holders + restores the gauges), but ClusterCast keeps its own active
+            // flag — stop() reconciles it so a later isActive()/start() isn't confused.
+            // Idempotent + no-op if nothing is cast.
+            try {
+                if (com.overdrive.app.launcher.ClusterCast.isActive()) {
+                    CameraDaemon.log("ACC-off edge: stopping cluster app cast");
+                    // ACC-off-safe stop: release the hold only, NO am/shell reparent work in
+                    // the load-bearing SF teardown window below (mirror-VD-before-source).
+                    com.overdrive.app.launcher.ClusterCast.stopForAccOff();
+                }
+            } catch (Throwable t) {
+                CameraDaemon.log("notifyAccEdge ACC-off cluster cast stop failed: " + t.getMessage());
+            }
+            // ACC-OFF: tear down the head-unit cluster MIRROR FIRST — BEFORE the OEM
+            // projection close below. ORDER IS LOAD-BEARING: the mirror owns its OWN
+            // SurfaceFlinger virtual display that reads the fission cluster layerStack (the
+            // SOURCE) and outputs into a head-unit SurfaceControl layer. If the OEM
+            // projection close destroys the fission source display while our virtual display
+            // is still bound + compositing (and the head-unit panel is power-gating at
+            // ACC-off), SurfaceFlinger faults natively and the crash cascades to kill BOTH
+            // the daemon and the app until the next ACC-on. forceCloseIfActive is
+            // SYNCHRONOUS (awaits the unbind+destroy) so the mirror's VD is fully gone
+            // before we touch the source. No-op if the mirror was never started.
+            try {
+                // Detach the view-into-Surface mirror FIRST (unbind its SF display before the
+                // fission source closes — same load-bearing ordering as the legacy mirror).
+                com.overdrive.app.surveillance.ClusterViewMirrorService.forceDetachIfActive("acc-off");
+                com.overdrive.app.surveillance.ClusterMirrorController.forceCloseIfActive("acc-off");
+            } catch (Throwable t) {
+                CameraDaemon.log("notifyAccEdge ACC-off cluster mirror stop failed: " + t.getMessage());
+            }
+            // ACC-OFF: THEN force-close any TRANSIENT blind-spot cluster projection so the
+            // gauges are restored IMMEDIATELY (not after the 8s linger). No-op if the
+            // projection was never opened (controller singleton null) or is already closed.
+            // The BS turn loop is gated against re-opening after an authoritative ACC-off
+            // (see GpuSurveillancePipeline.bsTurnTick), so this close is not re-asserted by
+            // the next 250ms tick mid-blink.
             try {
                 com.overdrive.app.surveillance.ClusterProjectionController.forceCloseIfActive("acc-off");
             } catch (Throwable t) {
@@ -191,15 +224,71 @@ public class AccMonitor {
             }
             return;
         }
+        // ACC-ON: wake the panel from THIS process too. AccSentryDaemon already
+        // wakes it on its own ACC-ON edge, but that daemon is a separate process
+        // and can be dead, wedged, or killed mid-park — in which case nothing
+        // there runs and the driver is handed a dark screen with no way to
+        // recover. byd_cam_daemon is independently watchdogged and also UID 2000,
+        // which makes this the natural second wake path. This is the narrowest
+        // de-duped OFF→ON edge in the process and is reached from BOTH the IPC
+        // path and the independent hardware probe, so it also covers a
+        // lost/never-sent ACC-ON IPC.
+        //
+        // turnOn() self-skips when getPowerScreenStatus() already reads on, so
+        // this is effectively free whenever the panel is already awake —
+        // including on the whole DiLink 3 fleet. Dispatched off this thread: it
+        // does binder reflection round-trips and this edge runs on the IPC/probe
+        // thread, where the side effects below expect to stay quick.
+        // Stamp the real ACC-ON edge so StealthPanel honours "vehicle in use" and
+        // suppresses any darken attempt during the transition (notably the screen
+        // deterrent's teardown, which runs in this process). Cheap volatile write;
+        // done inline, before the dispatch, so the suppression is in effect
+        // immediately rather than after a thread starts.
         try {
-            org.json.JSONObject nav = com.overdrive.app.config.UnifiedConfigManager.forceReload().optJSONObject("navMap");
-            boolean auto = nav != null && nav.optBoolean("autoProjectCluster", false);
-            if (auto) {
+            com.overdrive.app.power.StealthPanel.noteAccOnObserved();
+        } catch (Throwable ignored) {}
+        try {
+            new Thread(() -> {
+                try {
+                    com.overdrive.app.power.StealthPanel.turnOn(CameraDaemon.getAppContext());
+                } catch (Throwable t) {
+                    CameraDaemon.log("notifyAccEdge panel wake failed: " + t.getMessage());
+                }
+            }, "StealthPanelWake-AccOn").start();
+        } catch (Throwable t) {
+            CameraDaemon.log("notifyAccEdge panel wake dispatch failed: " + t.getMessage());
+        }
+        try {
+            // ACC-ON: at most ONE cluster takeover can auto-start (the cluster is a single
+            // surface). Read BOTH auto-start settings from a SINGLE config snapshot:
+            //   navMap.autoProjectCluster      → auto-project the RoadSense map, and
+            //   projection.autoStartOnAcc      → auto-cast projection.autoStartPackage.
+            // The two toggles are mutually exclusive at the WRITE layer (each UI clears the
+            // sibling), but a client race / OTA merge could leave both true — so we also
+            // enforce a deterministic tiebreak HERE: the map wins (established feature, and
+            // navigation is the safer thing to surface on the gauges).
+            org.json.JSONObject cfg = com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            org.json.JSONObject nav = cfg.optJSONObject("navMap");
+            boolean mapAuto = nav != null && nav.optBoolean("autoProjectCluster", false);
+            org.json.JSONObject proj = cfg.optJSONObject("projection");
+            boolean projAuto = proj != null && proj.optBoolean("autoStartOnAcc", false);
+            String projPkg = proj != null ? proj.optString("autoStartPackage", "") : "";
+            if (mapAuto && projAuto) {
+                CameraDaemon.log("ACC-on edge: BOTH cluster auto-starts enabled "
+                        + "(mutual-exclusion violated) — map wins, skipping projection auto-cast");
+                projAuto = false;
+            }
+            if (mapAuto) {
                 CameraDaemon.log("ACC-on edge: auto-projecting map to cluster");
                 com.overdrive.app.navmap.ClusterMapProjector.start();
+            } else if (projAuto && projPkg != null && !projPkg.isEmpty()) {
+                CameraDaemon.log("ACC-on edge: auto-casting projection app " + projPkg + " to cluster");
+                // Cast ONLY — the head-unit mirror is app-foreground-only (needs a resumed
+                // ProjectionFragment + live box geometry), so it is NOT started here.
+                com.overdrive.app.launcher.ClusterCast.start(projPkg);
             }
         } catch (Throwable t) {
-            CameraDaemon.log("notifyAccEdge auto-project check failed: " + t.getMessage());
+            CameraDaemon.log("notifyAccEdge auto-start check failed: " + t.getMessage());
         }
     }
 

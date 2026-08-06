@@ -282,6 +282,7 @@ class DashboardFragment : Fragment() {
             // moment a daemon is being launched, without waiting for RUNNING.
             updateHeroSubtitle(running, total, computeCoreHealth(states))
             rebuildTunnelChips()
+            updateTunnelTile()
             refreshHeroChips()
         }
 
@@ -598,30 +599,38 @@ class DashboardFragment : Fragment() {
     }
 
     private fun updateTunnelTile() {
-        val anyUrl = listOf(
-            daemonsViewModel.cloudflaredController.tunnelUrl.value,
-            daemonsViewModel.zrokController.tunnelUrl.value,
-            daemonsViewModel.tailscaleController.tunnelUrl.value
-        ).any { !it.isNullOrEmpty() }
-
         val states = daemonsViewModel.daemonStates.value
-        val anyStarting = states?.values?.any {
-            (it.type == DaemonType.CLOUDFLARED_TUNNEL ||
-                it.type == DaemonType.ZROK_TUNNEL ||
-                it.type == DaemonType.TAILSCALE_TUNNEL) &&
-                it.status == DaemonStatus.STARTING
-        } == true
+        val display = com.overdrive.app.ui.model.TunnelDisplayPolicy.resolve(
+            daemonsViewModel.zrokController.tunnelUrl.value,
+            daemonsViewModel.cloudflaredController.tunnelUrl.value,
+            daemonsViewModel.tailscaleController.tunnelUrl.value,
+            states?.get(DaemonType.ZROK_TUNNEL)?.status,
+            states?.get(DaemonType.CLOUDFLARED_TUNNEL)?.status,
+            states?.get(DaemonType.TAILSCALE_TUNNEL)?.status,
+        )
 
-        when {
-            anyUrl -> {
+        when (display.kind) {
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.ONLINE -> {
                 metricTunnelValue.text = getString(R.string.dashboard_tunnel_online)
                 tunnelStateDot.setBackgroundResource(R.drawable.status_dot_online)
             }
-            anyStarting -> {
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STARTING_ZROK,
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STARTING_CLOUDFLARED,
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STARTING_TAILSCALE,
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.WAITING_FOR_URL -> {
                 metricTunnelValue.text = getString(R.string.dashboard_tunnel_connecting)
+                // Amber, matching the toolbar pill for these states.
+                tunnelStateDot.setBackgroundResource(R.drawable.status_dot_starting)
+            }
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STOPPING -> {
+                metricTunnelValue.text = getString(R.string.dashboard_tunnel_tile_stopping)
+                tunnelStateDot.setBackgroundResource(R.drawable.status_dot_starting)
+            }
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.FAILED -> {
+                metricTunnelValue.text = getString(R.string.dashboard_tunnel_tile_failed)
                 tunnelStateDot.setBackgroundResource(R.drawable.status_dot_offline)
             }
-            else -> {
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.HIDDEN -> {
                 metricTunnelValue.text = getString(R.string.dashboard_tunnel_offline)
                 tunnelStateDot.setBackgroundResource(R.drawable.status_dot_offline)
             }
@@ -683,14 +692,24 @@ class DashboardFragment : Fragment() {
 
     private fun collectAvailableTunnels(): List<Pair<DaemonType, String>> {
         val list = mutableListOf<Pair<DaemonType, String>>()
+        val states = daemonsViewModel.daemonStates.value
         daemonsViewModel.cloudflaredController.tunnelUrl.value
-            ?.takeIf { it.isNotEmpty() }
+            ?.takeIf {
+                com.overdrive.app.ui.model.TunnelDisplayPolicy.isActiveUrl(
+                    it, states?.get(DaemonType.CLOUDFLARED_TUNNEL)?.status)
+            }
             ?.let { list.add(DaemonType.CLOUDFLARED_TUNNEL to it) }
         daemonsViewModel.zrokController.tunnelUrl.value
-            ?.takeIf { it.isNotEmpty() }
+            ?.takeIf {
+                com.overdrive.app.ui.model.TunnelDisplayPolicy.isActiveUrl(
+                    it, states?.get(DaemonType.ZROK_TUNNEL)?.status)
+            }
             ?.let { list.add(DaemonType.ZROK_TUNNEL to it) }
         daemonsViewModel.tailscaleController.tunnelUrl.value
-            ?.takeIf { it.isNotEmpty() }
+            ?.takeIf {
+                com.overdrive.app.ui.model.TunnelDisplayPolicy.isActiveUrl(
+                    it, states?.get(DaemonType.TAILSCALE_TUNNEL)?.status)
+            }
             ?.let { list.add(DaemonType.TAILSCALE_TUNNEL to it) }
         return list
     }
@@ -904,7 +923,15 @@ class DashboardFragment : Fragment() {
                 if (conn.responseCode == 200) {
                     val body = conn.inputStream.bufferedReader().use { it.readText() }
                     val json = org.json.JSONObject(body)
-                    val m = json.optString("modelId", "")
+                    val m = when {
+                        json.has("selectedModelId") && !json.isNull("selectedModelId") ->
+                            json.optString("selectedModelId", "")
+                        json.has("modelSource")
+                                && json.optString("modelSource", "unset") == "unset" -> ""
+                        // Backward compatibility with an older daemon that does
+                        // not expose selection provenance yet.
+                        else -> json.optString("modelId", "")
+                    }
                     if (m.isNotEmpty()) modelId = m
                 }
                 conn.disconnect()
@@ -914,7 +941,7 @@ class DashboardFragment : Fragment() {
                 if (!isAdded || view == null) return@post
                 if (nominalKwh > 0) {
                     tile.text = if (modelId != null) {
-                        getString(R.string.dashboard_vehicle_summary, nominalKwh, modelId.replaceFirstChar { it.uppercase() })
+                        getString(R.string.dashboard_vehicle_summary, nominalKwh, modelDisplayName(modelId))
                     } else {
                         String.format("%.1f kWh", nominalKwh)
                     }
@@ -932,8 +959,8 @@ class DashboardFragment : Fragment() {
      * `internal` so the onboarding vehicle chapter can launch the real dialog via
      * MainActivity.openVehicleProfileForOnboarding() rather than reimplementing it.
      */
-    internal fun showVehicleCapacityDialog() {
-        val ctx = context ?: return
+    internal fun showVehicleCapacityDialog(onFinished: (() -> Unit)? = null): Boolean {
+        val ctx = context ?: return false
 
         // Inflate the M3 layout (outlined inputs + ExposedDropdownMenu).
         val dialogView = layoutInflater.inflate(
@@ -1041,10 +1068,15 @@ class DashboardFragment : Fragment() {
                             // The previous version read "title" first which never
                             // existed in our manifest, so models showed as the
                             // id text. Ordering: name → title → id.
-                            val title = when {
+                            val canonicalTitle = when {
                                 m.optString("name", "").isNotEmpty() -> m.optString("name")
                                 m.optString("title", "").isNotEmpty() -> m.optString("title")
                                 else -> id
+                            }
+                            val title = if (id.equals("seagull", ignoreCase = true)) {
+                                ctx.getString(R.string.vehicle_model_seagull)
+                            } else {
+                                canonicalTitle
                             }
                             // nominalKwh is the manifest's canonical pack
                             // capacity for this model. 0 means the manifest
@@ -1063,7 +1095,13 @@ class DashboardFragment : Fragment() {
                 if (conn.responseCode == 200) {
                     val body = conn.inputStream.bufferedReader().use { it.readText() }
                     val json = org.json.JSONObject(body)
-                    val m = json.optString("modelId", "")
+                    val m = when {
+                        json.has("selectedModelId") && !json.isNull("selectedModelId") ->
+                            json.optString("selectedModelId", "")
+                        json.has("modelSource")
+                                && json.optString("modelSource", "unset") == "unset" -> ""
+                        else -> json.optString("modelId", "")
+                    }
                     if (m.isNotEmpty()) initialModelId = m
                 }
                 conn.disconnect()
@@ -1152,26 +1190,64 @@ class DashboardFragment : Fragment() {
             }
         }
 
-        com.google.android.material.dialog.MaterialAlertDialogBuilder(ctx, R.style.Theme_Overdrive_M3_Dialog)
+        var completionDeferred = false
+        var completionSent = false
+        fun finishOnce() {
+            if (!completionSent) {
+                completionSent = true
+                onFinished?.invoke()
+            }
+        }
+
+        val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(
+            ctx, R.style.Theme_Overdrive_M3_Dialog)
             .setTitle(getString(R.string.vehicle_dialog_title))
             .setView(dialogView)
-            .setPositiveButton(getString(R.string.vehicle_dialog_save)) { _, _ ->
+            // Install button listeners after show so invalid capacity does not
+            // trigger AlertDialog's default auto-dismiss behavior.
+            .setPositiveButton(getString(R.string.vehicle_dialog_save), null)
+            .setNeutralButton(getString(R.string.vehicle_dialog_reset), null)
+            .setNegativeButton(getString(R.string.action_cancel), null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener {
                 val raw = capInput.text?.toString()?.trim().orEmpty()
                 val kwh = raw.toDoubleOrNull()
                 if (kwh == null || kwh < 15.0 || kwh > 120.0) {
                     Toast.makeText(ctx, getString(R.string.vehicle_dialog_invalid_capacity), Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
+                    return@setOnClickListener
                 }
-                postNominalAndModel(kwh, selectedModelId)
+                completionDeferred = true
+                postNominalAndModel(kwh, selectedModelId) { finishOnce() }
+                dialog.dismiss()
             }
-            .setNeutralButton(getString(R.string.vehicle_dialog_reset)) { _, _ ->
-                postNominal(null)
+            dialog.getButton(android.content.DialogInterface.BUTTON_NEUTRAL).setOnClickListener {
+                completionDeferred = true
+                postNominal(
+                    kwh = null,
+                    clearModelSelection = true,
+                    onComplete = { finishOnce() },
+                )
+                dialog.dismiss()
             }
-            .setNegativeButton(getString(R.string.action_cancel), null)
-            .show()
+            dialog.getButton(android.content.DialogInterface.BUTTON_NEGATIVE).setOnClickListener {
+                dialog.dismiss()
+            }
+        }
+        dialog.setOnDismissListener {
+            // Save/reset wait for both daemon writes. Cancel, back, and
+            // outside-tap complete the optional onboarding chapter immediately.
+            if (!completionDeferred) finishOnce()
+        }
+        dialog.show()
+        return true
     }
 
-    private fun postNominal(kwh: Double?) {
+    private fun postNominal(
+        kwh: Double?,
+        clearModelSelection: Boolean = false,
+        onComplete: (() -> Unit)? = null,
+    ) {
         val executor = metricsExecutor ?: Executors.newSingleThreadExecutor()
             .also { metricsExecutor = it }
         executor.execute {
@@ -1185,11 +1261,33 @@ class DashboardFragment : Fragment() {
                 conn.responseCode
                 conn.disconnect()
             } catch (_: Throwable) {}
-            mainHandler.post { refreshVehicleTile() }
+
+            if (clearModelSelection) {
+                try {
+                    val conn = com.overdrive.app.util.DaemonHttpClient.open(
+                        "/api/models/selected", "POST", 3000, 5000)
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.outputStream.use {
+                        it.write("{\"clearModelSelection\":true}".toByteArray())
+                    }
+                    conn.responseCode
+                    conn.disconnect()
+                } catch (_: Throwable) {}
+            }
+
+            mainHandler.post {
+                refreshVehicleTile()
+                onComplete?.invoke()
+            }
         }
     }
 
-    private fun postNominalAndModel(kwh: Double, modelId: String?) {
+    private fun postNominalAndModel(
+        kwh: Double,
+        modelId: String?,
+        onComplete: (() -> Unit)? = null,
+    ) {
         val executor = metricsExecutor ?: Executors.newSingleThreadExecutor()
             .also { metricsExecutor = it }
         executor.execute {
@@ -1215,7 +1313,10 @@ class DashboardFragment : Fragment() {
                 } catch (_: Throwable) {}
             }
 
-            mainHandler.post { refreshVehicleTile() }
+            mainHandler.post {
+                refreshVehicleTile()
+                onComplete?.invoke()
+            }
         }
     }
 
@@ -1231,7 +1332,7 @@ class DashboardFragment : Fragment() {
             "song" -> "BYD Song"
             "qin" -> "BYD Qin"
             "dolphin" -> "BYD Dolphin"
-            "seagull" -> "BYD Seagull"
+            "seagull" -> getString(R.string.vehicle_model_seagull)
             "sealion6" -> "BYD Sealion 6"
             "sealion7" -> "BYD Sealion 7"
             "sealu", "seal-u" -> "BYD Seal U"

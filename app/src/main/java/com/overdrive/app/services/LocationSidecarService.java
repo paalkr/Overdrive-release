@@ -74,14 +74,6 @@ public class LocationSidecarService extends Service implements LocationListener 
     private Location lastProcessedLocation = null;
     private long lastProcessedTime = 0;
 
-    // Instrumentation: settle whether the provider's onLocationChanged actually
-    // fires (background-looper delivery has been suspect — GpsMonitor was only
-    // advancing every 4s, the old poll interval) or whether the periodic
-    // getLastKnownLocation poll is the sole feeder. Counts are logged every ~30s
-    // so a single drive shows the real callback rate vs the poll rate.
-    private volatile int providerFixCount = 0;   // real LocationListener callbacks
-    private volatile int pollFixCount = 0;        // fixes injected by the periodic poll
-    private long lastRateLogTime = 0;
     // Wall-clock (ms) of the last accepted GPS_PROVIDER fix. Used to REJECT a coarse
     // NETWORK_PROVIDER fix while a recent real GPS fix is still valid — see
     // onLocationChanged. 0 until the first GPS fix arrives.
@@ -212,14 +204,28 @@ public class LocationSidecarService extends Service implements LocationListener 
                 // fresh at ~1Hz even if the onLocationChanged callback isn't
                 // delivering on this background looper — this poll then picks up a
                 // fresh distinct fix each tick.
-                if (permissionGranted && locationManager != null) {
+                // STALENESS-GATED: only poll when the provider CALLBACK has gone
+                // quiet. The comment above describes the callback-not-delivering
+                // failure mode this poll exists to cover — but the listener is now
+                // registered with an explicit looper (see requestLocationUpdates
+                // below), so in the healthy case the callback DOES deliver and this
+                // poll was a redundant binder round-trip into system_server every
+                // second for the entire drive, whose fix then re-passed processFix's
+                // >1.5m/>500ms gate and triggered a SECOND TCP write for the same
+                // position. Skipping while callbacks are fresh removes that per-second
+                // cost; the backstop is preserved bit-for-bit because the moment
+                // callbacks stop for >CALLBACK_STALE_MS we resume polling exactly as
+                // before. Threshold is 3s: comfortably under RoadSense's 5s
+                // fix-staleness cutoff, so a fallback still lands in time.
+                boolean callbacksStale =
+                        (System.currentTimeMillis() - lastCallbackFixAtMs) > CALLBACK_STALE_MS;
+                if (callbacksStale && permissionGranted && locationManager != null) {
                     try {
                         Location lastGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
                         if (lastGps != null) {
                             long fixAge = System.currentTimeMillis() - lastGps.getTime();
                             if (fixAge < 10000) {
                                 // Fresh fix available that we might have missed
-                                pollFixCount++;
                                 processFix(lastGps);
                             }
                         }
@@ -228,23 +234,6 @@ public class LocationSidecarService extends Service implements LocationListener 
                     } catch (Exception e) {
                         // Ignore
                     }
-                }
-
-                // Log provider-callback vs poll delivery rate every ~30s so one
-                // drive settles which path feeds GpsMonitor.
-                long nowLog = System.currentTimeMillis();
-                if (nowLog - lastRateLogTime >= 30000) {
-                    if (lastRateLogTime != 0) {
-                        long dt = nowLog - lastRateLogTime;
-                        Log.i(TAG, String.format(
-                            "GPS rate over %.0fs: provider callbacks=%d (%.2f Hz), poll fixes=%d (%.2f Hz)",
-                            dt / 1000.0,
-                            providerFixCount, providerFixCount * 1000.0 / dt,
-                            pollFixCount, pollFixCount * 1000.0 / dt));
-                    }
-                    lastRateLogTime = nowLog;
-                    providerFixCount = 0;
-                    pollFixCount = 0;
                 }
 
                 // Periodic keep-alive / poll / daemon-restart recovery. Dropped
@@ -384,12 +373,26 @@ public class LocationSidecarService extends Service implements LocationListener 
         }
     }
 
+    // Wall-clock of the last GPS_PROVIDER fix delivered by the PROVIDER CALLBACK
+    // (as opposed to the periodic getLastKnownLocation poll). Lets the poll skip
+    // itself while GPS callbacks are healthy — see periodicSender.
+    //
+    // MUST be stamped only for GPS_PROVIDER. Both GPS (1s) and NETWORK (5s) are
+    // registered on this same listener, and processFix DISCARDS network fixes when
+    // GPS is fresh or when the accuracy delta guard trips. Stamping on any
+    // provider meant a 5s network tick — including one that was then thrown away —
+    // marked callbacks "healthy" and suppressed the GPS backstop poll for 3 of
+    // every 5 seconds during a GPS dropout, i.e. exactly when the backstop is
+    // needed. That degraded the distinct-fix rate feeding RoadSense's
+    // GpsRingBuffer back-projection.
+    private volatile long lastCallbackFixAtMs = 0;
+
     @Override
     public void onLocationChanged(Location location) {
-        // Real provider callback (distinct from the periodic poll's re-injection,
-        // which calls processFix directly). Counting here isolates whether the
-        // LocationManager callback is delivering on the background looper at all.
-        providerFixCount++;
+        if (location != null
+                && LocationManager.GPS_PROVIDER.equals(location.getProvider())) {
+            lastCallbackFixAtMs = System.currentTimeMillis();
+        }
         processFix(location);
     }
 
@@ -450,6 +453,25 @@ public class LocationSidecarService extends Service implements LocationListener 
         altitude = location.hasAltitude() ? location.getAltitude() : 0.0;
         fixTimeMs = location.getTime();
         
+        // Altitude: PREFER mean-sea-level (MSL) height when the platform can
+        // supply it. Location.getAltitude() returns height above the WGS84
+        // ELLIPSOID, which differs from MSL by the local geoid undulation
+        // (roughly −100 m … +85 m worldwide; strongly POSITIVE across Europe and
+        // much of Asia, so ellipsoidal altitude reads tens of metres HIGH there
+        // vs. a map/altimeter — the "altitude too high" report). Android 14
+        // (API 34) added getMslAltitudeMeters(), populated only when the GNSS HAL
+        // provides the geoid correction — hence the hasMslAltitude() guard, with
+        // the ellipsoidal value as the fallback on older platforms / HALs that
+        // don't report it. The correction is a near-constant local offset, so it
+        // does NOT change trip elevation gain/loss (computed from altitude deltas,
+        // where a constant offset cancels) — only the absolute altitude we store,
+        // send to ABRP/MQTT, and expose to RoadSense.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+                && location.hasMslAltitude()) {
+            altitude = location.getMslAltitudeMeters();
+        } else {
+            altitude = location.hasAltitude() ? location.getAltitude() : 0.0;
+        }
         // Fix age basis = the MONOTONIC since-boot clock, NOT UTC getTime(). The
         // earlier attempt used location.getTime() (GNSS-UTC) and aged it against
         // the daemon's System.currentTimeMillis() (device RTC) — two clock domains.
@@ -512,12 +534,58 @@ public class LocationSidecarService extends Service implements LocationListener 
                 Log.d(TAG, "Location update (moved=" + String.format("%.1f", distanceMoved) + "m): " + latitude + ", " + longitude);
             }
             
-            // Send to daemon via IPC
+            // Send to daemon via IPC — NOT throttled. This is the live path the
+            // daemon ages fixes against (geo-tagging staleness, RoadSense
+            // back-projection, nav puck), so it must keep the full provider rate.
             sendGpsViaTcp();
-            
-            // Also save to app's local cache (persists across reboots, readable by daemon)
-            saveToLocalCache();
+
+            // Persist to the on-disk cache — THROTTLED (see CACHE_WRITE_MIN_INTERVAL_MS).
+            saveToLocalCacheThrottled(now);
         }
+    }
+
+    /**
+     * Minimum spacing between gps_cache.json writes.
+     *
+     * <p>WHY (perf): saveToLocalCache() serializes a JSONObject, writes a temp
+     * file, renames it over the real one, and chmods it. It used to run on EVERY
+     * processed fix — and the gate above admits every provider fix (the time
+     * clause is 500 ms, deliberately half the 1 s provider period), so this was
+     * a JSON-serialize + create + write + rename + chmod at ~1 Hz for the entire
+     * drive: on the order of 86k write+rename cycles per day of driving, all on
+     * the same flash the recorder is writing to.
+     *
+     * <p>Why 5 s is safe: this file exists ONLY as a cold-start seed so the
+     * daemon has a last-known position before the first live fix arrives. It is
+     * not on any live path — the daemon reads live fixes over IPC (above), and
+     * per saveToLocalCache()'s own contract a cache-loaded fix is rejected by
+     * {@code isLoadedFromCache} in the geo gate, so it is never used for an age
+     * decision. The worst observable effect of a 5 s bound is that a cache
+     * restored after an unclean restart can be up to 5 s (≈ a few tens of
+     * metres) staler than before — well inside the 5 s max-fix-age the geo gate
+     * already enforces.
+     */
+    private static final long CACHE_WRITE_MIN_INTERVAL_MS = 5_000;
+
+    /** How long the provider callback must be silent before the periodic
+     *  getLastKnownLocation fallback re-engages. Under RoadSense's 5s
+     *  fix-staleness cutoff so a fallback fix still arrives in time. */
+    private static final long CALLBACK_STALE_MS = 3_000;
+    private long lastCacheWriteAtMs = 0;
+
+    /**
+     * Rate-limited wrapper around {@link #saveToLocalCache()}. Always writes the
+     * first fix (so a cold start seeds the cache immediately) and then at most
+     * once per {@link #CACHE_WRITE_MIN_INTERVAL_MS}. Called only from the
+     * single-threaded location callback, so the timestamp needs no lock.
+     */
+    private void saveToLocalCacheThrottled(long now) {
+        if (lastCacheWriteAtMs != 0
+                && (now - lastCacheWriteAtMs) < CACHE_WRITE_MIN_INTERVAL_MS) {
+            return;
+        }
+        lastCacheWriteAtMs = now;
+        saveToLocalCache();
     }
     
     /**
@@ -724,6 +792,23 @@ public class LocationSidecarService extends Service implements LocationListener 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.i(TAG, "Service started");
+        // "Vehicle ON only" parked-shutdown gate: if the stack was terminated for the
+        // parked window, this sidecar (1Hz GPS→IPC loop to the now-dead CameraDaemon)
+        // must not keep running/respawning. Self-stop and stay down until ACC-on recovery
+        // clears the marker. Guarded on onOnly (fail-open) so onAndOff is unaffected. The
+        // recoveryInProgress guard avoids self-stopping on the recovery edge before the
+        // async marker clear lands. Mirrors DaemonKeepaliveService.onStartCommand.
+        try {
+            if (com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()
+                    && new java.io.File(com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH).exists()
+                    && !com.overdrive.app.ui.daemon.DaemonStartupManager.getRecoveryInProgress()) {
+                Log.i(TAG, "onOnly + parked-shutdown marker present — stopping location sidecar");
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "parked-marker gate failed (" + t.getMessage() + ") — proceeding");
+        }
         return START_STICKY;
     }
 
@@ -742,6 +827,25 @@ public class LocationSidecarService extends Service implements LocationListener 
 
         if (locationManager != null) {
             locationManager.removeUpdates(this);
+        }
+
+        // FINAL FLUSH of the on-disk position cache. saveToLocalCache() is
+        // rate-limited on the live path (CACHE_WRITE_MIN_INTERVAL_MS), so at any
+        // moment up to that interval of movement may not be on disk yet. Without
+        // an unconditional write here, a teardown landing inside that window
+        // (ACC-off, parked shutdown, service restart, process kill) would leave
+        // the cache holding a position up to CACHE_WRITE_MIN_INTERVAL_MS old —
+        // which is exactly the value the next cold start seeds from. Bypasses the
+        // throttle deliberately: this is a one-shot on a path that is already
+        // tearing down, not a hot path.
+        //
+        // Posted to the worker looper (NOT run inline) because that thread owns
+        // the file: quitSafely() below lets the looper drain queued work first,
+        // and saveToLocalCache reads the volatile position fields the GPS
+        // callback writes on that same thread. Ordering: after removeUpdates()
+        // so no new fix can race it, before quitSafely() so it is still drained.
+        if (handler != null) {
+            handler.post(this::saveToLocalCache);
         }
 
         // Stop the background looper (callbacks already removed above).

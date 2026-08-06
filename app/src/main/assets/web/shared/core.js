@@ -18,16 +18,20 @@ window.BYD = window.BYD || {};
  * Why a custom runtime instead of i18next:
  *   - APK perf budget; i18next + Intl.PluralRules polyfill ~80KB minified.
  *   - Chrome 58 lacks Intl.PluralRules and modern template strings; we hand-roll
- *     plural rules from CLDR for our 16 supported langs (~3KB total).
+ *     plural rules from CLDR for our supported langs (~3KB total).
  *   - One synchronous load before first paint avoids the flash-of-English.
  */
 BYD.i18n = (function () {
     var SUPPORTED = [
         'en', 'zh-CN', 'zh-TW', 'pt-BR', 'es', 'de', 'fr', 'it',
-        'nb', 'nl', 'ja', 'ko', 'th', 'vi', 'hi', 'tr', 'ru'
+        'nb', 'nl', 'ja', 'ko', 'th', 'vi', 'hi', 'tr', 'ru', 'ar'
     ];
     var DEFAULT_LANG = 'en';
     var STORAGE_KEY = 'overdrive_locale';
+
+    // Right-to-left locales. Drives <html dir="rtl">. Arabic is the only RTL
+    // language we ship; add he/fa/ur here if they're ever onboarded.
+    var RTL_LANGS = { 'ar': true };
 
     // Native-script display labels (sidebar picker shows these — no flags by design).
     var DISPLAY_NAMES = {
@@ -47,7 +51,8 @@ BYD.i18n = (function () {
         'vi':    'Tiếng Việt',
         'hi':    'हिन्दी',
         'tr':    'Türkçe',
-        'ru':    'Русский'
+        'ru':    'Русский',
+        'ar':    'العربية'
     };
 
     // CLDR plural rules condensed to two-form (one/other) and language-specific quirks.
@@ -75,6 +80,21 @@ BYD.i18n = (function () {
                 if (mod10 === 1 && mod100 !== 11) return 'one';
                 if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return 'few';
                 return 'many';
+            case 'ar':
+                // Arabic six-form plural per CLDR. If a catalog entry only
+                // carries one/other (the common case), plural()'s lookup falls
+                // back to `other`, so these extra forms are harmless until a
+                // translator supplies zero/two/few/many for a key.
+                //   zero → 0        two → 2
+                //   few  → n%100 in 3..10        many → n%100 in 11..99
+                //   one  → 1        other → everything else (incl. fractions)
+                if (n === 0) return 'zero';
+                if (n === 1) return 'one';
+                if (n === 2) return 'two';
+                var arMod100 = i % 100;
+                if (arMod100 >= 3 && arMod100 <= 10) return 'few';
+                if (arMod100 >= 11 && arMod100 <= 99) return 'many';
+                return 'other';
             default:
                 // en, es, de, it, nb, nl
                 return n === 1 ? 'one' : 'other';
@@ -143,7 +163,14 @@ BYD.i18n = (function () {
             })
             .catch(function () {
                 if (lang === DEFAULT_LANG) return {};
-                return fetch('/i18n/' + DEFAULT_LANG + '.json').then(function (r) { return r.json(); });
+                // Same { cache: 'no-cache' } as the primary fetch above. The daemon
+                // serves /i18n/*.json with `public, max-age=86400`, so without it a
+                // browser could hold a day-old English catalog — and since init()
+                // now WAITS on this catalog to supply the fallback for keys missing
+                // from a locale, a stale copy means missing dropdown labels persist
+                // for up to 24h after an app update that added them.
+                return fetch('/i18n/' + DEFAULT_LANG + '.json', { cache: 'no-cache' })
+                    .then(function (r) { return r.json(); });
             });
     }
 
@@ -194,6 +221,22 @@ BYD.i18n = (function () {
         }
         if (typeof val === 'object' && val.other) val = val.other;
         return interpolate(val, vars);
+    }
+
+    /**
+     * Resolve a manifest model name through the active locale when a market
+     * uses a different badge. The manifest id remains canonical, so persisted
+     * selections and downloaded GLBs are unaffected by localized branding.
+     */
+    function modelName(modelId, fallback) {
+        var rawId = modelId == null ? '' : String(modelId);
+        var normalized = rawId.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+        if (normalized) {
+            var key = 'vehicle.model_name_' + normalized;
+            var translated = t(key);
+            if (translated != null && translated !== key) return translated;
+        }
+        return fallback || rawId;
     }
 
     function plural(key, count, vars) {
@@ -257,7 +300,14 @@ BYD.i18n = (function () {
             }
         }
         // Update <html lang="..."> so screen readers and CSS :lang() work.
-        if (document.documentElement) document.documentElement.setAttribute('lang', state.lang);
+        if (document.documentElement) {
+            document.documentElement.setAttribute('lang', state.lang);
+            // RTL scripts need <html dir="rtl"> so the browser mirrors the
+            // (start/end-based) layout. Only Arabic is RTL in our set; every
+            // other locale stays 'ltr'. Set it explicitly (not just for 'ar')
+            // so switching AWAY from Arabic restores 'ltr' in the same WebView.
+            document.documentElement.setAttribute('dir', RTL_LANGS[state.lang] ? 'rtl' : 'ltr');
+        }
     }
 
     function onChange(fn) { state.listeners.push(fn); }
@@ -324,22 +374,19 @@ BYD.i18n = (function () {
         return fetchCatalog(resolved).then(function (cat) {
             state.catalog = cat || {};
             state.loaded = true;
-            // Same en-fallback hydration as init(): fire-and-forget so the
-            // active locale renders immediately and any unresolved keys
-            // pick up an en string on the next t() call.
-            if (state.lang !== 'en' && state.enCatalog == null) {
-                fetchCatalog('en').then(function (enCat) {
-                    state.enCatalog = enCat || {};
-                    // Re-hydrate so any first-paint elements that fell
-                    // through to the raw key (because en wasn't loaded
-                    // yet) pick up the English string. notify() also
-                    // wakes any consumer subscribed via onChange().
-                    hydrate(document);
-                    notify();
-                }).catch(function () { /* best-effort */ });
-            }
-            hydrate(document);
-            notify();
+            // AWAIT the en fallback before hydrate/notify, for the same reason
+            // init() does: an onChange subscriber re-renders imperative text
+            // (dropdown <option>s) that no later hydrate() can repair, so the
+            // fallback has to be in place BEFORE we wake them.
+            var fallbackReady = (state.lang !== 'en' && state.enCatalog == null)
+                ? fetchCatalog('en').then(function (enCat) {
+                      state.enCatalog = enCat || {};
+                  }).catch(function () { /* best-effort */ })
+                : Promise.resolve();
+            return fallbackReady.then(function () {
+                hydrate(document);
+                notify();
+            });
         });
     }
 
@@ -391,47 +438,52 @@ BYD.i18n = (function () {
         state.loadingPromise = fetchCatalog(state.lang).then(function (cat) {
             state.catalog = cat || {};
             state.loaded = true;
-            // Load en as a side-channel fallback when the active locale
-            // is non-en. Fire-and-forget — the visible hydrate already
-            // ran and any subsequent t() call that misses on the active
-            // catalog will check enCatalog before returning the raw key.
-            if (state.lang !== 'en' && state.enCatalog == null) {
-                fetchCatalog('en').then(function (enCat) {
-                    state.enCatalog = enCat || {};
-                    // Re-hydrate so any first-paint elements that fell
-                    // through to the raw key (because en wasn't loaded
-                    // yet) pick up the English string. notify() also
-                    // wakes any consumer subscribed via onChange().
-                    hydrate(document);
-                    notify();
-                }).catch(function () { /* best-effort */ });
-            }
-            hydrate(document);
-            notify();
-            // External mode: pull the server-stored web locale to handle
-            // the tunnel-URL-rotation case (localStorage on the new
-            // origin is empty, but the server remembers the last pick).
-            // Skipped in-app — the AndroidBridge sync read above is
-            // already authoritative.
-            if (!inAppWebView()) {
-                fetchServerWebLocale().then(function (serverLang) {
-                    if (!serverLang) return;
-                    var resolved = resolveLang(serverLang);
-                    if (resolved && resolved !== state.lang) {
-                        // Mirror the server pick into localStorage so a
-                        // subsequent reload short-circuits without a fetch.
-                        setStored(resolved);
-                        // setLang() refetches + rehydrates. Skip the
-                        // server POST inside it (we just READ the value).
-                        state.lang = resolved;
-                        fetchCatalog(resolved).then(function (cat2) {
-                            state.catalog = cat2 || {};
-                            hydrate(document);
-                            notify();
-                        });
-                    }
-                });
-            }
+            // Load en as a side-channel fallback when the active locale is non-en.
+            // AWAITED, not fire-and-forget: callers gate their whole UI build on
+            // init() (see key-mapping.html / automations.html), and dropdown
+            // <option> text is written imperatively via textContent — it carries no
+            // [data-i18n] attribute, so the later hydrate() cannot repair it. If a
+            // page built its selects before enCatalog landed, every key missing from
+            // the active locale rendered as the RAW KEY forever ("keymap.act_bsd").
+            // That is not hypothetical: web/i18n/ar.json has no keymap or automation
+            // section at all (all 188 keymap options), and nb.json is missing 77.
+            // Waiting costs one parallel fetch of an already-cached asset.
+            var fallbackReady = (state.lang !== 'en' && state.enCatalog == null)
+                ? fetchCatalog('en').then(function (enCat) {
+                      state.enCatalog = enCat || {};
+                  }).catch(function () { /* best-effort — active catalog still usable */ })
+                : Promise.resolve();
+            return fallbackReady.then(function () {
+                hydrate(document);
+                notify();
+                // External mode: pull the server-stored web locale to handle
+                // the tunnel-URL-rotation case (localStorage on the new
+                // origin is empty, but the server remembers the last pick).
+                // Skipped in-app — the AndroidBridge sync read above is
+                // already authoritative. Stays fire-and-forget: it only
+                // CORRECTS an already-rendered page, so gating init() on it
+                // would delay first paint for every tunnel user.
+                if (!inAppWebView()) {
+                    fetchServerWebLocale().then(function (serverLang) {
+                        if (!serverLang) return;
+                        var resolved = resolveLang(serverLang);
+                        if (resolved && resolved !== state.lang) {
+                            // Mirror the server pick into localStorage so a
+                            // subsequent reload short-circuits without a fetch.
+                            setStored(resolved);
+                            // setLang() refetches + rehydrates. Skip the
+                            // server POST inside it (we just READ the value).
+                            state.lang = resolved;
+                            fetchCatalog(resolved).then(function (cat2) {
+                                state.catalog = cat2 || {};
+                                hydrate(document);
+                                notify();
+                            });
+                        }
+                    });
+                }
+                return cat;
+            });
         });
         return state.loadingPromise;
     }
@@ -461,6 +513,7 @@ BYD.i18n = (function () {
         setLang: setLang,
         onChange: onChange,
         getLang: function () { return state.lang; },
+        modelName: modelName,
         getDisplayName: function (lang) { return DISPLAY_NAMES[lang] || lang; },
         supported: function () { return SUPPORTED.slice(); },
         // True when the app's server-side locale should override the local
@@ -481,10 +534,20 @@ BYD.units = {
     mode: 'km',  // 'km' or 'mi' — updated from /status.distanceUnit
     KM_TO_MI: 0.621371,
 
-    /** Format a distance value (stored in km) for display. */
+    /**
+     * Format a distance value (stored in km) for display.
+     *
+     * `decimals` is honoured in BOTH unit modes. It previously applied only to km
+     * and miles always rounded to whole, which silently discarded the precision
+     * at call sites that ask for it — e.g. two odometer readings a few hundred
+     * metres apart rendered as the same number.
+     */
     dist(km, decimals) {
         if (km == null || isNaN(km)) return '--';
-        if (this.mode === 'mi') return Math.round(km * this.KM_TO_MI) + ' mi';
+        if (this.mode === 'mi') {
+            var mi = km * this.KM_TO_MI;
+            return (decimals != null ? mi.toFixed(decimals) : Math.round(mi)) + ' mi';
+        }
         return (decimals != null ? km.toFixed(decimals) : Math.round(km)) + ' km';
     },
 
@@ -526,6 +589,19 @@ BYD.units = {
 
     /** Per-100 consumption label: "kWh/100km" or "kWh/100mi". */
     consumptionLabel() { return this.mode === 'mi' ? 'kWh/100mi' : 'kWh/100km'; },
+
+    /**
+     * Convert a "distance-per-kWh" efficiency (km/kWh) to the user's unit.
+     * This is the inverse-facing sibling of per100Val: higher is better.
+     * In miles mode, mi/kWh = km/kWh × KM_TO_MI (distance shrinks per unit).
+     */
+    effVal(kmPerKwh) {
+        if (kmPerKwh == null || isNaN(kmPerKwh)) return 0;
+        return this.mode === 'mi' ? kmPerKwh * this.KM_TO_MI : kmPerKwh;
+    },
+
+    /** Distance-per-energy efficiency label: "km/kWh" or "mi/kWh". */
+    efficiencyLabel() { return this.mode === 'mi' ? 'mi/kWh' : 'km/kWh'; },
 
     /** "per km" or "per mi" for cost display. */
     perDistLabel() { return this.mode === 'mi' ? '/mi' : '/km'; },

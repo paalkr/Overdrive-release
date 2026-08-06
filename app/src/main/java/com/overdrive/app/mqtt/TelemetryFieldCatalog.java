@@ -176,6 +176,11 @@ public final class TelemetryFieldCatalog {
         add("light_front_fog", "Front Fog",  BINARY, "light", null, null, "mdi:car-light-fog",    true, 0);
         add("light_hazard",    "Hazards",    BINARY, "light", null, null, "mdi:car-light-alert",  true, 0);
         add("light_drl",       "Daytime Running Lights", BINARY, "light", null, null, "mdi:car-light-dimmed", true, 0);
+        add("ambient_colour",  "Ambient Lights Colour",  SENSOR, null,   MEAS, null, "mdi:format-color-fill", true, 0);
+        // Ambient main-switch state (1=on/0=off). Published only when the vehicle reports it —
+        // see MqttConnectionManager — so this stays unavailable on a trim that cannot read it
+        // rather than reporting a false "off". The controllable twin is the ambient_power switch.
+        add("ambient_enabled", "Ambient Lights State",   BINARY, "light", null, null, "mdi:track-light", true, 0);
         add("light_left_turn", "Left Turn Signal",  SENSOR, "enum", null, null, "mdi:arrow-left-bold", true, 0);
         add("light_right_turn","Right Turn Signal", SENSOR, "enum", null, null, "mdi:arrow-right-bold", true, 0);
 
@@ -200,6 +205,10 @@ public final class TelemetryFieldCatalog {
 
         // ---------- Safety / ADAS ----------
         add("speed_limit_warning", "Speed Limit Warning", BINARY, "problem", null, null, "mdi:speedometer-slow", true, 0);
+        // Child Presence Detection setting state (on/off). Published as 1/0 so the adas_cpd
+        // control switch's state_topic (child_presence_detection) reflects real state, matching
+        // the speed_limit_warning pattern. No "problem" device_class — CPD-on is the desired state.
+        add("child_presence_detection", "Child Presence Detection", BINARY, null, null, null, "mdi:car-child-seat", true, 0);
         add("emergency_alarm",     "Emergency Alarm",     SENSOR, "enum", null, null, "mdi:alarm-light",     true, 0);
         add("power_level",         "Power Level",         SENSOR, "enum", null, null, "mdi:power",           true, 0);
         add("mcu_status",          "MCU Status",          SENSOR, "enum", null, null, "mdi:chip",            true, 0);

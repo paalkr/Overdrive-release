@@ -319,6 +319,20 @@ public class OemDashcamPipeline {
     // recording-only behaviour).
     private volatile EGLCore parentEglCore;
 
+    // TRUE only when this pipeline's GL context was actually created in pano's
+    // EGL SHARE GROUP (EGLCore.createShared succeeded). Recording never needs
+    // this — OEM blits its own texture inside its own context, so an independent
+    // context records perfectly. But VIEW-6 STREAMING does: pano's stream scaler
+    // binds our cameraTextureId on PANO's GL thread, and a texture name from an
+    // unshared context does not exist there — it samples as undefined/black while
+    // every gate (isRunning / texture id != 0 / matrix published) still reports
+    // ready. That silent mismatch is why view 6 showed the AVM mosaic or black
+    // while views 1-4 (which use pano's own texture) were correct, and why the
+    // manual OEM off/on workaround "fixed" it (the restart won the pano race).
+    // isRouteReady() now gates on this so the route is refused (and a restart
+    // scheduled) instead of falsely succeeding. Set inside start()'s EGL block.
+    private volatile boolean eglSharedWithPano = false;
+
     // Pano stream scaler this pipeline publishes its tex matrix into when
     // view-6 streaming is active. Set/cleared by GpuSurveillancePipeline
     // around bindOemSource/unbindOemSource. Per-frame the render loop
@@ -343,6 +357,11 @@ public class OemDashcamPipeline {
     // setOverlayRecordingActive on the recorder side.
     private volatile TelemetryDataCollector telemetryCollector;
     private volatile boolean overlayEnabled = false;
+    // Which telemetry fields the OEM dashcam overlay draws (its OWN independent
+    // selection — never shared with pano/surveillance). Defaults to the legacy
+    // eight-field set so behavior is unchanged until the user edits it.
+    private volatile com.overdrive.app.telemetry.TelemetryFields overlayFields =
+        com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
 
     public OemDashcamPipeline(String outputDir) {
         this.outputDir = outputDir;
@@ -468,9 +487,25 @@ public class OemDashcamPipeline {
      *  arriving in that ~50–500ms window passes {@code isRunning} but
      *  finds a zero texture id. Use this method anywhere a consumer needs
      *  to know "the camera + EGL handles are actually plumbed" rather
-     *  than "start() is mid-flight". */
+     *  than "start() is mid-flight".
+     *
+     *  <p>ALSO requires {@link #isEglSharedWithPano()}: view-6 routing makes PANO's
+     *  GL thread bind OUR {@code cameraTextureId}, which only names a real texture
+     *  when both contexts are in one share group. Without this clause the route
+     *  "succeeded" against an unshared texture and the viewer got the AVM mosaic /
+     *  black while every other gate reported healthy. Recording is unaffected by
+     *  this gate (it never crosses contexts) — see {@link #isRecording}. */
     public boolean isRouteReady() {
-        return running.get() && cameraTextureId != 0 && cameraSurfaceTexture != null;
+        return running.get() && cameraTextureId != 0 && cameraSurfaceTexture != null
+            && eglSharedWithPano;
+    }
+
+    /** True iff this pipeline's GL context shares pano's EGL group, i.e. pano may
+     *  sample our camera texture (the view-6 streaming requirement). False when OEM
+     *  came up before pano and got an independent context — recording still works,
+     *  but the pipeline must be restarted for view-6 streaming to render. */
+    public boolean isEglSharedWithPano() {
+        return eglSharedWithPano;
     }
 
     /** True iff a dvr_*.mp4 segment is currently being written. Independent
@@ -547,6 +582,14 @@ public class OemDashcamPipeline {
         synchronized (recordingStateLock) {
             if (!recording.compareAndSet(false, true)) return false;
             recordingEventOwned.set(eventOwned);
+            // Parked-idle throttle: snap the encode draw-stride back to 1 the
+            // instant we win the CAS — INSIDE the lock so a concurrent
+            // reapplyIdleStrideAfterStop (which re-checks recording under the same
+            // lock) can never clobber it after we've opened a full-rate clip. The
+            // clip body then records at full frame rate from frame 1 (parity with
+            // today). No-op when stride was already 1. triggerEventRecording (below)
+            // issues its own splice IDR, so strided pre-roll frames stay valid.
+            recorderDrawStride = 1;
         }
         String path = generateOutputPath();
         long clampedPost = Math.max(0L, postRecordMs);
@@ -590,6 +633,7 @@ public class OemDashcamPipeline {
             recordingEventOwned.set(false);
         }
         if (encoder != null) encoder.stopEventRecording(true, Math.max(0L, postRecordMs));
+        reapplyIdleStrideAfterStop();
         reconcileTelemetryHold();
     }
 
@@ -621,6 +665,7 @@ public class OemDashcamPipeline {
             recordingEventOwned.set(false);
         }
         if (encoder != null) encoder.stopEventRecording(true, Math.max(0L, postRecordMs));
+        reapplyIdleStrideAfterStop();
         reconcileTelemetryHold();
         return true;
     }
@@ -677,6 +722,40 @@ public class OemDashcamPipeline {
                 .optInt("segmentRotateOffsetMs", 30_000);
         } catch (Throwable t) {
             return 30_000;
+        }
+    }
+
+    /**
+     * Re-arm the parked-idle encode stride after a clip finalizes. Event/
+     * continuous starts snap the stride to 1 for a full-rate clip; once the clip
+     * ends we must return to the throttled idle stride if we are still on the
+     * parked surveillance axis with the throttle on — otherwise the encoder would
+     * keep running at full rate (no power saving) until the next config reapply.
+     * Never throttles while a clip is in flight. No-op when the throttle is off
+     * (resolves to stride 1 = today's behaviour).
+     */
+    private void reapplyIdleStrideAfterStop() {
+        try {
+            // Compute the target stride OUTSIDE the lock (AccMonitor + UCM reads can
+            // take ms), then re-check recording and write the stride TOGETHER under
+            // recordingStateLock. This closes the check-then-act race with
+            // startRecordingInternal: a clip that won the CAS (and set stride=1
+            // inside the same lock) is observed here as recording==true, so we skip
+            // the write and never clobber a freshly-opened full-rate clip's stride.
+            boolean surveillanceAxis = !com.overdrive.app.monitor.AccMonitor.isAccOn();
+            int target;
+            if (surveillanceAxis && UnifiedConfigManager.isOemIdleThrottleWhenParked()) {
+                int idleFps = UnifiedConfigManager.getOemIdleFps();
+                target = (idleFps > 0) ? Math.max(1, Math.round((float) fps / idleFps)) : 1;
+            } else {
+                target = 1;
+            }
+            synchronized (recordingStateLock) {
+                if (recording.get()) return;  // a new clip already opened — leave its stride
+                recorderDrawStride = target;
+            }
+        } catch (Throwable t) {
+            recorderDrawStride = 1;  // fail safe: full rate
         }
     }
 
@@ -803,8 +882,14 @@ public class OemDashcamPipeline {
         // nothing to read) — do this BEFORE the early return so a cleared
         // collector reliably tears the worker down.
         OverlayBitmapRenderer r = overlayRenderer;
+        // Keep the renderer's field selection current whenever it exists.
+        if (r != null) r.setActiveFields(overlayFields);
         if (telemetryCollector == null) {
             if (r != null) r.stopWorker();
+            // Drop any beam demand this flow published — the overlay can't draw
+            // without a collector, and a stale entry would keep the light poll
+            // alive for a flow that has stopped.
+            com.overdrive.app.byd.BydDataCollector.setOverlayBeamDemand("oem", false);
             return;
         }
         // Hold polling only when overlay is enabled AND we're actively
@@ -812,11 +897,36 @@ public class OemDashcamPipeline {
         // in — the overlay only paints into clips that are actually being
         // written to disk).
         boolean shouldHold = overlayEnabled && running.get() && recording.get();
+        // Report which overlay-only signals this flow draws so the collector can
+        // skip the reflective turn-signal / seatbelt reads when unused. Issued on
+        // EVERY reconcile while holding (not just the start edge) so a LIVE field
+        // change mid-recording — setOverlayFields() -> reconcileTelemetryHold()
+        // with shouldHold already true — re-reports demand. Without this, newly
+        // enabling turn/seatbelt mid-clip would draw a field whose HAL read is
+        // still skipped (stale/dead). setOverlayFieldDemand is idempotent.
+        if (shouldHold) {
+            telemetryCollector.setOverlayFieldDemand(
+                "oem",
+                overlayFields.has(com.overdrive.app.telemetry.TelemetryFields.Field.TURN_SIGNALS),
+                overlayFields.hasAny(
+                    com.overdrive.app.telemetry.TelemetryFields.Field.SEATBELT_DRIVER,
+                    com.overdrive.app.telemetry.TelemetryFields.Field.SEATBELT_PASSENGER));
+        }
+        // Beams live on BydDataCollector's 5 s poll (not the telemetry collector)
+        // and that poll is otherwise automation-gated, so declare demand here or
+        // the beam glyphs stay frozen at their boot state. Outside the shouldHold
+        // branch so the demand is also CLEARED when this flow stops drawing.
+        com.overdrive.app.byd.BydDataCollector.setOverlayBeamDemand(
+            "oem",
+            shouldHold && overlayFields.hasAny(
+                com.overdrive.app.telemetry.TelemetryFields.Field.LOW_BEAM,
+                com.overdrive.app.telemetry.TelemetryFields.Field.HIGH_BEAM));
         if (shouldHold && !overlayPollingHeld) {
             telemetryCollector.setOverlayRecordingActive(true);
             telemetryCollector.startPolling();
             overlayPollingHeld = true;
         } else if (!shouldHold && overlayPollingHeld) {
+            telemetryCollector.clearOverlayFieldDemand("oem");
             telemetryCollector.setOverlayRecordingActive(false);
             telemetryCollector.stopPolling();
             overlayPollingHeld = false;
@@ -830,6 +940,18 @@ public class OemDashcamPipeline {
             if (shouldHold) r.startWorker(telemetryCollector);
             else r.stopWorker();
         }
+    }
+
+    /**
+     * Set the OEM dashcam overlay's field selection (its own independent list).
+     * {@code null} resets to the legacy default. Applied to the renderer + re-
+     * reported as demand on the next reconcile.
+     */
+    public void setOverlayFields(com.overdrive.app.telemetry.TelemetryFields fields) {
+        this.overlayFields = (fields != null)
+            ? fields
+            : com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
+        reconcileTelemetryHold();
     }
 
     public boolean isOverlayEnabled() {
@@ -900,6 +1022,22 @@ public class OemDashcamPipeline {
                 requestedFps = recAxisFps;
             }
             fps = Math.max(15, Math.min(60, requestedFps));
+
+            // Parked-idle encode throttle: on the SURVEILLANCE (parked) axis, when
+            // the OEM throttle is enabled and we are NOT recording, sub-sample the
+            // encoder draw to ~idleFps via the draw-stride. The camera HAL rate
+            // (fps, >=15) is untouched — only the encode rate drops — so an event
+            // can snap to a clean full-rate clip (startRecordingInternal resets
+            // stride to 1). On the drive axis, or with the throttle off, force
+            // stride 1 (today's behaviour). Never override an in-flight clip.
+            if (surveillanceAxis
+                    && UnifiedConfigManager.isOemIdleThrottleWhenParked()
+                    && !recording.get()) {
+                int idleFps = UnifiedConfigManager.getOemIdleFps();
+                recorderDrawStride = (idleFps > 0) ? Math.max(1, Math.round((float) fps / idleFps)) : 1;
+            } else if (!recording.get()) {
+                recorderDrawStride = 1;
+            }
 
             // Recording-axis tier chain (also the surveillance-axis fallback).
             String recAxisQuality = oem.has("recordingQuality")
@@ -1121,7 +1259,12 @@ public class OemDashcamPipeline {
     }
 
     private void startThreads() {
-        glThread = new HandlerThread("OemDvr-GL", Process.THREAD_PRIORITY_FOREGROUND);
+        // Default priority (was FOREGROUND): this is a compute-bound GL render
+        // loop and, like the pano GL-RenderLoop, should not preempt the native
+        // head-unit UI on the shared SDM665. The wait-bound encoder drainer /
+        // disk writer keep FOREGROUND (they burn no CPU; priority only trims
+        // their wakeup latency).
+        glThread = new HandlerThread("OemDvr-GL", Process.THREAD_PRIORITY_DEFAULT);
         glThread.start();
         glHandler = new Handler(glThread.getLooper());
         // Dedicated thread for SurfaceTexture frame-available callbacks.
@@ -1214,14 +1357,22 @@ public class OemDashcamPipeline {
                         // fails on Adreno with EGL_BAD_MATCH on encoder
                         // input surfaces.
                         eglCore = EGLCore.createShared(parent, true);
+                        // Only NOW is cross-context sampling (view-6 streaming) valid.
+                        eglSharedWithPano = true;
                         logger.info("OEM EGL context created in shared group with pano (recordable)");
                     } catch (Throwable t) {
                         logger.warn("EGLCore.createShared failed (" + t.getMessage()
-                            + "); falling back to independent context");
+                            + "); falling back to independent context — RECORDING is fine, "
+                            + "but view-6 streaming needs a restart once pano is up");
                         eglCore = new EGLCore();
+                        eglSharedWithPano = false;
                     }
                 } else {
+                    // No parent (pano wasn't up yet, or recording-only bring-up):
+                    // independent context. Recording works; view-6 streaming does not
+                    // until this pipeline is restarted with pano's context as parent.
                     eglCore = new EGLCore();
+                    eglSharedWithPano = false;
                 }
                 encoderEglSurface = eglCore.createWindowSurface(encoderSurface);
                 dummySurface = eglCore.createPbufferSurface(1, 1);
@@ -1413,6 +1564,23 @@ public class OemDashcamPipeline {
 
     private final AtomicInteger drawSequence = new AtomicInteger(0);
 
+    // Parked-idle throttle: encode draw-stride. MediaCodec encodes exactly the
+    // frames swapped into its input surface, so drawing every Nth iteration
+    // yields ~halFps/N encode fps WITHOUT touching the (HAL-rejectable) camera
+    // setCameraFps or the (immutable) KEY_FRAME_RATE. Default 1 = every frame
+    // (byte-identical to today). Set >1 only while parked-idle keep-warm; snapped
+    // back to 1 on an event so the clip body records full-rate. Written from the
+    // control thread, read on the GL thread — volatile is sufficient.
+    private volatile int recorderDrawStride = 1;
+    // GL-thread-confined stride counter (never touched off the render loop).
+    private int renderStridePhase = 0;
+    // GL-thread-confined: last time we forced an IDR while parked-idle. At the
+    // strided-down encode rate the frame-count GOP stretches past the pre-record
+    // window, so we pulse a sync-frame here (inline in the render loop — glHandler
+    // is occupied by the busy render while-loop, so a posted timer would never
+    // run). Only adds IDRs; never runs unless idle-throttle is active.
+    private long oemLastIdleKeyframeMs = 0;
+
     private void startRenderLoop() {
         startWatchdog();
         glHandler.post(this::renderLoop);
@@ -1567,10 +1735,39 @@ public class OemDashcamPipeline {
                     lastPtsNs = ptsNs;
                 }
 
-                drawPassthrough();
+                // Parked-idle throttle: only draw+swap (i.e. feed the encoder)
+                // every Nth iteration. updateTexImage + PTS resolution above ran
+                // this iteration regardless, so the HAL is fully drained and the
+                // NEXT emitted frame still carries a correct monotonic wall-clock
+                // PTS — playback speed is unchanged, only the encode rate drops.
+                // stride==1 (default / event / not-idle) → byte-identical to today.
+                final int stride = recorderDrawStride;
+                if (stride <= 1 || (renderStridePhase++ % stride) == 0) {
+                    drawPassthrough();
 
-                eglCore.swapBuffersWithTimestamp(encoderEglSurface, ptsNs);
-                drawSequence.incrementAndGet();
+                    eglCore.swapBuffersWithTimestamp(encoderEglSurface, ptsNs);
+                    drawSequence.incrementAndGet();
+
+                    // Idle keyframe pulse: when strided down and NOT recording an
+                    // event, force an IDR every ~preRecordSeconds/2 so the
+                    // pre-record ring always holds a keyframe despite the stretched
+                    // low-rate GOP. Guarded on stride>1 so it never runs at full
+                    // rate; only adds IDRs.
+                    if (stride > 1 && !recordingEventOwned.get()) {
+                        long nowMs = android.os.SystemClock.uptimeMillis();
+                        long periodMs = Math.max(1000L, resolveOemPreRecordSeconds() * 1000L / 2L);
+                        if (oemLastIdleKeyframeMs == 0
+                                || (nowMs - oemLastIdleKeyframeMs) >= periodMs) {
+                            oemLastIdleKeyframeMs = nowMs;
+                            HardwareEventRecorderGpu enc = encoder;
+                            if (enc != null) {
+                                try { enc.requestSyncFrame(); } catch (Throwable ignored) {}
+                            }
+                        }
+                    } else {
+                        oemLastIdleKeyframeMs = 0;
+                    }
+                }
                 consecutiveErrors = 0;
             } catch (Throwable t) {
                 consecutiveErrors++;
@@ -2009,6 +2206,10 @@ public class OemDashcamPipeline {
         encoderEglSurface = null;
         dummySurface = null;
         cameraTextureId = 0;
+        // The share-group property belongs to the context we just destroyed. Clear it
+        // so a restarted pipeline can't inherit a stale "shared" claim and let
+        // isRouteReady() green-light a cross-context bind against a dead texture.
+        eglSharedWithPano = false;
         passthroughProgram = 0;
         overlayTextureId = 0;
         overlayProgramId = 0;

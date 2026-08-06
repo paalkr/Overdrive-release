@@ -45,6 +45,12 @@ public final class BsNativeLayer {
 
     private final int bufferW;
     private final int bufferH;
+    // SurfaceControl layer name (for dumpsys SurfaceFlinger identification) and its
+    // z-order. Configurable so this generic buffer-layer primitive can back a second
+    // on-screen layer (e.g. video playback) at a DIFFERENT z without contending with
+    // the blind-spot card. Defaults preserve the original blind-spot behaviour exactly.
+    private final String layerName;
+    private final int zOrder;
     private Object surfaceControl;     // android.view.SurfaceControl (reflected)
     private Surface surface;           // wraps surfaceControl, fed to EGL
     private volatile boolean shown = false;
@@ -58,9 +64,30 @@ public final class BsNativeLayer {
     // this firmware (a UID-2000 layer tagged layerStack=1 composited onto the cluster).
     private volatile int layerStack = 0;
 
+    // Buffer rotation applied when the fixed bufferW×bufferH buffer is composited
+    // into the on-screen dest rect: 0/90/180/270 degrees. Used by the single-view
+    // blind-spot rotation option (side/rear only). Stored here so every geometry
+    // transaction (setGeometry / show) carries it without threading a param through
+    // the many call sites; the daemon sets it via setBufferRotation and pairs it
+    // with a dest rect whose aspect it already swapped for the 90/270 cases, so the
+    // scale stays uniform (no stretch of the baked rounded corners).
+    private volatile int bufferRotation = 0;
+
     public BsNativeLayer(int bufferW, int bufferH) {
+        this(bufferW, bufferH, "BlindSpot", Z_ORDER);
+    }
+
+    /**
+     * Full constructor: choose the SurfaceControl layer name and z-order. Use this to
+     * back a second on-screen buffer layer (e.g. video playback) that must sit at a
+     * different z than the blind-spot card. The 2-arg constructor keeps the original
+     * blind-spot name/z.
+     */
+    public BsNativeLayer(int bufferW, int bufferH, String layerName, int zOrder) {
         this.bufferW = bufferW;
         this.bufferH = bufferH;
+        this.layerName = layerName;
+        this.zOrder = zOrder;
     }
 
     /**
@@ -90,10 +117,61 @@ public final class BsNativeLayer {
     /** Current target layerStack (0 head-unit / 1 cluster). */
     public synchronized int getLayerStack() { return layerStack; }
 
+    /**
+     * Set the buffer rotation (0/90/180/270 degrees) applied by the next geometry
+     * transaction. Any non-multiple-of-90 value is snapped to the nearest 90° step
+     * and normalised to [0,270]. Cheap store; the caller re-issues setGeometry (with
+     * an aspect-swapped dest rect for 90/270) to make it take effect on screen.
+     */
+    public synchronized void setBufferRotation(int degrees) {
+        int d = ((degrees % 360) + 360) % 360;      // normalise to [0,360)
+        this.bufferRotation = (Math.round(d / 90f) * 90) % 360;
+    }
+
+    /** Current buffer rotation in degrees (0/90/180/270). */
+    public synchronized int getBufferRotation() { return bufferRotation; }
+
+    // Native transform codes for SurfaceControl.Transaction.setGeometry's orientation
+    // arg. These are the android_transform_t / NATIVE_WINDOW_TRANSFORM_* bit values,
+    // NOT the Surface.ROTATION_* ordinals (0/1/2/3). See rotationConst below.
+    private static final int TRANSFORM_IDENTITY = 0;   // no-op
+    private static final int TRANSFORM_ROT_90   = 4;   // HAL_TRANSFORM_ROT_90  = 1<<2
+    private static final int TRANSFORM_ROT_180  = 3;   // HAL_TRANSFORM_ROT_180 = FLIP_H|FLIP_V
+    private static final int TRANSFORM_ROT_270  = 7;   // HAL_TRANSFORM_ROT_270 = ROT_180|ROT_90
+
+    /** Map a 0/90/180/270 degree rotation to the transform code that
+     *  {@code SurfaceControl.Transaction.setGeometry(...,orientation)} actually
+     *  consumes.
+     *
+     *  <p>TRAP: the framework annotates that arg {@code @Surface.Rotation} and the
+     *  obvious thing is to pass {@code Surface.ROTATION_*} (0/1/2/3). That is WRONG.
+     *  The Java {@code setGeometry} forwards the value UNCONVERTED through
+     *  {@code nativeSetGeometry} into {@code Transaction::setGeometry}
+     *  (SurfaceComposerClient.cpp), whose switch keys on the HAL transform bitmask
+     *  ({@code NATIVE_WINDOW_TRANSFORM_*}), not the Surface rotation ordinal. Those
+     *  numberings disagree: ordinal 1(ROTATION_90)=FLIP_H, 2(ROTATION_180)=FLIP_V,
+     *  3(ROTATION_270)=ROT_180. So passing the ordinals turned the card's 90° into a
+     *  horizontal mirror, 180° into a vertical mirror, and 270° into a plain 180° turn
+     *  — the "distorted / mirror-image" blind-spot rotation bug (all models). The
+     *  anamorphic stretch rode along because {@link #applyGeometry}'s caller pre-swaps
+     *  the dest rect to 3:4 for a quarter turn (expecting an axis-transposing rotation),
+     *  but FLIP_H/FLIP_V do NOT transpose axes, so a 4:3 buffer was scaled into a 3:4
+     *  dest with unequal x/y scale. Emitting the correct ROT_90/270 codes (which DO
+     *  transpose) makes that 3:4 dest match again → uniform scale, clean rotation.
+     *  0° stays identity (why the un-rotated card always looked right). */
+    private static int rotationConst(int degrees) {
+        switch (((degrees % 360) + 360) % 360) {
+            case 90:  return TRANSFORM_ROT_90;
+            case 180: return TRANSFORM_ROT_180;
+            case 270: return TRANSFORM_ROT_270;
+            default:  return TRANSFORM_IDENTITY;
+        }
+    }
+
     /** Create the buffer layer (does NOT show it yet). Returns false on failure. */
     public synchronized boolean create() {
         if (surfaceControl != null) return true;
-        surfaceControl = createBufferLayer("BlindSpot", bufferW, bufferH);
+        surfaceControl = createBufferLayer(layerName, bufferW, bufferH);
         if (surfaceControl == null) {
             logger.warn("create: SurfaceControl buffer layer creation failed");
             return false;
@@ -112,6 +190,7 @@ public final class BsNativeLayer {
     /** The Android Surface to render into (wrap in EGLSurface on the GL thread). */
     public synchronized Surface getSurface() { return surface; }
 
+
     public synchronized boolean isCreated() { return surfaceControl != null; }
     public boolean isShown() { return shown; }
 
@@ -122,7 +201,24 @@ public final class BsNativeLayer {
      */
     public synchronized void setGeometry(int x, int y, int w, int h) {
         if (surfaceControl == null) return;
-        applyGeometry(surfaceControl, x, y, w, h, Z_ORDER, true, bufferW, bufferH, layerStack);
+        applyGeometry(surfaceControl, 0, 0, bufferW, bufferH, x, y, w, h, zOrder, true,
+                bufferW, bufferH, layerStack, bufferRotation);
+        shown = true;
+    }
+
+    /**
+     * Position + show the layer, scaling a SUB-RECT of the buffer (source crop) into the
+     * on-screen dest rect. Used ONLY by the cluster-mirror ZOOM (crop-to-cover) scaling
+     * mode; the default {@link #setGeometry(int,int,int,int)} scales the FULL buffer and
+     * is byte-for-byte unchanged, so the blind-spot card / speed overlay (which rely on
+     * src == full buffer, since libod bakes rounded corners + margins into the whole
+     * buffer) are untouched by this overload. The src rect is clamped to the buffer.
+     */
+    public synchronized void setGeometry(Rect src, int x, int y, int w, int h) {
+        if (surfaceControl == null) return;
+        Rect s = clampSrc(src);
+        applyGeometry(surfaceControl, s.left, s.top, s.width(), s.height(), x, y, w, h,
+                zOrder, true, bufferW, bufferH, layerStack, bufferRotation);
         shown = true;
     }
 
@@ -131,8 +227,31 @@ public final class BsNativeLayer {
      *  a show-then-hide one-frame flash of an unrendered layer. */
     public synchronized void setGeometryHidden(int x, int y, int w, int h) {
         if (surfaceControl == null) return;
-        applyGeometry(surfaceControl, x, y, w, h, Z_ORDER, false, bufferW, bufferH, layerStack);
+        applyGeometry(surfaceControl, 0, 0, bufferW, bufferH, x, y, w, h, zOrder, false,
+                bufferW, bufferH, layerStack, bufferRotation);
         // shown stays false
+    }
+
+    /** Source-cropped variant of {@link #setGeometryHidden} for the ZOOM mode's initial
+     *  arm (avoids an empty-layer flash). See {@link #setGeometry(Rect,int,int,int,int)}. */
+    public synchronized void setGeometryHidden(Rect src, int x, int y, int w, int h) {
+        if (surfaceControl == null) return;
+        Rect s = clampSrc(src);
+        applyGeometry(surfaceControl, s.left, s.top, s.width(), s.height(), x, y, w, h,
+                zOrder, false, bufferW, bufferH, layerStack, bufferRotation);
+        // shown stays false
+    }
+
+    /** Clamp a requested source crop to a valid, non-empty sub-rect of the buffer so a
+     *  degenerate crop (zero/negative/oversized) can never reach SurfaceFlinger (which
+     *  would fault or composite black). Defensive; the callers already compute in-bounds. */
+    private Rect clampSrc(Rect src) {
+        if (src == null) return new Rect(0, 0, bufferW, bufferH);
+        int l = Math.max(0, Math.min(src.left, bufferW - 1));
+        int t = Math.max(0, Math.min(src.top, bufferH - 1));
+        int r = Math.max(l + 1, Math.min(src.right, bufferW));
+        int b = Math.max(t + 1, Math.min(src.bottom, bufferH));
+        return new Rect(l, t, r, b);
     }
 
     /** Hide the layer (keeps it allocated for a fast re-show). */
@@ -212,8 +331,9 @@ public final class BsNativeLayer {
         }
     }
 
-    private static void applyGeometry(Object sc, int x, int y, int w, int h, int z, boolean show,
-                                      int bufW, int bufH, int layerStack) {
+    private static void applyGeometry(Object sc, int srcX, int srcY, int srcW, int srcH,
+                                      int x, int y, int w, int h, int z, boolean show,
+                                      int bufW, int bufH, int layerStack, int rotationDeg) {
         try {
             Class<?> scCls = Class.forName("android.view.SurfaceControl");
             Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
@@ -226,27 +346,58 @@ public final class BsNativeLayer {
                 try { txCls.getMethod("setLayerStack", scCls, int.class).invoke(tx, sc, layerStack); } catch (Throwable ignored) {}
             }
             try { txCls.getMethod("setAlpha", scCls, float.class).invoke(tx, sc, 1.0f); } catch (Throwable ignored) {}
-            // setGeometry(sc, sourceCrop, destFrame, rotation) — validated present
-            // on this firmware. Scales the fixed bufW×bufH buffer into the dest rect.
+            // setGeometry(sc, sourceCrop, destFrame, orientation) — validated present
+            // on this firmware. Scales the source-crop sub-rect of the buffer into the
+            // dest rect, rotating it by `orientation` (a NATIVE_WINDOW_TRANSFORM_* /
+            // HAL transform code from rotationConst — NOT a Surface.ROTATION_* ordinal;
+            // see rotationConst's javadoc for why that distinction is load-bearing).
+            // The source crop is the FULL buffer for every caller except the cluster
+            // mirror's ZOOM mode; the caller supplies a dest rect already sized for the
+            // rotated buffer (w/h swapped for 90/270), so the scale stays uniform.
+            int orientation = rotationConst(rotationDeg);
             boolean geom = false;
             try {
-                Rect src = new Rect(0, 0, bufW, bufH);
+                Rect src = new Rect(srcX, srcY, srcX + srcW, srcY + srcH);
                 Rect dst = new Rect(x, y, x + w, y + h);
                 txCls.getMethod("setGeometry", scCls, Rect.class, Rect.class, int.class)
-                        .invoke(tx, sc, src, dst, 0);
+                        .invoke(tx, sc, src, dst, orientation);
                 geom = true;
             } catch (Throwable ignored) {}
             if (!geom) {
-                // Fallback: position + scale via setPosition + setMatrix.
+                // Fallback: position + scale via setPosition + setMatrix. setMatrix is a
+                // 2×2 (dsdx,dtdx,dsdy,dtdy); compose the rotation into it so a device
+                // lacking the 4-arg setGeometry still honours the rotation option.
+                // The dest rect is now ALWAYS the source's 4:3 aspect (the caller no
+                // longer swaps to 3:4 for quarter turns — see the primary path's note),
+                // and the buffer is itself 4:3, so a SINGLE uniform scale s = w/bufW
+                // (== h/bufH) keeps square pixels for every angle; only the rotation
+                // signs differ. This matches the native setGeometry scale (which also
+                // scales by dstW/srcW and rotates after), so a device on the fallback
+                // rotates the same direction as one on the primary path.
+                // NOTE: setMatrix rotates about the buffer ORIGIN and cannot express a
+                // pivot offset, so on a device that lacks the 4-arg setGeometry the
+                // rotated card is placed best-effort (may be offset from the exact dest
+                // corner) — never stretched or mirrored. The primary setGeometry path is
+                // the one used on this firmware (validated present on API 29).
                 try {
                     txCls.getMethod("setPosition", scCls, float.class, float.class)
                             .invoke(tx, sc, (float) x, (float) y);
                 } catch (Throwable ignored) {}
                 try {
-                    float sx = (float) w / (float) Math.max(1, bufW);
-                    float sy = (float) h / (float) Math.max(1, bufH);
-                    txCls.getMethod("setMatrix", scCls, float.class, float.class, float.class, float.class)
-                            .invoke(tx, sc, sx, 0f, 0f, sy);
+                    java.lang.reflect.Method setMatrix = txCls.getMethod("setMatrix",
+                            scCls, float.class, float.class, float.class, float.class);
+                    int d = ((rotationDeg % 360) + 360) % 360;
+                    // Uniform scale (dst is 4:3 like the buffer, so both axes agree).
+                    float s = (float) w / (float) Math.max(1, bufW);
+                    if (d == 90) {
+                        setMatrix.invoke(tx, sc, 0f, s, -s, 0f);
+                    } else if (d == 180) {
+                        setMatrix.invoke(tx, sc, -s, 0f, 0f, -s);
+                    } else if (d == 270) {
+                        setMatrix.invoke(tx, sc, 0f, -s, s, 0f);
+                    } else {
+                        setMatrix.invoke(tx, sc, s, 0f, 0f, s);
+                    }
                 } catch (Throwable ignored) {}
             }
             if (show) try { txCls.getMethod("show", scCls).invoke(tx, sc); } catch (Throwable ignored) {}
@@ -285,38 +436,50 @@ public final class BsNativeLayer {
         }
     }
 
-    /** Real size of the driver-cluster display (the OEM "fission" PRESENTATION
-     *  VirtualDisplay, layerStack 1, ~1920×720). Only valid while an OEM cluster
-     *  projection is open — call AFTER projection-ready. Enumerates DisplayManager
-     *  rather than WindowManager.getDefaultDisplay (which only ever returns the
-     *  head-unit). Falls back to the known fixed 1920×720 if the display can't be
-     *  read. Selection order: name contains "fission" → displayId==1 → a non-default
-     *  PRESENTATION display. */
+    /** Resolve the live descriptor and return the corresponding cluster's real size. */
     public static Point clusterDisplaySize(Context ctx) {
+        return clusterDisplaySize(ctx, resolveFissionDisplay());
+    }
+
+    /**
+     * Real size of the driver-cluster display (the OEM "fission" VirtualDisplay).
+     * The supplied descriptor lets callers use the SAME identity for display routing and
+     * sizing. This matters when stale fission entries or another PRESENTATION display exist:
+     * choosing by name or category first can combine one display's id with another's size.
+     *
+     * <p>Resolution order is exact positive displayId via DisplayManager/getRealSize, the
+     * real size parsed from that descriptor's dumpsys line, then an identity-matched dumpsys
+     * retry. A name lookup is allowed only when no id was resolved. An arbitrary presentation
+     * display is never accepted as the cluster.
+     */
+    public static Point clusterDisplaySize(Context ctx, FissionDisplay fission) {
         Point p = new Point(1920, 720);
         try {
+            if (ctx == null) throw new IllegalStateException("no context");
             android.hardware.display.DisplayManager dm =
                 (android.hardware.display.DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
-            if (dm == null) return p;
+            if (dm == null) throw new IllegalStateException("no DisplayManager");
             android.view.Display chosen = null;
             android.view.Display[] displays = dm.getDisplays();
             if (displays != null) {
-                // 1) name contains "fission"
-                for (android.view.Display d : displays) {
-                    String n = d.getName();
-                    if (n != null && n.toLowerCase(java.util.Locale.US).contains("fission")) { chosen = d; break; }
-                }
-                // 2) displayId == 1
-                if (chosen == null) {
+                // 1) Exact id from the authoritative live fission DisplayInfo line.
+                if (fission != null && fission.displayId > 0) {
                     for (android.view.Display d : displays) {
-                        if (d.getDisplayId() == 1) { chosen = d; break; }
+                        if (d.getDisplayId() == fission.displayId) {
+                            chosen = d;
+                            break;
+                        }
                     }
                 }
-                // 3) a non-default PRESENTATION display
-                if (chosen == null) {
+                // 2) Name fallback only when dumpsys did not resolve an identity.
+                if (chosen == null && (fission == null || fission.displayId < 0)) {
                     for (android.view.Display d : displays) {
-                        if (d.getDisplayId() != android.view.Display.DEFAULT_DISPLAY
-                                && (d.getFlags() & android.view.Display.FLAG_PRESENTATION) != 0) { chosen = d; break; }
+                        String n = d.getName();
+                        if (d.getDisplayId() != android.view.Display.DEFAULT_DISPLAY && n != null
+                                && n.toLowerCase(java.util.Locale.US).contains("fission")) {
+                            chosen = d;
+                            break;
+                        }
                     }
                 }
             }
@@ -340,14 +503,13 @@ public final class BsNativeLayer {
         } catch (Throwable t) {
             logger.debug("clusterDisplaySize failed: " + t.getMessage());
         }
+        if (fission != null && fission.width > 0 && fission.height > 0) {
+            return new Point(fission.width, fission.height);
+        }
         // DisplayManager couldn't surface the fission display (its cache misses the
-        // foreign uid-1000 display on many models). Before giving up to the fixed
-        // 1920×720, parse the AUTHORITATIVE real W×H from the fission display's own
-        // `dumpsys display` block (same source resolveFissionDisplay uses for the id /
-        // layerStack — it reflects reality even when the DisplayManager cache is stale).
-        // This is what stops a non-Seal cluster (real panel ≠ 1920×720) from silently
-        // snapping to the fallback and mis-sizing / under-rendering the projection.
-        Point fromDump = clusterDisplaySizeViaDumpsys();
+        // foreign uid-1000 display on many models). Retry dumpsys, tied to the same id.
+        int expectedId = fission != null ? fission.displayId : -1;
+        Point fromDump = clusterDisplaySizeViaDumpsys(expectedId);
         if (fromDump != null && fromDump.x > 0 && fromDump.y > 0) {
             logger.info("clusterDisplaySize: resolved " + fromDump.x + "x" + fromDump.y
                     + " from dumpsys (DisplayManager cache missed the fission display)");
@@ -357,7 +519,8 @@ public final class BsNativeLayer {
         // cluster panel differs AND whose dumpsys layout we couldn't parse, this
         // mis-sizes the projection.
         logger.warn("clusterDisplaySize: fission panel not found via DisplayManager OR "
-                + "dumpsys — using fixed 1920x720 fallback (may mis-size on non-Seal clusters)");
+                + "identity-matched dumpsys — using fixed 1920x720 fallback"
+                + " (displayId=" + expectedId + ", may mis-size on non-Seal clusters)");
         return p;
     }
 
@@ -376,36 +539,29 @@ public final class BsNativeLayer {
      * does. Bounds-checked (1..8192) so a stray small pair (e.g. a density "1 x 1")
      * can't win. Best-effort: any failure returns null and the caller uses its fallback.
      */
-    private static Point clusterDisplaySizeViaDumpsys() {
+    private static Point clusterDisplaySizeViaDumpsys(int expectedDisplayId) {
         Process proc = null;
         try {
             proc = new ProcessBuilder("dumpsys", "display").redirectErrorStream(true).start();
             java.io.BufferedReader r = new java.io.BufferedReader(
                     new java.io.InputStreamReader(proc.getInputStream()));
-            // <W> x <H> with optional spaces around the 'x' (e.g. "1920 x 720" or "1920x720").
-            java.util.regex.Pattern dim =
-                    java.util.regex.Pattern.compile("(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})");
             String line;
             Point best = null;
             while ((line = r.readLine()) != null) {
-                if (!line.toLowerCase(java.util.Locale.US).contains("fission")) continue;
-                java.util.regex.Matcher mt = dim.matcher(line);
-                while (mt.find()) {
-                    int w = Integer.parseInt(mt.group(1));
-                    int h = Integer.parseInt(mt.group(2));
-                    // Plausible panel dimensions only; prefer the LARGEST pair on the
-                    // line (the real resolution, not an inset/density artifact).
-                    if (w >= 200 && w <= 8192 && h >= 200 && h <= 8192) {
-                        if (best == null || (long) w * h > (long) best.x * best.y) {
-                            best = new Point(w, h);
-                        }
-                    }
+                String low = line.toLowerCase(java.util.Locale.US);
+                if (!low.contains("fission")
+                        || low.matches(".*\\bstate[ =]+(off|unknown)\\b.*")) {
+                    continue;
                 }
-                if (best != null) {
+                int lineId = extractDisplayIdOnLine(line);
+                if (expectedDisplayId > 0 && lineId != expectedDisplayId) continue;
+                Point candidate = extractLargestSizeOnLine(line);
+                if (candidate != null) {
+                    best = candidate; // Prefer the last live Base/Override DisplayInfo line.
                     logger.info("clusterDisplaySizeViaDumpsys raw: " + line.trim());
-                    return best;
                 }
             }
+            return best;
         } catch (Throwable t) {
             logger.debug("clusterDisplaySizeViaDumpsys failed: " + t.getMessage());
         } finally {
@@ -414,14 +570,100 @@ public final class BsNativeLayer {
         return null;
     }
 
+    /**
+     * Parse the fission display's REAL physical size from a {@code dumpsys display} line.
+     *
+     * <p>The DisplayInfo line inlines SEVERAL {@code W x H} pairs, e.g.
+     * {@code ... app 1920 x 720, real 1920 x 720, overscan (80,50,80,50), largest app 1920 x 1920,
+     * smallest app 720 x 720, ...}. The {@code real}/{@code app} pair is the authoritative panel
+     * size (1920×720 = 8:3 on the Seal); {@code largest app}/{@code smallest app} are AMS's
+     * rotation/overscan envelope bounds (here 1920×1920 and 720×720) and are NOT the panel — a
+     * plain "largest area wins" scan wrongly picked {@code 1920 x 1920}, giving a 1:1 aspect that
+     * made the projection box render SQUARE (confirmed on-car: cluster-mirror-status reported
+     * panelH=1920). So we prefer, in order: the {@code real} pair, then the {@code app} pair (but
+     * NOT {@code largest app}/{@code smallest app}), and only if neither token is present do we
+     * fall back to the first valid pair on the line (covers the DisplayDeviceInfo line, whose bare
+     * leading {@code 1920 x 720} carries no envelope pairs).
+     */
+    /** {@link Point} wrapper over the pure {@link #parseSizeFromDumpsysLine} parser. Kept because
+     *  {@code new Point(w,h)} only stores its args on a real device — under the plain-JVM unit test
+     *  the {@code android.graphics.Point} stub is a no-op, so ALL parsing is done in int[] space
+     *  and the Point is built ONLY here (never exercised by the test). */
+    private static Point extractLargestSizeOnLine(String line) {
+        int[] wh = parseSizeFromDumpsysLine(line);
+        return wh == null ? null : new Point(wh[0], wh[1]);
+    }
+
+    /**
+     * Pure size parse (returns {@code [w, h]} or null) — the testable core of
+     * {@link #extractLargestSizeOnLine}. Package-private so the unit test can pin it against real
+     * on-car {@code dumpsys display} lines without a device (and without the Point stub).
+     */
+    static int[] parseSizeFromDumpsysLine(String line) {
+        // 1) Authoritative: "real <W> x <H>".
+        int[] real = matchLabeledSize(line, "real");
+        if (real != null) return real;
+        // 2) Base app size: "app <W> x <H>", but reject the envelope pairs whose "app" is preceded
+        //    by "largest"/"smallest".
+        int[] app = matchAppSize(line);
+        if (app != null) return app;
+        // 3) No labeled size on this line — take the FIRST valid pair (not the largest; the bogus
+        //    square envelope, if present, would otherwise win an area contest).
+        java.util.regex.Matcher mt = java.util.regex.Pattern
+                .compile("(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})")
+                .matcher(line);
+        while (mt.find()) {
+            int[] p = validSize(mt.group(1), mt.group(2));
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    /** First {@code <label> <W> x <H>} pair on the line (e.g. label="real"), or null. */
+    private static int[] matchLabeledSize(String line, String label) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\\b" + label + "\\s+(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})")
+                .matcher(line);
+        return m.find() ? validSize(m.group(1), m.group(2)) : null;
+    }
+
+    /** The base {@code app <W> x <H>} pair, EXCLUDING {@code largest app}/{@code smallest app}. */
+    private static int[] matchAppSize(String line) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(largest |smallest )?app\\s+(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})")
+                .matcher(line);
+        while (m.find()) {
+            if (m.group(1) != null) continue;   // skip "largest app" / "smallest app"
+            int[] p = validSize(m.group(2), m.group(3));
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    /** Bounds-checked (200..8192) {@code [w, h]}, or null. */
+    private static int[] validSize(String ws, String hs) {
+        int w = parseIntSafe(ws), h = parseIntSafe(hs);
+        if (w >= 200 && w <= 8192 && h >= 200 && h <= 8192) return new int[] { w, h };
+        return null;
+    }
+
     /** Resolved cluster (fission) display descriptor from {@code dumpsys display}.
      *  displayId / layerStack are -1 when not parsed. */
     public static final class FissionDisplay {
         public final int displayId;
         public final int layerStack;
+        public final int width;
+        public final int height;
+
         FissionDisplay(int displayId, int layerStack) {
+            this(displayId, layerStack, 0, 0);
+        }
+
+        FissionDisplay(int displayId, int layerStack, int width, int height) {
             this.displayId = displayId;
             this.layerStack = layerStack;
+            this.width = width;
+            this.height = height;
         }
         /** True when we positively identified the fission display (id and/or stack). */
         public boolean present() { return displayId >= 0 || layerStack >= 0; }
@@ -478,7 +720,7 @@ public final class BsNativeLayer {
             java.util.regex.Pattern sameLineStack =
                 java.util.regex.Pattern.compile("(?i)layerstack[ =]+(\\d+)");
             String line;
-            int foundId = -1, foundStack = -1;
+            int foundId = -1, foundStack = -1, foundW = 0, foundH = 0;
             while ((line = r.readLine()) != null) {
                 String low = line.toLowerCase(java.util.Locale.US);
                 if (!low.contains("fission")) continue;
@@ -544,11 +786,29 @@ public final class BsNativeLayer {
                 // Base; identical N).
                 java.util.regex.Matcher m = sameLineStack.matcher(line);
                 int id = extractDisplayIdOnLine(line);
-                if (m.find()) {
+                Point size = extractLargestSizeOnLine(line);
+                if (m.find() && id >= 0) {
+                    boolean sameDisplay = foundId == id;
                     foundStack = parseIntSafe(m.group(1));
-                    if (id >= 0) foundId = id;          // id paired with THIS stack's line
+                    foundId = id;                       // id paired with THIS stack's line
+                    if (size != null) {
+                        foundW = size.x;
+                        foundH = size.y;
+                    } else if (!sameDisplay) {
+                        // Never carry dimensions from a different fission entry into this id.
+                        foundW = 0;
+                        foundH = 0;
+                    }
                 } else if (id >= 0 && foundStack < 0) {
+                    boolean sameDisplay = foundId == id;
                     foundId = id;                        // id-only line, no stack seen yet
+                    if (size != null) {
+                        foundW = size.x;
+                        foundH = size.y;
+                    } else if (!sameDisplay) {
+                        foundW = 0;
+                        foundH = 0;
+                    }
                 }
             }
             // DIAGNOSTIC: log the RESOLVED result so the next on-car log shows whether
@@ -557,8 +817,8 @@ public final class BsNativeLayer {
             // "resolveFissionDisplay raw:" above are the two datums every prior log
             // lacked, which left code-vs-environment unanswerable.
             logger.info("resolveFissionDisplay result: displayId=" + foundId
-                    + " layerStack=" + foundStack);
-            return new FissionDisplay(foundId, foundStack);
+                    + " layerStack=" + foundStack + " real=" + foundW + "x" + foundH);
+            return new FissionDisplay(foundId, foundStack, foundW, foundH);
         } catch (Throwable t) {
             logger.warn("resolveFissionDisplay parse failed: " + t.getMessage());
             return new FissionDisplay(-1, -1);
@@ -613,14 +873,30 @@ public final class BsNativeLayer {
         // (live stack but OEM never panel-composites it).
         if (fd.layerStack >= 0) {
             logger.info("clusterLayerStack: branch=live stack=" + fd.layerStack);
-            return fd.layerStack;   // live, authoritative
-        }
-        if (fd.displayId >= 0) {
+        } else if (fd.displayId >= 0) {
             logger.info("clusterLayerStack: branch=FALLBACK stack=" + fallback
                     + " (displayId=" + fd.displayId + " but layerStack unparsed)");
-            return fallback;          // fission seen, stack unparsed → last-known-good
+        } else {
+            logger.info("clusterLayerStack: branch=UNRESOLVED (no fission display)");
         }
-        logger.info("clusterLayerStack: branch=UNRESOLVED (no fission display)");
+        return clusterLayerStack(fd, fallback);
+    }
+
+    /**
+     * Resolve the cluster layerStack from an ALREADY-resolved {@link FissionDisplay} so a
+     * caller that ALSO needs the display id or panel size uses ONE consistent descriptor for
+     * all three, instead of parsing {@code dumpsys display} a second time. Two back-to-back
+     * parses can straddle a layerStack change across a projection re-open (the stack is a
+     * process-global counter that increments per re-open), pairing one display's stack with
+     * another's size/id — the exact hazard the descriptor-carry refactor removes. Same
+     * resolution order as {@link #clusterLayerStack(int)}: the live parsed stack, else the
+     * {@code fallback} when the fission display was seen but its stack was unparsed, else
+     * {@link #STACK_UNRESOLVED} (no fission display → caller must not show).
+     */
+    public static int clusterLayerStack(FissionDisplay fd, int fallback) {
+        if (fd == null) return STACK_UNRESOLVED;
+        if (fd.layerStack >= 0) return fd.layerStack;   // live, authoritative
+        if (fd.displayId >= 0) return fallback;          // fission seen, stack unparsed
         return STACK_UNRESOLVED;                          // no fission display → don't show
     }
 

@@ -38,6 +38,11 @@ public class MqttPublisherService implements MqttCallback {
     private static final int BACKOFF_BASE_SECONDS = 5;
     private static final int BACKOFF_CAP_SECONDS = 300;
 
+    // How long to wait for an enabled-but-not-yet-up Tailscale proxy before falling back to a
+    // direct dial. Covers the boot window (tailscaled still binding) without permanently refusing
+    // a directly-reachable broker if the proxy is genuinely dead.
+    private static final long PROXY_WARMUP_GRACE_MS = 60_000L;
+
     // Connection config
     private final MqttConnectionConfig config;
     private final String deviceId;
@@ -53,6 +58,10 @@ public class MqttPublisherService implements MqttCallback {
     private volatile long lastPublishTime = 0;
     private volatile int consecutiveFailures = 0;
     private volatile String lastError = null;
+    // Proxy warm-up tracking (issue #182): when the first defer started, and whether we've already
+    // logged this warm-up so the health loop doesn't spam an identical warning every cycle.
+    private volatile long proxyWaitStartMs = 0L;
+    private volatile boolean loggedProxyWait = false;
 
     // Change detection (report-by-exception) + Home Assistant discovery state.
     // TelemetryDiffer is documented single-thread-owned: ALL access to it must
@@ -101,6 +110,44 @@ public class MqttPublisherService implements MqttCallback {
             logger.error(lastError);
             return false;
         }
+
+        // Mark the connection active as soon as it has a broker to attempt, independent of whether
+        // this first connect succeeds. Otherwise a failed OR deferred initial connect leaves
+        // running=false, and MqttConnectionManager's health loop bails on !isRunning() and never
+        // reschedules — the connection stays dead until a daemon restart. That gate (not the direct
+        // dial alone) is the real "never recovers" root cause behind #182, and the reason the
+        // "will retry on first publish" contract at the call site never actually held.
+        running = true;
+
+        // issue #182: when the Tailscale SOCKS proxy is ENABLED the broker is normally reachable
+        // ONLY through it (e.g. a LAN broker behind a subnet router while the car is on cellular).
+        // A DIRECT dial in that state can never succeed off Wi-Fi and strands the connection, so
+        // hold off while the proxy is warming up (tailscaled still binding at boot / after a link
+        // change) instead of falling through to the direct-socket path below. We do NOT bump
+        // consecutiveFailures — the health loop re-probes at the min-interval floor and connects the
+        // instant the proxy binds. Bounded by PROXY_WARMUP_GRACE_MS so a genuinely dead proxy can't
+        // permanently refuse a directly-reachable broker: after the grace window we fall through and
+        // try a direct dial as a last resort.
+        if (ProxyHelper.isProxyExpected() && !ProxyHelper.isProxyAvailable()) {
+            long now = System.currentTimeMillis();
+            if (proxyWaitStartMs == 0L) proxyWaitStartMs = now;
+            long waitedMs = now - proxyWaitStartMs;
+            if (waitedMs < PROXY_WARMUP_GRACE_MS) {
+                connected = false;
+                lastError = "Tailscale proxy enabled but not reachable yet (127.0.0.1:"
+                        + ProxyHelper.getTailscaleProxyPort() + ") — deferring connect until proxy is up";
+                if (!loggedProxyWait) {
+                    logger.warn(lastError);
+                    loggedProxyWait = true;
+                }
+                return false;
+            }
+            logger.warn("Tailscale proxy still unreachable after " + (waitedMs / 1000)
+                    + "s — attempting a direct connect as a fallback");
+        }
+        // Proxy is up (or the grace window elapsed) — clear the warm-up state and proceed to connect.
+        proxyWaitStartMs = 0L;
+        loggedProxyWait = false;
 
         String effectiveClientId = config.getEffectiveClientId(deviceId);
 
@@ -241,6 +288,18 @@ public class MqttPublisherService implements MqttCallback {
                 }
             }
 
+            // Inbound automation triggers: <base>/automation/<channel>. Independent of the
+            // HA/control gates above — an external broker message on this subtree fires an
+            // OverDrive automation (see messageArrived → Automations.publishMqttTrigger).
+            // Re-subscribed on every (re)connect since connect() is the reconnect path.
+            // Cheap and inert when no automation watches the channel.
+            try {
+                client.subscribe(config.topic + "/automation/+", config.qos);
+                logger.info("Subscribed to inbound automation-trigger topics under " + config.topic + "/automation/");
+            } catch (MqttException e) {
+                logger.warn("Automation-trigger subscribe failed: " + e.getMessage());
+            }
+
             logger.info("Connected to " + brokerUri);
             return true;
 
@@ -357,8 +416,19 @@ public class MqttPublisherService implements MqttCallback {
         }
 
         long now = System.currentTimeMillis();
+
+        // Read the vehicle state up front — it drives both the state-transition full-sync AND the
+        // per-state heartbeat ceiling (parked / charging overrides). Cheap in-memory reads; default
+        // to the previous cycle's values if a monitor isn't ready so the interval stays stable.
+        boolean carOn = prevAccOn, charging = prevCharging;
+        try { carOn = com.overdrive.app.monitor.AccMonitor.isAccOn(); } catch (Throwable ignored) {}
+        try { charging = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging(); } catch (Throwable ignored) {}
+
         long minMs = Math.max(1, config.minIntervalSeconds) * 1000L;
-        long maxMs = Math.max(config.minIntervalSeconds, config.maxIntervalSeconds) * 1000L;
+        // Heartbeat ceiling is state-aware: while charging (or, failing that, while parked) the
+        // config's per-state override replaces maxIntervalSeconds. effectiveMaxIntervalSeconds
+        // floors the result at minIntervalSeconds, so maxMs >= minMs always holds.
+        long maxMs = config.effectiveMaxIntervalSeconds(carOn, charging) * 1000L;
 
         Set<String> changed = differ.changedKeys(snapshot);
         boolean first = differ.lastSendTimeMs() == 0;
@@ -370,9 +440,6 @@ public class MqttPublisherService implements MqttCallback {
         // Full-sync on every state-mode transition (ACC on↔off, charging start↔stop) so the new
         // state survives even if a single change-publish is lost at a network handoff. Cheap:
         // fires only on edges, a few full sends each. Inert until the monitors first report.
-        boolean carOn = prevAccOn, charging = prevCharging;
-        try { carOn = com.overdrive.app.monitor.AccMonitor.isAccOn(); } catch (Throwable ignored) {}
-        try { charging = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging(); } catch (Throwable ignored) {}
         if (config.flushOnStateChange && stateInit && (carOn != prevAccOn || charging != prevCharging)) {
             stateFlushCycles = 5;
         }
@@ -442,6 +509,27 @@ public class MqttPublisherService implements MqttCallback {
     public synchronized boolean publish(JSONObject payload) {
         if (!running) return false;
         return publishString(config.topic, payload.toString(), config.retainMessages, config.qos);
+    }
+
+    /**
+     * Publish an arbitrary payload to an arbitrary topic — the seam the automation
+     * "Publish MQTT" action uses to notify Home Assistant (or any broker consumer). A
+     * relative topic (no leading '/') is scoped under this connection's base topic so a
+     * user needn't know the full prefix; an absolute topic (leading '/') is used as-is
+     * minus the leading slash. Returns false when the connection isn't running so a
+     * disabled/absent MQTT setup makes the action a clean no-op. Uses this connection's
+     * QoS; retain is caller-chosen (HA state topics want retain=true).
+     */
+    public synchronized boolean publishToTopic(String topic, String payload, boolean retain) {
+        if (!running) return false;
+        if (topic == null || topic.isEmpty() || payload == null) return false;
+        String full;
+        if (topic.startsWith("/")) {
+            full = topic.substring(1);
+        } else {
+            full = config.topic + "/" + topic;
+        }
+        return publishString(full, payload, retain, config.qos);
     }
 
     /** Low-level single-message publish with reconnect + stats handling. */
@@ -599,6 +687,24 @@ public class MqttPublisherService implements MqttCallback {
                 // Defer the differ.reset() to the publish thread — do NOT touch
                 // the differ from this Paho callback thread (it isn't thread-safe).
                 forceFullResend = true;
+            }
+            return;
+        }
+
+        // Inbound automation trigger: <base>/automation/<channel>. An external broker
+        // message (Home Assistant, Node-RED, …) becomes an automation signal keyed by
+        // channel, so a rule can fire on "HA published X to channel Y". Enqueue-only —
+        // Automations.publishMqttTrigger does an atomic map CAS + queues to the automation
+        // worker, so it's safe and non-blocking on this Paho callback thread (never runs
+        // action logic here). Inert at zero cost when no automation watches the channel.
+        String autoPrefix = config.topic + "/automation/";
+        if (topic != null && topic.startsWith(autoPrefix)) {
+            String channel = topic.substring(autoPrefix.length());
+            String payload = new String(message.getPayload());
+            try {
+                com.overdrive.app.automation.Automations.publishMqttTrigger(channel, payload);
+            } catch (Throwable t) {
+                logger.warn("Inbound MQTT automation trigger failed: " + t.getMessage());
             }
             return;
         }

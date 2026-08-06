@@ -18,6 +18,7 @@ import com.overdrive.app.surveillance.SurveillanceEngineGpu;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -261,8 +262,10 @@ public class PanoramicCameraGpu {
     private volatile boolean imagePending = false;
     
     // Consumers
-    private GpuMosaicRecorder recorder;
-    private HardwareEventRecorderGpu encoder;  // Direct encoder reference for draining
+    // volatile: the stall watchdog thread reads both to decide whether a consumer is
+    // starved, and encoder is wired ~1.5s AFTER that thread starts.
+    private volatile GpuMosaicRecorder recorder;
+    private volatile HardwareEventRecorderGpu encoder;  // Direct encoder reference for draining
     // Volatile so the GL render loop's snapshot read at drawFrame's
     // top-of-loop sees stream-disable's null-write atomically. Without
     // volatile, the GL thread can cache a stale ref past the disable
@@ -440,7 +443,78 @@ public class PanoramicCameraGpu {
     // bare restartCameraAfterError() until the warmup-routed recovery completes
     // (and resets it via notePipelineRestarted()).
     private volatile boolean halRecoveryEscalated = false;
-    
+
+    // DiLink 4 parked-producer recovery: the byd_apa producer can die at ACC OFF
+    // and never resume. Bounded reopen, spaced by
+    // DILINK4_ERROR_RESTART_MIN_INTERVAL_MS. 5 attempts matches esco's cap.
+    private static final int DILINK4_STALL_RESTART_MAX_ATTEMPTS = 5;
+    private volatile int dilink4StallRestartAttempts = 0;
+    private volatile long dilink4LastStallRestartMs = 0L;
+    /** Latched when the budget is spent so the give-up logs once, not per tick. */
+    private volatile boolean dilink4StallRecoveryExhausted = false;
+    // Proof-of-recovery before the budget is refilled: a half-alive HAL can emit a
+    // frame or two after a reopen and freeze again, and refilling on frame 1 turns
+    // the bounded ladder into an unbounded reopen loop. 30s of unbroken flow (~120
+    // frames at this HAL's 4-5 fps) keeps a pause/flow/pause cycle from earning a
+    // fresh budget every minute; any stall in between voids the tally.
+    private static final int DILINK4_RECOVERY_PROOF_FRAMES = 60;
+    private static final long DILINK4_RECOVERY_PROOF_MS = 30_000L;
+    private volatile int dilink4RecoveryProofFrames = 0;
+    private volatile long dilink4RecoveryProofSinceMs = 0L;
+
+    // DEAD-SLOT ESCAPE (issue #170). Every self-healing path above needs proof
+    // that the camera produced at least one frame: the frame-15/50 revalidation
+    // is driven by frameCounter, and the frame-stall monitor is gated on
+    // `lastFrameTime > 0`. A slot that opens but can NEVER stream therefore arms
+    // none of them and the pipeline waits forever — Diagnostics stays on
+    // "Probing…", frameCount stays 0, nothing is ever recorded.
+    //
+    // That is exactly what BYD's 2602-generation firmware does on legacy pano_h
+    // boards: AVMCamera.open(1) succeeds, but the HAL reports a 0x0 preview so
+    // addPreviewSurface fails (err 423) and startPreview fails (err 279) — both
+    // inside the HAL, neither raising a Java exception we could catch at open.
+    //
+    // So: if NO frame has arrived within this window of the camera opening, the
+    // slot is presumed dead and we walk PanoCameraFallbackOrder. The window must
+    // clear the documented 5-8s BYD first-frame latency and the 9s stall grace
+    // with room to spare — a false trigger costs a HAL close/open cycle, so we
+    // are deliberately patient. This only ever fires for a camera that has not
+    // produced a single frame; once one arrives, the existing machinery owns
+    // recovery and this path is permanently disarmed for the session.
+    //
+    // Legacy (addPreviewSurface) path ONLY. On dilink4 the esco-parity posture
+    // deliberately performs no stall-driven close/reopen at all (see
+    // dilink4SkipStallRestart below): that HAL routinely pauses frame emission
+    // on parked cars, so "open but no frames for 25s" is a NORMAL state there,
+    // not a dead slot — walking would churn the HAL and could persist a wrong
+    // id. Issue #170's hardware is exclusively the legacy path.
+    private static final long FIRST_FRAME_DEAD_SLOT_MS = 25000;
+    // Camera IDs opened OR attempted this session, so the walk never revisits
+    // a candidate. startCamera records every successful open; the walk records
+    // each candidate at switch time — an attempt that fails to open counts as
+    // tried too, otherwise a candidate whose open throws would be retried on
+    // every watchdog tick, forever.
+    // CopyOnWriteArraySet, not a synchronized wrapper: startCamera adds from the
+    // camera-open worker thread that restartCameraAfterError spawns, while the
+    // GL thread reads it (and concatenates it into log lines). COW gives both
+    // contains() and toString() snapshot semantics with no lock and no risk of
+    // ConcurrentModificationException. Writes are rare and the set holds at most
+    // a couple of entries, so the copy cost is irrelevant.
+    private final java.util.Set<Integer> deadSlotTriedCameraIds =
+        new java.util.concurrent.CopyOnWriteArraySet<>();
+    // True once the walk has switched ids at least once. Two consumers: it
+    // relaxes the watchdog's cameraObj gate (a candidate whose open FAILED
+    // leaves cameraObj null mid-walk — the walk must still advance past it),
+    // and it makes the switch re-enable frame validation so the frame-15/50
+    // path can validate-and-persist the recovered id (see advance...()).
+    private volatile boolean deadSlotWalkActive = false;
+    // Latched once the candidate list is exhausted so we log once, not per tick.
+    private volatile boolean deadSlotWalkExhausted = false;
+    // BmmCameraInfo panoramic tag mapping, resolved lazily on first use so the
+    // reflection + logging cost is paid only on boards that actually wedge.
+    // MIN_VALUE = not yet resolved; -1 = resolved, API absent (DiLink 3.0).
+    private volatile int halPanoCameraIdHint = Integer.MIN_VALUE;
+
     // Flag to indicate camera restart is in progress — watchdog uses extended timeout.
     // P1 #11: AtomicBoolean so concurrent restartCameraAfterError + reopenCamera
     // calls can't both enter the restart path. Loser observes
@@ -503,6 +577,14 @@ public class PanoramicCameraGpu {
 
     private int targetFps = 15;  // Desired frame rate for camera
 
+    // Cached AI-lane readback pacing (parked-idle throttle). The AiLaneGl is
+    // created/torn down lazily on the GL thread and is null while disarmed, so a
+    // control-thread setter caches the value here and re-applies it at bring-up
+    // (ensureAiLaneStarted) — mirroring how sentry.setCameraTargetFps is
+    // re-asserted. Default 0 = disabled ⇒ AiLaneGl uses its compiled modulo=3,
+    // byte-identical to today.
+    private volatile long aiReadbackMinIntervalMs = 0L;
+
     // Recorder draw stride. The render loop draws into the RECORDING encoder's
     // input surface (PASS 1A) only on every Nth camera frame; stream (PASS 1B)
     // and blind-spot (PASS 1C) are unaffected (separate encoders, drawn every
@@ -537,6 +619,30 @@ public class PanoramicCameraGpu {
     // is benign for a phase counter read as `% stride`.
     private volatile long recorderStrideCounter = 0;
 
+    // Stream-lane stride: same pattern as recorderFrameStride but derived from
+    // streamEncoder.getFps() vs camera targetFps. When the camera runs at 15 fps
+    // and the stream preset requests 10 fps, stride = floor(15/10) = 1 (draw every
+    // frame); at 30 vs 10, stride = 3 (draw every 3rd). Stride 1 = every frame.
+    // Volatile: written on the GL thread during enable/quality-change (via pipeline),
+    // read on the same GL render thread.
+    private volatile int streamFrameStride = 1;
+    private volatile long streamStrideCounter = 0;
+    // Stream client-presence probe (set by the pipeline to
+    // WebSocketStreamServer::hasActiveClients). When it returns false, PASS 1B
+    // skips the GPU raster + encode entirely: with no viewer the encoded bytes
+    // are dropped anyway (WebSocketStreamServer.onH264Packet early-exits), so
+    // rastering + encoding them is pure wasted GPU/Venus for the 30s idle window.
+    // Default supplier returns true so any wiring gap fails OPEN (stream keeps
+    // working) rather than silently going black. Same pattern as the recorder's
+    // halContentionProbe. When a client (re)connects, the pipeline requests a
+    // fresh IDR (encoder.requestSyncFrame) so the resumed stream is immediately
+    // decodable — see the keyframeRequestHook path.
+    private volatile java.util.function.BooleanSupplier streamClientProbe = () -> true;
+    // Rising-edge tracker for the stream client-presence gate. GL-thread-confined
+    // read/write in the render loop; reset from the control thread on teardown
+    // (benign racy hint — worst case one extra IDR on the next enable).
+    private volatile boolean streamWasActive = false;
+
     private final float[] quadrantStripOffsetX;
     private final float[] quadrantCornerOffsetsXY;
 
@@ -546,10 +652,85 @@ public class PanoramicCameraGpu {
     // would be wrong). volatile because the GL thread sets it on first frame.
     private volatile boolean emittedDimsLogged = false;
 
+    /** Dimensions the HAL was OBSERVED to emit, or -1 before the first frame.
+     *  Legacy ImageReader path: from {@code Image.getWidth/getHeight}. dilink4:
+     *  populated instead by the byte-callback kick ({@code halBytePathWidth}),
+     *  because on the SurfaceTexture path neither the transform matrix nor
+     *  BmmCameraInfo can reveal the producer size. Only these observed values
+     *  may ever be persisted as {@code probedWidth}/{@code probedHeight}. */
+    private volatile int halEmittedWidth = -1;
+    private volatile int halEmittedHeight = -1;
+
+    /** Best available OBSERVED producer width, or -1. Prefers the legacy
+     *  ImageReader observation, then the dilink4 byte-callback observation. */
+    public int getObservedProducerWidth() {
+        int w = halEmittedWidth;
+        if (w > 0) return w;
+        return halBytePathWidth;
+    }
+
+    /** Best available OBSERVED producer height, or -1. See
+     *  {@link #getObservedProducerWidth}. */
+    public int getObservedProducerHeight() {
+        int h = halEmittedHeight;
+        if (h > 0) return h;
+        return halBytePathHeight;
+    }
+
     // Sticky flag for the SurfaceTexture path: true once SurfaceTexture has
     // signalled at least one onFrameAvailable. Drives the renderLoop bind
     // instead of imagePending (which is for the ImageReader path).
     private volatile boolean stFramePending = false;
+
+    // GENUINE new-buffer counter for the SurfaceTexture (dilink4) path.
+    // Incremented ONLY from onFrameAvailable — i.e. only when the HAL actually
+    // queued a buffer. This exists because updateTexImage() is a documented
+    // no-op that returns normally when nothing is queued, so
+    // consumeSurfaceTextureFrame() cannot distinguish "new frame" from "same
+    // frame again". Before this counter existed, frameCounter/lastFrameTime
+    // advanced on every render-loop tick, which:
+    //   - inflated the Stats: line (loop ticks reported as camera frames),
+    //   - blinded the frame-stall watchdog (lastFrameTime always fresh),
+    //   - pinned priorOpenDeliveredNoFrame false so zero-frame escalation
+    //     could never fire.
+    // Legacy ImageReader path never touches this (it has a real freshness
+    // signal: acquireLatestImage() == null), so non-dilink4 cars are unaffected.
+    private final java.util.concurrent.atomic.AtomicLong stFrameArrivalSeq =
+        new java.util.concurrent.atomic.AtomicLong(0);
+
+    // Value of stFrameArrivalSeq consumed by the last updateTexImage() that
+    // actually picked up new content. GL thread only.
+    private long stLastConsumedArrivalSeq = 0;
+
+    // Wall-clock of the last GENUINE new buffer on the SurfaceTexture path
+    // (0 = none yet). This is what the frame-stall watchdog reads on dilink4;
+    // lastFrameTime keeps its legacy meaning (any processed loop iteration).
+    private volatile long lastRealFrameTimeSt = 0;
+
+    // True once a stall has been announced for the CURRENT stall episode, so the
+    // (deliberately action-free) dilink4 stall path logs once per episode instead
+    // of on every watchdog tick — a parked byd_apa HAL pauses frame emission for
+    // minutes at a time and would otherwise emit ~1400 log lines/hour saying the
+    // same thing. Cleared as soon as a real frame arrives.
+    private volatile boolean stallEpisodeLogged = false;
+
+    /** Wall-clock of the last REAL frame before the current stall episode began,
+     *  and the next re-log deadline. Needed because the stall branch resets the
+     *  detector's own clock every time it fires (or it would re-fire on every
+     *  tick), which makes {@code timeSinceFrame} useless as a duration. 0 = no
+     *  episode in progress. */
+    private volatile long stallEpisodeStartMs = 0;
+    private volatile long stallEpisodeNextLogMs = 0;
+
+    /** First re-log of a dilink4 stall episode. Escalates from here (see the
+     *  watchdog): 1min → 5min → 30min, so a long freeze stays visible in the log
+     *  without the ~1400 lines/hour a fixed cadence produced. */
+    private static final long STALL_RELOG_STEP_MS = 60_000L;
+
+    /** {@code lastCameraStartTime} value for which the warmup-grace suppression
+     *  line has already been logged, so it prints once per camera open instead of
+     *  once per watchdog tick. */
+    private volatile long warmupGraceLoggedForStartMs = -1;
 
     // One-shot first-frame transform-matrix dump on the SurfaceTexture path.
     // Cleared by attachSurfaceTextureToCamera so we re-emit on every
@@ -763,15 +944,10 @@ public class PanoramicCameraGpu {
                     // Legacy fleet (USE_ESCO_SURFACE_TEXTURE_PATH == false)
                     // keeps the prior immediate-restart behaviour.
                     if (USE_ESCO_SURFACE_TEXTURE_PATH) {
-                        // ESCO-PARITY: dilink4 does NOT restart on HAL
-                        // onCameraError. Field log shows the BYD HAL emits
-                        // event=8 spuriously during normal parked operation
-                        // — restarting puts the producer surface in
-                        // red-banner mode (close+reopen race on byd_apa).
-                        // esco's PanoCameraRecord retries via the recorder
-                        // listener path with a 5×15s backoff, NOT a camera
-                        // close+reopen. Skip the restart entirely on
-                        // dilink4 — log the event for observability.
+                        // Log only: event=8 lands ~25s AFTER frames stop, and some
+                        // failures emit no error at all, so the stall watchdog owns
+                        // reopening. It is the ONLY dilink4 restart trigger — do not
+                        // add a second one here.
                         long now = System.currentTimeMillis();
                         long timeSinceLastError = now - lastErrorRestartTime;
                         lastErrorRestartTime = now;
@@ -800,8 +976,30 @@ public class PanoramicCameraGpu {
             }
         }
         
-        // Start GL thread
-        glThread = new HandlerThread("GL-RenderLoop");
+        // Start GL thread.
+        //
+        // PRIORITY (perf): run at THREAD_PRIORITY_DISPLAY (nice -4) instead of
+        // the default (nice 0). This thread does consume->draw->swap feeding the
+        // hardware encoder; at default priority it competes on equal footing
+        // with every ordinary background thread in this ~40-thread daemon, and
+        // the daemon itself is spawned via app_process (no cgroup/nice applied),
+        // so nothing else keeps it ahead of unrelated work.
+        //
+        // Two concrete wins:
+        //   1. Frame pacing gets more consistent, which reduces PTS jitter and
+        //      encoder-input backpressure (the rt/swap stalls documented in
+        //      GpuMosaicRecorder's per-stage timing notes).
+        //   2. It makes the GL stall watchdog LESS likely to fire. That watchdog
+        //      calls System.exit(0) when the heartbeat stalls past
+        //      GL_THREAD_TIMEOUT_MS (3s), so a starved GL thread means a daemon
+        //      restart, not just a dropped frame.
+        //
+        // Deliberately DISPLAY (-4) and not URGENT_DISPLAY (-8) or AUDIO:
+        // SurfaceFlinger runs at -9, so at -4 we stay strictly below the
+        // compositor and cannot starve system UI. This is the highest tier that
+        // is still safely under SF.
+        glThread = new HandlerThread("GL-RenderLoop",
+                android.os.Process.THREAD_PRIORITY_DISPLAY);
         glThread.start();
         glHandler = new Handler(glThread.getLooper());
 
@@ -896,7 +1094,19 @@ public class PanoramicCameraGpu {
             if (!cropperReady) {
                 logger.warn("Lazy AI-lane: FoveatedCropper init did not complete in 1.5s");
             }
+            // Publish the lane FIRST, then apply the cached idle-throttle readback
+            // pacing by RE-READING the volatile cache. Ordering matters: a
+            // control-thread setReadbackMinIntervalMs that races bring-up reads
+            // aiLaneGl and forwards to the live lane only if non-null, so once we
+            // publish here any subsequent setter reaches the lane directly; and by
+            // re-reading the cache AFTER publishing we also pick up a write that
+            // landed during the (blocking) bring-up above. If we instead applied
+            // the cache before publishing, a setter interleaving between the apply
+            // and the publish would see aiLaneGl==null, update only the cache, and
+            // leave the just-published lane on the stale value. 0 = disabled (lane
+            // keeps its modulo default).
             aiLaneGl = lane;
+            lane.setReadbackMinIntervalMs(aiReadbackMinIntervalMs);
             logger.info("AI lane started lazily (surveillance armed)");
         } catch (Throwable t) {
             logger.warn("Lazy AI-lane start failed: " + t.getMessage());
@@ -999,16 +1209,23 @@ public class PanoramicCameraGpu {
             // emits canonical layout — without this the cropper's centroid
             // and the engine's quadrant grid disagree.
             if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                // Read from Dilink4Constants rather than re-typing the arrays.
+                // These were duplicated literals and had drifted: this site
+                // carried the Y bit on Front+Right (the pair that rendered
+                // upside down) while FoveatedCropper below carried Y bits on
+                // Rear+Left instead — two different wrong answers. Routing every
+                // feed site through the single source of truth is what makes
+                // that class of drift impossible.
                 downscaler.setProducerCornerMap(
-                    new float[] { 0.0f, 0.0f },  // Front  → producer TL
-                    new float[] { 0.5f, 0.5f },  // Right  → producer BR
-                    new float[] { 0.5f, 0.0f },  // Rear   → producer TR
-                    new float[] { 0.0f, 0.5f }); // Left   → producer BL
+                    Dilink4Constants.CORNER_FRONT,
+                    Dilink4Constants.CORNER_RIGHT,
+                    Dilink4Constants.CORNER_REAR,
+                    Dilink4Constants.CORNER_LEFT);
                 downscaler.setFlipFlags(
-                    new float[] { 1.0f, 1.0f },  // Front  X+Y-flip
-                    new float[] { 0.0f, 1.0f },  // Right  Y-flip
-                    new float[] { 0.0f, 0.0f },  // Rear   no flip
-                    new float[] { 0.0f, 0.0f }); // Left   no flip
+                    Dilink4Constants.FLIP_FRONT,
+                    Dilink4Constants.FLIP_RIGHT,
+                    Dilink4Constants.FLIP_REAR,
+                    Dilink4Constants.FLIP_LEFT);
                 // Red-overlay suppression on the AI lane. Same dilink4RedMask
                 // unified-config flag the recorder reads — keeps motion
                 // thumbnails clean of the HAL "calibration failed" chrome.
@@ -1042,20 +1259,29 @@ public class PanoramicCameraGpu {
         foveatedCropper.setCameraLayout(getCameraLayoutMode());
 
         // DiLink 4: override the canonical corner map with the only
-        // known-good Variant A layout (Front=TL X-flip, Right=BR no-flip,
-        // Rear=TR Y-flip, Left=BL Y-flip). Mirrors GpuMosaicRecorder so
-        // V2 motion crops align with the recorder's mosaic.
+        // known-good Variant A layout (Front=TL X-mirrored, Right=BR, Rear=TR,
+        // Left=BL, no Y flip on any role). Mirrors GpuMosaicRecorder so V2
+        // motion crops align with the recorder's mosaic.
+        //
+        // This site used to carry its own literals — FRONT{1,0} RIGHT{0,0}
+        // REAR{0,1} LEFT{0,1} — which agreed with the render paths on front and
+        // right but put Y bits on rear/left that the device frame contradicts.
+        // Because the cropper only maps a motion centroid into producer space
+        // and never renders the visible mosaic, that rear/left error was
+        // invisible in the picture and merely mis-placed motion crops for those
+        // two roles. Now reads the shared constants so recorder / stream /
+        // blind-spot / AI-downscaler / cropper can only ever move together.
         if (USE_ESCO_SURFACE_TEXTURE_PATH) {
             foveatedCropper.setProducerCornerMap(
-                new float[] { 0.0f, 0.0f },  // Front  → producer TL
-                new float[] { 0.5f, 0.5f },  // Right  → producer BR
-                new float[] { 0.5f, 0.0f },  // Rear   → producer TR
-                new float[] { 0.0f, 0.5f }); // Left   → producer BL
+                Dilink4Constants.CORNER_FRONT,
+                Dilink4Constants.CORNER_RIGHT,
+                Dilink4Constants.CORNER_REAR,
+                Dilink4Constants.CORNER_LEFT);
             foveatedCropper.setFlipFlags(
-                new float[] { 1.0f, 0.0f },  // Front  X-flip
-                new float[] { 0.0f, 0.0f },  // Right  no flip
-                new float[] { 0.0f, 1.0f },  // Rear   Y-flip
-                new float[] { 0.0f, 1.0f }); // Left   Y-flip
+                Dilink4Constants.FLIP_FRONT,
+                Dilink4Constants.FLIP_RIGHT,
+                Dilink4Constants.FLIP_REAR,
+                Dilink4Constants.FLIP_LEFT);
             // Red-overlay suppression on AI thumbnails too — same flag the
             // recorder/stream/downscaler read.
             try {
@@ -1213,6 +1439,14 @@ public class PanoramicCameraGpu {
             // Cheap signalling — the actual updateTexImage happens on the GL
             // thread inside renderLoop. Ride frameSync so the wait/notify
             // protocol matches the ImageReader path.
+            //
+            // stFrameArrivalSeq is the ONLY genuine "the HAL queued a new
+            // buffer" signal on this path. updateTexImage() is a documented
+            // no-op that does NOT throw when the queue is empty, so it can
+            // never tell us whether content changed (unlike the legacy path's
+            // acquireLatestImage() == null). Everything that needs to know
+            // "did a real frame arrive" reads this counter, not frameCounter.
+            stFrameArrivalSeq.incrementAndGet();
             synchronized (frameSync) {
                 stFramePending = true;
                 frameSync.notify();
@@ -1242,6 +1476,11 @@ public class PanoramicCameraGpu {
         Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
         int previewIndex = cameraSurfaceMode;
 
+        // A camera is being attached — clear the teardown sentinel BEFORE any
+        // helper thread is spawned below, so they see a live camera. (Set again
+        // by releaseCameraConsumer on stop/reattach.)
+        cameraTornDown = false;
+
         // BmmCameraInfo dim probe — what the HAL claims it'll emit for this
         // camera id BEFORE we attach. Mirrors esco's C6500c.m28945a path.
         // Output is purely diagnostic; the BYD HAL ignores anything we do
@@ -1256,13 +1495,55 @@ public class PanoramicCameraGpu {
         //   - persist.vendor.camera.autostudy.avm  (calibration coefficients)
         //   - vehicle.config.camInfo.avm           (physical module info)
         //   - vehicle.config.cam_sort / pano_cam / pano_l_cam (id mapping)
-        // When `autostudy.avm` is empty / absent, the BYD AVM HAL itself
-        // refuses to stream the stitched mosaic and returns a red "no
-        // calibration" frame (or similar) — esco doesn't post-process this
-        // away because on properly-calibrated cars it never appears. If you
-        // see a red feed on this car, check this log: if all four props are
-        // empty, the AVM was never calibrated by the dealer.
+        // Purely INFORMATIONAL. Do NOT infer "the HAL will paint a red
+        // calibration banner" from these being empty — that claim used to live
+        // here and it is FALSE. Verified 2026-07-29 against the OEM reference
+        // app (jadx of Escort_Auto.apk): it contains ZERO SystemProperties.set
+        // calls and ZERO calibration strings, reads these five props once at
+        // init purely to upload them as telemetry (`vj/a.java:325-347` →
+        // `ph/q.java:198`), and their ONE functional consumer is a quadrant-
+        // order permutation (`il/e.java:150`) that byd_apa boards bypass
+        // entirely — lens indices are hardcoded under `if (d.c()) { … return; }`
+        // in `AVMCameraLensFacing.java:78-86`. Empty `autostudy.avm` is a fully
+        // supported path in the app that works on these cars.
         logAvmCalibrationProps();
+
+        // ── isPreview() PROBE (cf. OEM gl/a.java:265-278) ──────────────────
+        // The OEM branches on isPreview(): when true it skips startPreview() and
+        // only disables the byte callback before re-attaching the texture.
+        //
+        // WE DO NOT SKIP startPreview(), deliberately — the OEM's precondition is
+        // not ours. It calls isPreview() on an AVMCamera instance IT opened moments
+        // earlier in the same method (gl/a.java:568 `camera.v()` → `:265 c(st)`),
+        // so a true there means "my own instance is streaming". On this fleet the
+        // AVM HAL is a shared multi-consumer service: AvcHalWarmup pre-warms
+        // com.byd.avc, and OemDashcamPipeline / CameraPreviewHelper drive their own
+        // AVMCamera objects. So a true here may describe SOMEONE ELSE's stream —
+        // and skipping startPreview() would then mean our freshly-bound texture is
+        // never started and we deliver ZERO frames. No video is a far worse
+        // regression than one redundant startPreview(), which is the behaviour that
+        // shipped for the entire life of this path and is known-safe (the OEM
+        // itself calls startPreview() on an already-previewing camera at
+        // gl/a.java:410). Probe + log it for field correlation; don't act on it.
+        boolean alreadyPreviewing = false;
+        try {
+            Method mIsPreview = avmClass.getDeclaredMethod("isPreview");
+            mIsPreview.setAccessible(true);
+            Object pv = mIsPreview.invoke(cameraObj);
+            if (pv instanceof Boolean) alreadyPreviewing = (Boolean) pv;
+            logger.info("isPreview() = " + alreadyPreviewing
+                + " (diagnostic only — startPreview is called either way)");
+        } catch (NoSuchMethodException e) {
+            logger.info("isPreview() not present on this HAL");
+        } catch (Throwable t) {
+            logger.warn("isPreview() probe failed: " + t.getMessage());
+        }
+
+        // Note: no disablePreviewCallback() here either. The OEM issues one in its
+        // already-previewing branch, but on its OWN instance. Ours could disable a
+        // callback that com.byd.avc or another in-process consumer legitimately
+        // owns, breaking their feed to fix nothing of ours — our frames come from
+        // the texture, not a byte callback.
 
         Method mAddTexture = avmClass.getDeclaredMethod(
             "addTexture", SurfaceTexture.class, int.class);
@@ -1274,12 +1555,65 @@ public class PanoramicCameraGpu {
         mSetTexture.setAccessible(true);
         mSetTexture.invoke(cameraObj, cameraSurfaceTexture, previewIndex);
 
+        // ALWAYS startPreview — unchanged from what shipped. See the isPreview()
+        // note above for why we don't skip it.
         Method mStart = avmClass.getDeclaredMethod("startPreview");
         mStart.setAccessible(true);
         Object startResult = mStart.invoke(cameraObj);
         logger.info("Esco-path attached: addTexture+setTexture(idx=" + previewIndex
             + ") + startPreview → " + startResult
-            + " (cameraId=" + cameraId + ")");
+            + " (cameraId=" + cameraId + ", isPreview was " + alreadyPreviewing + ")");
+
+        // ── BYTE-CALLBACK KICK when the HAL declares no preview size ───────
+        // This is the branch that separates working from broken DiLink 4 cars.
+        // The OEM (gl/a.java:407-413) checks BmmCameraInfo dims FIRST and, when
+        // they are absent/zero — precisely our failing unit, which logs
+        // "BmmCameraInfo.getDefaultPreviewWidth/Height not found" — takes a
+        // COMPLETELY different startup path: setPreviewCallback + startPreview
+        // + enablePreviewCallback(idx), tearing the callback down again on the
+        // first frame (gl/a.java:162-163). That callback is what pokes these
+        // boards into actually producing.
+        //
+        // We keep our SurfaceTexture as the real frame source and use the
+        // callback purely as a producer kick.
+        //
+        // ARMED IMMEDIATELY, matching the OEM (gl/a.java:409-413). The
+        // regression guard is the `!halDeclaredDimsKnown` condition itself —
+        // which is the OEM's own discriminator at gl/a.java:407 — not a delay:
+        // a car whose BmmCameraInfo answers correctly never reaches this line at
+        // any timing. An earlier revision waited 9s first, but that protected
+        // nobody the dims gate doesn't already protect while adding 9s of black
+        // screen for exactly the broken population. A car that happens to work
+        // despite absent dims is the case the OEM arms unconditionally too, and
+        // its own first frame disarms us on the next watcher tick (<=200ms).
+        if (!halDeclaredDimsKnown) {
+            armPreviewCallbackKick(avmClass, previewIndex);
+        }
+
+        // NO POST-ATTACH SETTLE HERE — deliberately.
+        //
+        // An earlier revision suppressed consumer draws for 2000 ms after attach,
+        // citing the OEM's `sendMessageDelayed(..., 2000L)` at gl/a.java:420/:194
+        // as parity. That was a MISREADING, on three counts:
+        //   1. Those messages post into gl/a.java's handler, whose only real work
+        //      is `cameraListener.b(width, height)` (gl/a.java:169-172) — and that
+        //      callback is where the OEM *starts* its GL renderer
+        //      (ll/k.java:331-333: mGLManager.s() / .p(1) / .m(w,h)). Until it
+        //      runs, `isGLReleased` is true and `onDrawFrame` early-returns
+        //      (ll/k.java:148-151). So the OEM has no renderer to suppress — it is
+        //      a renderer START delay, not a draw-suppression window. Our GL loop
+        //      is already live and wired when we attach, so there is no equivalent
+        //      seam and suppressing draws is not the same operation.
+        //   2. The :420 delay sits in the else-branch of gl/a.java:407 — the
+        //      size-KNOWN path. A unit that declares no preview size (exactly the
+        //      broken population here) takes the byte-callback branch and gets NO
+        //      delay at all. Applying one unconditionally hurt precisely the cars
+        //      the OEM exempts.
+        //   3. The OEM's is CAS-latched once per camera session
+        //      (isFirstFrame, gl/a.java:149); ours re-armed on every attach,
+        //      punching a 2 s hole in the recording on every reacquire/restart.
+        // Net effect was a guaranteed 2 s of missing video added to a bug whose
+        // headline symptom is missing video. Do not reintroduce it as "parity".
 
         // Re-arm the first-frame transform-matrix log so we print it on the
         // next frame after every (re)attach, not just the very first
@@ -1288,11 +1622,18 @@ public class PanoramicCameraGpu {
         firstFrameDimsLogged = false;
     }
 
+    /** True when BmmCameraInfo answered with a usable (non-zero) preview size
+     *  for the slot we are attaching. False when the class/method is absent or
+     *  the HAL reports 0x0 — the OEM treats that as "take the byte-callback
+     *  startup path instead", and so do we. Set by {@link #logHalDeclaredDims}
+     *  on every attach, before it is read. */
+    private boolean halDeclaredDimsKnown = false;
+
     /** Probe BmmCameraInfo for the HAL's declared preview size for this
-     *  cameraId. Pure logging — we never trust these numbers, but they're
-     *  the cheapest signal of "the slot you opened streams something
-     *  utterly different from the configured strip". */
+     *  cameraId. Also latches {@link #halDeclaredDimsKnown}, which selects the
+     *  attach strategy (texture-only vs texture + byte-callback kick). */
     private void logHalDeclaredDims(int cameraId) {
+        halDeclaredDimsKnown = false;
         try {
             Class<?> bmm = Class.forName("android.hardware.BmmCameraInfo");
             Method gw = bmm.getDeclaredMethod("getDefaultPreviewWidth", int.class);
@@ -1313,10 +1654,14 @@ public class PanoramicCameraGpu {
             // mosaic-doubled dims that AVMCamera emits for previewIndex=0
             // are 2*W x 2*H per esco's C6500c.m28945a:88. Spell that out.
             if (wInt > 0 && hInt > 0) {
+                halDeclaredDimsKnown = true;
                 int mosaicW = wInt * 2;
                 int mosaicH = hInt * 2;
                 logger.info("  → mosaic-doubled would be " + mosaicW + "x" + mosaicH
                     + " (esco AVMCamera 2x scale rule)");
+            } else {
+                logger.info("  → no declared size: will arm the byte-callback"
+                    + " producer kick after attach (OEM gl/a.java:407-413 parity)");
             }
         } catch (ClassNotFoundException e) {
             logger.info("BmmCameraInfo class not present — skipping dim probe");
@@ -1327,11 +1672,331 @@ public class PanoramicCameraGpu {
         }
     }
 
-    /** Dump the four AVM-related SystemProperties so we can tell at a glance
-     *  whether the car has been factory-calibrated. Empty `autostudy.avm` +
-     *  empty `camInfo.avm` is the classic "AVM HAL renders red 'calibration
-     *  failed' frame" symptom — esco never sees it because it ships on cars
-     *  where these are populated by the dealer-side calibration procedure. */
+    /** Live byte-callback proxy, non-null only while a producer kick is armed.
+     *  GL/daemon threads both touch it during attach/teardown, hence volatile. */
+    private volatile Object previewCallbackProxy = null;
+
+    /** Max time a byte-callback kick stays armed before we disarm it anyway.
+     *
+     *  <p>Deliberately SHORT. While armed, the HAL copies full-resolution NV21
+     *  into a shared-memory preview heap and the framework materialises a
+     *  ~7 MB byte[] per frame that we immediately discard — at ~8 fps that is
+     *  tens of MB/s of bandwidth and allocation churn on a device already
+     *  GPU- and thermally-bound. The disarm signal (a genuine onFrameAvailable)
+     *  arrives within one frame period of the producer waking, so a long window
+     *  buys nothing: the 9s pre-arm delay has already absorbed the documented
+     *  5-8s BYD first-frame latency before we get here. */
+    private static final long PREVIEW_KICK_MAX_MS = 6_000L;
+
+    /** Liveness signal for the attach-time helper threads.
+     *
+     *  <p>These threads must NOT test {@code running}: {@code start()} calls
+     *  {@code startCamera()} — which attaches and therefore spawns them — BEFORE
+     *  it sets {@code running = true}. On a cold start they would observe
+     *  {@code running == false} on their first iteration and return immediately,
+     *  silently disabling both the byte-callback producer kick and the
+     *  startPreview safety net on precisely the hardware they exist for.
+     *
+     *  <p>Cleared when a camera is attached, set on any consumer teardown. So
+     *  "torn down" means an actual stop/reattach happened, not merely "start()
+     *  has not finished wiring itself up yet". */
+    private volatile boolean cameraTornDown = false;
+
+    /** SINGLE-FLIGHT guard for the byte-callback watcher thread. Attach can recur
+     *  (auto-probe walk, reacquire, error restart); without this, each attach
+     *  would spawn another sleeping thread and the only thing bounding the count
+     *  would be luck plus per-caller throttling spread across five call sites.
+     *  CAS-claimed on spawn, cleared in the worker's finally. */
+    private final AtomicBoolean previewKickWatcherRunning = new AtomicBoolean(false);
+
+    /** Atomic arm-claim for the byte-callback kick. Guards the install sequence
+     *  itself (a plain null-check on previewCallbackProxy is check-then-act and
+     *  could let two racing attaches each install a proxy, leaking the first).
+     *  Released by disarmPreviewCallbackKick, or on any install failure. */
+    private final AtomicBoolean previewKickArming = new AtomicBoolean(false);
+
+
+    /**
+     * Arm the AVMCamera byte preview callback purely as a producer kick, for
+     * HALs that declare no preview size.
+     *
+     * <p>Rationale (OEM parity): when {@code BmmCameraInfo} has no entry for the
+     * slot, the reference app does not use the texture path alone — it runs
+     * {@code setPreviewCallback} + {@code startPreview} +
+     * {@code enablePreviewCallback(idx)} and only tears the callback down once a
+     * frame has landed ({@code gl/a.java:407-413} and {@code :162-163}). On
+     * those boards the callback is what makes the producer start emitting.
+     *
+     * <p>We do NOT decode the callback bytes — the SurfaceTexture remains the
+     * one frame source, so there is no second decode path to keep in sync. The
+     * callback is disarmed as soon as {@link #stFrameArrivalSeq} moves (proof
+     * the texture path is alive) or after {@link #PREVIEW_KICK_MAX_MS}.
+     *
+     * <p>Fails soft in every direction: any missing method, any throw, and we
+     * simply continue with the plain texture attach that shipped before.
+     */
+    private void armPreviewCallbackKick(Class<?> avmClass, int previewIndex) {
+        // ATOMIC claim, not a check-then-act on the volatile. Two attaches racing
+        // (probe walk + reacquire) could both read previewCallbackProxy == null and
+        // both install a proxy; the second would overwrite the field and the first
+        // proxy would be leaked — permanently armed, with the HAL copying
+        // full-resolution frames to a callback nobody will ever disarm.
+        if (!previewKickArming.compareAndSet(false, true)) {
+            logger.info("Preview-callback kick already armed/arming — skipping re-arm");
+            return;
+        }
+        final Object camAtArm = cameraObj;
+        if (camAtArm == null) { previewKickArming.set(false); return; }
+        // Fresh arm ⇒ fresh disarm signals. A leftover true from a previous
+        // session would make the watcher disarm on its very first tick.
+        previewKickByteSeen = false;
+        previewKickFirstByteLogged = false;
+        try {
+            Class<?> cbInterface = Class.forName(
+                "android.hardware.AVMCamera$IPreviewCallback");
+            final long baselineArrival = stFrameArrivalSeq.get();
+            Object proxy = Proxy.newProxyInstance(
+                cbInterface.getClassLoader(),
+                new Class<?>[]{ cbInterface },
+                (p, method, args) -> {
+                    // The HAL hands us (data, ?, width, height, ...) — we do not
+                    // consume the pixels, we only note that the producer woke up.
+                    // NOTE: this runs on a HAL binder thread. Keep it trivial and
+                    // never touch GL state here.
+                    if ("onPreview".equals(method.getName())) {
+                        int w = -1, h = -1;
+                        if (args != null && args.length >= 4) {
+                            if (args[2] instanceof Integer) w = (Integer) args[2];
+                            if (args[3] instanceof Integer) h = (Integer) args[3];
+                        }
+                        // Record the arrival OUTSIDE the log-gated block below:
+                        // this is the disarm signal and it must survive R8's
+                        // log-stripping in release builds.
+                        previewKickByteSeen = true;
+                        if (!previewKickFirstByteLogged) {
+                            previewKickFirstByteLogged = true;
+                            logger.info("Preview-callback kick: HAL emitted first byte"
+                                + " frame " + w + "x" + h
+                                + " (producer is alive; texture path should follow)");
+                            // Record the dims the HAL reports on this callback.
+                            //
+                            // DO NOT over-read these. They are the byte-callback's
+                            // own view of previewIndex 0 and are NOT proof of the
+                            // stitched-mosaic geometry: a unit that renders the 2x2
+                            // split perfectly still reports 1280x720 here. Treating
+                            // this as "the producer is a single camera, so the
+                            // quadrant remap must be wrong" is a mistake that was
+                            // made once already — the 4-cam split was correct and
+                            // the real defect was elsewhere. Diagnostic only.
+                            if (w > 0 && h > 0) {
+                                halBytePathWidth = w;
+                                halBytePathHeight = h;
+                            }
+                        }
+                        return null;
+                    }
+                    // Object methods must still behave sanely on a proxy.
+                    String n = method.getName();
+                    if ("hashCode".equals(n)) return System.identityHashCode(p);
+                    if ("equals".equals(n)) return args != null && args.length == 1 && p == args[0];
+                    if ("toString".equals(n)) return "AvmPreviewKickProxy";
+                    return null;
+                });
+
+            Method mSetCb = avmClass.getDeclaredMethod(
+                "setPreviewCallback", cbInterface);
+            mSetCb.setAccessible(true);
+            // PUBLISH THE FIELD BEFORE the HAL knows about the proxy. If
+            // enablePreviewCallback's lookup or invoke throws, the catch below
+            // must be able to SEE that a callback is installed in order to tear
+            // it down — with the assignment after the invoke, the field was still
+            // null on that path and the HAL kept our proxy with no disarm ever
+            // issued (a leak that only the next camera close cleaned up).
+            previewCallbackProxy = proxy;
+            previewKickArmedCamera = camAtArm;
+            mSetCb.invoke(camAtArm, proxy);
+
+            Method mEnableCb = avmClass.getDeclaredMethod(
+                "enablePreviewCallback", int.class);
+            mEnableCb.setAccessible(true);
+            Object enabled = mEnableCb.invoke(camAtArm, previewIndex);
+            logger.info("Preview-callback kick ARMED (idx=" + previewIndex
+                + ", enablePreviewCallback → " + enabled + ")");
+
+            // Disarm watcher. Runs off the GL thread so a wedged HAL call can
+            // never stall rendering. Single-flight + monotonic clock, same
+            // reasoning as the two schedulers.
+            final int idx = previewIndex;
+            if (!previewKickWatcherRunning.compareAndSet(false, true)) {
+                // A previous watcher is still winding down (it releases the arm
+                // claim in disarm's finally BEFORE clearing this flag, so a
+                // racing attach can land here). We have already installed a
+                // proxy and there is nobody to disarm it — tear it down now
+                // rather than leave the HAL copying frames for the whole session
+                // with previewKickArming wedged true.
+                logger.info("Preview-kick watcher already running — disarming this"
+                    + " arm rather than leaving it unattended");
+                disarmPreviewCallbackKick(idx);
+                return;
+            }
+            Thread watcher = new Thread(() -> {
+                long deadline = android.os.SystemClock.elapsedRealtime() + PREVIEW_KICK_MAX_MS;
+                try {
+                    while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                        // cameraTornDown, NOT !running — start() spawns us from
+                        // startCamera() before it sets running = true, so testing
+                        // `running` would disarm the kick instantly on cold start.
+                        if (cameraTornDown) { disarmPreviewCallbackKick(idx); return; }
+                        // Disarm on the FIRST BYTE, exactly as the OEM does
+                        // (gl/a.java:162-163 tears the callback down inside its
+                        // first-frame handler). The byte callback fires the moment
+                        // the producer wakes; the texture path follows 5-8s later
+                        // on this HAL. Waiting for the texture frame meant the
+                        // kick stayed armed for the whole PREVIEW_KICK_MAX_MS
+                        // window on EVERY attach — hundreds of MB/s of
+                        // full-resolution HAL copies we discard, during precisely
+                        // the warmup that has to succeed. The byte proves the
+                        // producer is alive, which is all the kick exists to do.
+                        if (previewKickByteSeen) {
+                            logger.info("Preview-callback kick: producer emitted a byte frame"
+                                + " — disarming immediately (OEM gl/a.java:162-163 parity)");
+                            disarmPreviewCallbackKick(idx);
+                            return;
+                        }
+                        if (stFrameArrivalSeq.get() != baselineArrival) {
+                            logger.info("Preview-callback kick: texture path delivered"
+                                + " — disarming callback");
+                            disarmPreviewCallbackKick(idx);
+                            return;
+                        }
+                        Thread.sleep(200);
+                    }
+                    logger.warn("Preview-callback kick: no texture frame within "
+                        + PREVIEW_KICK_MAX_MS + "ms — disarming anyway");
+                    disarmPreviewCallbackKick(idx);
+                } catch (InterruptedException ignored) {
+                    disarmPreviewCallbackKick(idx);
+                } catch (Throwable t) {
+                    logger.warn("Preview-kick watcher error: " + t.getMessage());
+                    disarmPreviewCallbackKick(idx);
+                } finally {
+                    previewKickWatcherRunning.set(false);
+                }
+            }, "AvmPreviewKick");
+            watcher.setDaemon(true);
+            try {
+                watcher.start();
+            } catch (Throwable startFail) {
+                // OOM / EAGAIN: no worker exists, so nothing will ever clear
+                // previewKickWatcherRunning or disarm the proxy. Undo both here or
+                // every future arm lands on the CAS-lost branch above forever.
+                logger.warn("Preview-kick watcher failed to start: " + startFail.getMessage());
+                previewKickWatcherRunning.set(false);
+                disarmPreviewCallbackKick(idx);
+            }
+        } catch (ClassNotFoundException e) {
+            previewKickArming.set(false);
+            logger.info("AVMCamera$IPreviewCallback absent — no byte-callback kick available");
+        } catch (NoSuchMethodException e) {
+            previewKickArming.set(false);
+            logger.info("setPreviewCallback/enablePreviewCallback absent — skipping kick: "
+                + e.getMessage());
+        } catch (Throwable t) {
+            // Release the claim so a later attach can retry; if a proxy did get
+            // installed before the throw, tear it down rather than leak it.
+            if (previewCallbackProxy != null) {
+                disarmPreviewCallbackKick(previewIndex);
+            } else {
+                previewKickArming.set(false);
+            }
+            logger.warn("Preview-callback kick failed to arm: " + t.getMessage());
+        }
+    }
+
+    /** Tear the producer kick down. Idempotent; safe from any thread.
+     *  Always releases the arm-claim, even when there was nothing to tear down,
+     *  so a failed/partial arm can never wedge the kick permanently.
+     *
+     *  <p>Acts on {@link #previewKickArmedCamera} — the camera the kick was armed
+     *  ON — never on a re-read of {@code cameraObj}. A stale watcher outliving a
+     *  camera swap would otherwise disarm the NEW camera's freshly-armed kick
+     *  (guaranteed to trigger, since releaseCameraConsumer zeroes the arrival
+     *  counter the watcher compares against) and would issue
+     *  {@code disablePreviewCallback} on an instance we never enabled — the exact
+     *  co-consumer hazard we avoid elsewhere in this method. */
+    private void disarmPreviewCallbackKick(int previewIndex) {
+        Object proxy = previewCallbackProxy;
+        if (proxy == null) { previewKickArming.set(false); return; }
+        Object cam = previewKickArmedCamera;
+        if (cam == null || cam != cameraObj) {
+            // The camera we armed is gone or has been replaced. closeCameraForPath
+            // already nulled the HAL-side callback for it, so there is nothing
+            // left to tear down — just drop our references and release the claim
+            // WITHOUT touching the current camera.
+            previewCallbackProxy = null;
+            previewKickArmedCamera = null;
+            previewKickArming.set(false);
+            logger.info("Preview-kick disarm skipped — armed camera already replaced/closed");
+            return;
+        }
+        previewCallbackProxy = null;
+        previewKickArmedCamera = null;
+        try {
+            Class<?> avmClass = cam.getClass();
+            try {
+                Method mDisable = avmClass.getDeclaredMethod(
+                    "disablePreviewCallback", int.class);
+                mDisable.setAccessible(true);
+                mDisable.invoke(cam, previewIndex);
+            } catch (Throwable t) {
+                logger.info("disablePreviewCallback during disarm: " + t.getMessage());
+            }
+            try {
+                Class<?> cbInterface = Class.forName(
+                    "android.hardware.AVMCamera$IPreviewCallback");
+                Method mSetCb = avmClass.getDeclaredMethod(
+                    "setPreviewCallback", cbInterface);
+                mSetCb.setAccessible(true);
+                mSetCb.invoke(cam, (Object) null);
+            } catch (Throwable t) {
+                logger.info("setPreviewCallback(null) during disarm: " + t.getMessage());
+            }
+            logger.info("Preview-callback kick disarmed");
+        } catch (Throwable t) {
+            logger.warn("Preview-callback disarm failed: " + t.getMessage());
+        } finally {
+            previewKickArming.set(false);
+        }
+    }
+
+    private volatile boolean previewKickFirstByteLogged = false;
+
+    /** The AVMCamera instance the byte-callback kick was armed ON. Disarm must
+     *  target this object, not a fresh read of {@code cameraObj}, so a watcher
+     *  that outlives a camera swap cannot tear down the new camera's kick or call
+     *  {@code disablePreviewCallback} on an instance we never enabled. */
+    private volatile Object previewKickArmedCamera = null;
+
+    /** Set by the byte-callback proxy on its FIRST frame. This — not the texture
+     *  arrival counter — is the kick's disarm signal: the byte callback fires as
+     *  soon as the producer wakes, whereas the texture path can trail by the
+     *  documented 5-8s BYD first-frame latency. Assigned OUTSIDE the log-gated
+     *  block so R8's log-stripping cannot remove it. */
+    private volatile boolean previewKickByteSeen = false;
+
+    /** True producer dims as reported by the HAL's own byte callback, or -1.
+     *  This is the ONLY place on the dilink4 path where the real emitted size
+     *  becomes knowable when BmmCameraInfo is empty — the transform matrix
+     *  cannot reveal it (see logFirstFrameDims). Diagnostic today; exposed so
+     *  the geometry mismatch can be surfaced rather than silently assumed. */
+    private volatile int halBytePathWidth = -1;
+    private volatile int halBytePathHeight = -1;
+    public int getHalBytePathWidth() { return halBytePathWidth; }
+    public int getHalBytePathHeight() { return halBytePathHeight; }
+
+    /** Dump the four AVM-related SystemProperties. INFORMATIONAL ONLY — see the
+     *  call site in {@link #attachSurfaceTextureToCamera} for why the old
+     *  "empty props ⇒ HAL paints a red banner" reading is false. */
     private void logAvmCalibrationProps() {
         try {
             Class<?> sp = Class.forName("android.os.SystemProperties");
@@ -1347,18 +2012,29 @@ public class PanoramicCameraGpu {
                 + " cam_sort=" + describeProp(camSort)
                 + " pano_cam=" + describeProp(panoCam)
                 + " pano_l_cam=" + describeProp(panoLCam));
+
             if (isBlank(autostudy) && isBlank(camInfo)) {
-                // Information only. The HAL gates the red 'calibration failed'
-                // overlay on this property being non-empty; nothing in
-                // user-space (not us, not esco) can write
-                // persist.vendor.camera.autostudy.avm — it's owned by the
-                // dealer-run autostudy procedure and SELinux denies app/shell
-                // writes (verified rc=1 in the field). When this fires the
-                // user's only software remedy is the GL red-mask filter.
-                logger.info("AVM is UNCALIBRATED on this vehicle (autostudy "
-                    + "and camInfo properties are empty). The HAL will paint "
-                    + "a red banner into the producer surface; enable "
-                    + "dilink4RedMask to mask it cosmetically.");
+                // INFORMATIONAL ONLY — do not read a red banner into this.
+                //
+                // The old text here asserted "the HAL will paint a red banner
+                // into the producer surface", and that assertion was then quoted
+                // back as if it were field evidence. It is NOT true: the OEM app
+                // (jadx of Escort_Auto.apk) reads these same props purely for
+                // telemetry upload, never writes them, and on byd_apa boards
+                // bypasses their only functional consumer entirely
+                // (AVMCameraLensFacing.java:78-86 hardcodes lens indices under
+                // `if (d.c()) return;`). Empty autostudy.avm is a fully supported
+                // configuration in an app that works on these cars.
+                //
+                // What IS true: nothing in user-space can write
+                // persist.vendor.camera.autostudy.avm (SELinux denies app/shell
+                // writes, verified rc=1 in the field), so this is a read-only
+                // observation about dealer provisioning — useful for correlating
+                // per-unit behaviour, and nothing more.
+                logger.info("AVM autostudy/camInfo properties are EMPTY on this "
+                    + "vehicle (dealer AVM calibration not provisioned). "
+                    + "Informational: the OEM app runs fine in this state, so do "
+                    + "NOT treat this as the cause of a red or frozen tile.");
             }
         } catch (Throwable t) {
             logger.warn("AVM calibration prop probe failed: " + t.getMessage());
@@ -1454,7 +2130,18 @@ public class PanoramicCameraGpu {
             BydApaViewpointHelper.release(viewpointToken);
             // Step 2 — remove our texture binding from the HAL.
             detachSurfaceTextureFromCamera(cam);
-            // Steps 3+4 — null callback proxies on the AVMCamera.
+            // Steps 3+4 — null callback proxies on the AVMCamera. This also
+            // covers a still-armed producer kick (clearAvmCameraCallbacks nulls
+            // setPreviewCallback); drop our own reference so the next attach is
+            // free to re-arm rather than seeing a stale non-null proxy.
+            previewCallbackProxy = null;
+            previewKickArmedCamera = null;
+            previewKickFirstByteLogged = false;
+            previewKickByteSeen = false;
+            // Release the arm-claim too, or the next attach would refuse to arm
+            // (compareAndSet fails) and the kick would be permanently unavailable
+            // after the first camera close.
+            previewKickArming.set(false);
             clearAvmCameraCallbacks(cam);
         }
         // Steps 5+6 (and disablePreviewCallback in legacy compat).
@@ -1577,6 +2264,48 @@ public class PanoramicCameraGpu {
         }
         }
         stFramePending = false;
+        // Reset the arrival bookkeeping together with the SurfaceTexture it
+        // describes. The old SurfaceTexture's listener is detached above, so no
+        // further increments can arrive from it; a NEW SurfaceTexture starts its
+        // own arrival sequence. Both must go back to 0 in lockstep:
+        //   - leaving stFrameArrivalSeq high while stLastConsumedArrivalSeq is
+        //     reset would fabricate a "fresh" frame before the HAL produced one;
+        //   - leaving stLastConsumedArrivalSeq high while the counter restarts
+        //     at 0 would make (arrivalSeq != last) true on the first arrival by
+        //     accident and then FALSE for the genuine second frame.
+        // Resetting both to 0 keeps the invariant "equal ⇒ nothing new".
+        stFrameArrivalSeq.set(0);
+        stLastConsumedArrivalSeq = 0;
+        // Drop the real-arrival clock too: a stale value would make the stall
+        // watchdog measure against the previous camera session and could fire
+        // (or suppress) spuriously right after a reattach. 0 = "no frame yet",
+        // which the watchdog's `stallClock > 0` guard treats as warmup.
+        lastRealFrameTimeSt = 0;
+        stallEpisodeLogged = false;
+        stallEpisodeStartMs = 0;
+        stallEpisodeNextLogMs = 0;
+        // Tell any in-flight attach helper thread (byte-callback watcher,
+        // startPreview safety net) that the camera it was watching is gone, so it
+        // stops rather than poking a released HAL object. Cleared again by the
+        // next attachSurfaceTextureToCamera.
+        cameraTornDown = true;
+        // Invalidate the OBSERVED producer dims along with the camera that
+        // produced them: they describe a slot we no longer hold, and a legacy
+        // auto-probe walking id 0 → id 1 must not report id 0's geometry for id 1.
+        //
+        // emittedDimsLogged is deliberately NOT reset. It is the one-shot latch for
+        // the "HAL emitted WxH but pipeline configured WxH" line, and this method
+        // runs on every consumer recreate (probe advance, post-yield reacquire,
+        // restartCameraAfterError) — re-arming it would turn a once-per-process
+        // warning into once-per-reacquire on the legacy fleet, which is a
+        // behavioural (log-volume) change for cars this work is not meant to
+        // touch. The dims fields below are only consumed as diagnostics now
+        // (persistPanoramicProbe no longer writes geometry), so leaving them at
+        // -1 after a re-attach is correct-by-omission rather than stale.
+        halEmittedWidth = -1;
+        halEmittedHeight = -1;
+        halBytePathWidth = -1;
+        halBytePathHeight = -1;
         // Reset to identity so a stale matrix from the previous camera
         // can't leak into the first draw against a freshly-attached
         // SurfaceTexture if its first consumeSurfaceTextureFrame returns
@@ -1723,6 +2452,14 @@ public class PanoramicCameraGpu {
 
         startCameraViaAvmReflection(cameraId);
 
+        // Remember every slot we've opened so the dead-slot walk (issue #170)
+        // can't loop back onto one that already failed to deliver a frame.
+        // Recomputed rather than reusing the local: the static-factory branch
+        // inside startCameraViaAvmReflection can probe ids 0-5 and open a
+        // DIFFERENT slot (it updates cameraIdOverride when it does) — record
+        // the id that actually opened, not the one we asked for.
+        deadSlotTriedCameraIds.add(cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID);
+
         cameraYielded = false;
         lastCameraStartTime = System.currentTimeMillis();
         // Snapshot the frame counter at this open so the next restart can tell
@@ -1740,7 +2477,7 @@ public class PanoramicCameraGpu {
     /**
      * Opens camera via AVMCamera reflection.
      *
-     * Strategy (mirrors DiPlus C4051a.m4446d() approach):
+     * Strategy (mirrors the secondary reference app C4051a.m4446d() approach):
      *   1. Constructor: new AVMCamera(int) + .open() — required on this device.
      *      The static factory AVMCamera.open(int) returns null because
      *      BmmCameraInfo.isValidCamera() is empty (vehicle.config.cam_sort
@@ -1987,6 +2724,12 @@ public class PanoramicCameraGpu {
             if (!emittedDimsLogged) {
                 int emittedW = image.getWidth();
                 int emittedH = image.getHeight();
+                // Record the OBSERVED size. This is the authoritative producer
+                // size on the legacy path and the only one we should ever
+                // persist as "probed" — previously it was logged and discarded
+                // while persistPanoramicProbe wrote back the CONFIGURED size.
+                halEmittedWidth = emittedW;
+                halEmittedHeight = emittedH;
                 if (emittedW != width || emittedH != height) {
                     logger.warn("HAL emitted " + emittedW + "x" + emittedH
                         + " but pipeline configured " + width + "x" + height
@@ -2068,6 +2811,36 @@ public class PanoramicCameraGpu {
     private boolean consumeSurfaceTextureFrame() {
         SurfaceTexture st = cameraSurfaceTexture;
         if (st == null) return false;
+        // FRESHNESS GATE. updateTexImage() silently no-ops (no throw) when the
+        // BufferQueue has nothing new, so without this check a frozen HAL still
+        // yields return=true → frameCounter++ → lastFrameTime refreshed →
+        // stale texture re-encoded with a brand-new PTS, forever.
+        //
+        // SCOPE — be precise about what this does and does not fix. It is an
+        // INSTRUMENTATION correctness fix, not a cure for a frozen picture:
+        // renderLoop returns before every consumer pass either way, so the old
+        // code redrew identical pixels where the new code draws nothing. Neither
+        // creates nor cures a freeze. What it DOES fix is that four independent
+        // recovery/reporting mechanisms were reading a counter that advanced on
+        // render-loop ticks rather than on camera buffers: the Stats line, the
+        // 4s frame-stall watchdog (structurally unable to fire — it was measuring
+        // its own heartbeat), the zero-frame reopen escalation
+        // (priorOpenDeliveredNoFrame permanently false), and the AI lane
+        // re-scoring duplicate content. De-blinding the watchdog is the
+        // load-bearing part.
+        //
+        // stFrameArrivalSeq only moves in onFrameAvailable, so it is the one
+        // trustworthy "HAL queued a buffer" signal on this path. We still call
+        // updateTexImage() unconditionally below — that is esco's continuous
+        // pump (`ll/k.java:159` runs it every GL tick under renderMode=1) and
+        // some byd_apa boards need the dequeue to release slots back to the
+        // producer — but when no buffer arrived we report no-frame so the
+        // pipeline treats the tick as a miss rather than as a camera frame.
+        // Consume-without-drawing is itself OEM-sanctioned: on an fps-limited
+        // tick the OEM also consumes then returns without drawing
+        // (`ll/k.java:160-164`).
+        long arrivalSeq = stFrameArrivalSeq.get();
+        boolean freshBuffer = (arrivalSeq != stLastConsumedArrivalSeq);
         try {
             // Crash-fix: updateTexImage swaps the backing EGLImage of
             // cameraTextureId; hold cameraTextureLock so the AI lane isn't
@@ -2127,6 +2900,49 @@ public class PanoramicCameraGpu {
             // is fine, but per-frame upload is cheap (memcpy under lock).
             HighResPreviewSampler hr = highResSampler;
             if (hr != null) hr.setTextureMatrix(currentTexMatrix);
+        }
+        // Record what we consumed and short-circuit when no genuine buffer
+        // arrived. Everything below (PTS mint, cameraFrameSeq bump, probe)
+        // must run ONLY for real frames — a duplicate would fabricate a new
+        // timestamp for unchanged pixels and re-drive the AI lane on content
+        // it has already scored.
+        if (!freshBuffer) {
+            return false;
+        }
+        stLastConsumedArrivalSeq = arrivalSeq;
+        lastRealFrameTimeSt = System.currentTimeMillis();
+        // Frames are flowing again — re-arm the once-per-episode stall log so a
+        // LATER stall is still announced.
+        if (stallEpisodeLogged) {
+            stallEpisodeLogged = false;
+            stallEpisodeStartMs = 0;
+            stallEpisodeNextLogMs = 0;
+        }
+        // Refill the reopen budget only on SUSTAINED flow, not the first buffer.
+        // A half-alive HAL can hand back one or two frames after a reopen and then
+        // freeze again; refilling on frame 1 would let it reopen indefinitely.
+        // dilink4LastStallRestartMs is deliberately NOT cleared — it is half of the
+        // reopen floor's anchor and must keep its spacing.
+        if (dilink4StallRestartAttempts != 0 || dilink4StallRecoveryExhausted) {
+            if (dilink4RecoveryProofFrames == 0) {
+                dilink4RecoveryProofSinceMs = lastRealFrameTimeSt;
+            }
+            dilink4RecoveryProofFrames++;
+            if (dilink4RecoveryProofFrames >= DILINK4_RECOVERY_PROOF_FRAMES
+                    && (lastRealFrameTimeSt - dilink4RecoveryProofSinceMs)
+                        >= DILINK4_RECOVERY_PROOF_MS) {
+                logger.info("dilink4 producer sustained " + dilink4RecoveryProofFrames
+                    + " frames over "
+                    + (lastRealFrameTimeSt - dilink4RecoveryProofSinceMs)
+                    + "ms — reopen budget refilled");
+                dilink4StallRestartAttempts = 0;
+                dilink4StallRecoveryExhausted = false;
+                dilink4RecoveryProofFrames = 0;
+                dilink4RecoveryProofSinceMs = 0L;
+            }
+        } else if (dilink4RecoveryProofFrames != 0) {
+            dilink4RecoveryProofFrames = 0;
+            dilink4RecoveryProofSinceMs = 0L;
         }
         if (!firstFrameDimsLogged) {
             firstFrameDimsLogged = true;
@@ -2358,8 +3174,10 @@ public class PanoramicCameraGpu {
             halEffectiveHeight = Math.round(effH);
             logger.info(String.format(java.util.Locale.US,
                 "First frame transform: sx=%.4f sy=%.4f tx=%.4f ty=%.4f → "
-                + "effective sampled region ≈ %.0fx%.0f (configured %dx%d)",
-                sx, sy, tx, ty, effW, effH, width, height));
+                + "crop covers %.0f%%x%.0f%% of the producer buffer"
+                + " (configured %dx%d — NOT a size check, see below)",
+                sx, sy, tx, ty,
+                Math.abs(sx) * 100f, Math.abs(sy) * 100f, width, height));
             // Cross-correlate effective dims with the configured pipeline
             // viewport. esco's encoder adapts to whatever the HAL emits;
             // we instead pin a fixed encoder viewport (Seal: 2560×1920),
@@ -2368,6 +3186,17 @@ public class PanoramicCameraGpu {
             // warning loudly so the operator picks the right cameraMode
             // / camera profile rather than wondering why the recording
             // looks squashed.
+            // CAVEAT — this comparison CANNOT detect a producer-size mismatch,
+            // and must not be read as if it could. effW = |sx| * width, so
+            // effW/width reduces to |sx| exactly and the configured dims cancel
+            // out. Because createCameraSurfaceTexture deliberately skips
+            // setDefaultBufferSize, the producer owns the buffer and the crop
+            // rect is normalised against THAT buffer, so |sx| = |sy| = 1.0
+            // whatever the true size is. This test therefore only ever catches
+            // a HAL that sets a sub-rect crop on its own buffer — a
+            // wrong-sized buffer with a full-surface crop reads as a perfect
+            // match. The only reliable producer-size signal on this path is the
+            // HAL's own byte callback (see halBytePathWidth/Height).
             float wRatio = effW / (float) Math.max(1, width);
             float hRatio = effH / (float) Math.max(1, height);
             float wDeviation = Math.abs(wRatio - 1.0f);
@@ -2611,7 +3440,21 @@ public class PanoramicCameraGpu {
             firstFrameReceived = true;
             consecutiveContentionStalls = 0;  // Frames flowing — clear stall counter
             consecutiveZeroFrameRestarts = 0; // Real frame arrived — reopen succeeded; clear escalation counter
-            
+
+            // Dead-slot fallback (issue #170): deliberately NO persist here.
+            // A first frame proves delivery, not content — every other persist
+            // site demands pixel evidence first. The switch re-enabled frame
+            // validation (advanceToNextCandidateCameraId sets
+            // skipFrameValidation=false), so the frame-15/50 blocks below own
+            // validating AND persisting the recovered id — including their
+            // non-black readback and the frame-50 manual-override guard.
+            if (deadSlotWalkActive && frameCounter == 1) {
+                logger.info("Dead-slot fallback: camera id "
+                    + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID)
+                    + " delivered its first frame — frame-15/50 validation will"
+                    + " confirm content before anything is persisted");
+            }
+
             // SOTA: Full-matrix auto-probe at frame 15 (~2 sec).
             // Sweeps camera IDs 0-5 × surface modes 0-5 to find the first
             // combination that produces panoramic image data. Each combo gets
@@ -2720,11 +3563,15 @@ public class PanoramicCameraGpu {
                             // Only write back if there's no manual override, or if the manual override
                             // matches what we're currently running (user's choice is already applied)
                             if (!hasManualOverride || savedId == currentId) {
+                                // Pass OBSERVED dims, not the configured ones —
+                                // writing `width, height` here is what made
+                                // probedWidth/Height self-confirming. -1 when
+                                // unobserved leaves the stored values alone.
                                 com.overdrive.app.camera.CameraConfigResolver.persistPanoramicProbe(
                                     currentId,
                                     cameraSurfaceMode,
-                                    width,
-                                    height,
+                                    getObservedProducerWidth(),
+                                    getObservedProducerHeight(),
                                     true,
                                     false);
                             } else {
@@ -2856,18 +3703,11 @@ public class PanoramicCameraGpu {
                 if (drawThisFrame) {
                     localRecorder.drawFrame(cameraTextureId, windshieldTextureId,
                         windshieldStarted && windshieldFrameReady, currentFrameTimestampNs);
-
-                    // CRITICAL: Drain encoder immediately after frame submission
-                    // This prevents eglSwapBuffers from blocking when encoder buffers fill up
-                    if (localEncoder != null) {
-                        localEncoder.drainEncoder();
-                    }
-                } else if (localEncoder != null) {
-                    // Even on a skipped draw, keep draining any already-queued
-                    // output so the codec's output buffers can't back up while
-                    // we're feeding it sparsely.
-                    localEncoder.drainEncoder();
                 }
+                // NOTE: encoder draining now runs on HardwareEventRecorderGpu's
+                // dedicated drainer thread; the old inline drainEncoder() calls
+                // here were no-ops (see HardwareEventRecorderGpu.drainEncoder) and
+                // have been removed.
 
                 // RECOVERY: If encoder surface died (EGL_BAD_SURFACE after prolonged use),
                 // reinitialize the encoder and reconnect the recorder.
@@ -2931,16 +3771,64 @@ public class PanoramicCameraGpu {
             }
 
             // PASS 1B: Streaming (Parallel Zero-Copy GPU Path)
-            // Only runs if streaming is enabled - uses separate encoder at lower resolution
+            // Only runs if streaming is enabled - uses separate encoder at lower resolution.
+            // Stream stride gate: when the camera HAL runs faster than the stream
+            // preset (e.g. 30 fps camera vs 10 fps stream), we skip frames here
+            // to avoid wasted GPU raster + encode. Same pattern as PASS 1A's
+            // recorderFrameStride.
             // Capture local refs to avoid NPE from concurrent pipeline shutdown
             com.overdrive.app.streaming.GpuStreamScaler localStreamScaler = streamScaler;
             HardwareEventRecorderGpu localStreamEncoder = streamEncoder;
             if (localStreamScaler != null && localStreamEncoder != null) {
-                if (USE_ESCO_SURFACE_TEXTURE_PATH) {
-                    localStreamScaler.setTextureMatrix(currentTexMatrix);
+                // Client-presence gate: with no viewer connected the encoded bytes
+                // are dropped downstream, so skip the raster + encode entirely.
+                boolean streamActive = streamClientProbe.getAsBoolean();
+                if (streamActive) {
+                    // Rising edge (idle → a client just (re)connected): force a fresh
+                    // IDR so the resumed stream is immediately decodable rather than
+                    // waiting for the next natural keyframe interval.
+                    if (!streamWasActive) {
+                        localStreamEncoder.requestSyncFrame();
+                        streamStrideCounter = 0;  // resume on a drawn frame
+                    }
+                    streamWasActive = true;
+
+                    int sStride = streamFrameStride;
+                    boolean drawStreamFrame = sStride <= 1 || (streamStrideCounter % sStride) == 0;
+                    streamStrideCounter++;
+                    if (drawStreamFrame) {
+                        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                            localStreamScaler.setTextureMatrix(currentTexMatrix);
+                            // Stamp the presentation time on dilink4 ONLY.
+                            //
+                            // This HAL emits at its own fixed rate (~4.5 fps
+                            // observed) and refuses setCameraFps outright — it
+                            // returns false for every value, and both the OEM app
+                            // (gl/a.java:402) and DiPlus discard that return, so
+                            // false is simply normal here. An encoder configured
+                            // for a higher KEY_FRAME_RATE and fed UNSTAMPED buffers
+                            // has to invent timing: most ticks see an identical
+                            // image, yielding near-empty P-frames and a picture
+                            // that looks frozen after the first keyframe.
+                            //
+                            // currentFrameTimestampNs is the same single-domain
+                            // System.nanoTime() PTS the recorder lane already
+                            // stamps (GpuMosaicRecorder:1022) and the OEM stamps
+                            // per frame arrival. The stream lane was the only one
+                            // pushing buffers with no timestamp at all.
+                            //
+                            // Legacy (ImageReader) path is untouched: it keeps the
+                            // unstamped swapBuffers it has always used, so nothing
+                            // about non-dilink4 timing changes.
+                            localStreamScaler.drawFrame(cameraTextureId,
+                                currentFrameTimestampNs);
+                        } else {
+                            localStreamScaler.drawFrame(cameraTextureId);
+                        }
+                    }
+                } else {
+                    streamWasActive = false;
                 }
-                localStreamScaler.drawFrame(cameraTextureId);
-                localStreamEncoder.drainEncoder();
             }
 
             // PASS 1C: Blind-spot lane (views 7/8). Independent scaler fed from the
@@ -2962,19 +3850,15 @@ public class PanoramicCameraGpu {
             // the turn trigger sets bsLayerVisible=true picks up rendering (~66ms
             // worst-case latency, imperceptible).
             com.overdrive.app.streaming.GpuStreamScaler localBsScaler = bsStreamScaler;
-            HardwareEventRecorderGpu localBsEncoder = bsStreamEncoder;
             if (localBsScaler != null && bsLayerVisible) {
                 if (USE_ESCO_SURFACE_TEXTURE_PATH && localBsScaler == bsStreamScaler) {
                     localBsScaler.setTextureMatrix(currentTexMatrix);
                 }
                 localBsScaler.drawFrame(cameraTextureId);
                 bsDiagFrames++;
-                // Drain only if an encoder is wired (legacy path). Native path has
-                // none — the swapBuffers in drawFrame presented straight to screen.
-                // Identity re-check guards a concurrent disable nulling the field.
-                if (localBsEncoder != null && bsStreamEncoder == localBsEncoder) {
-                    localBsEncoder.drainEncoder();
-                }
+                // Native path: drawFrame's swapBuffers presented straight to the
+                // SurfaceControl layer — no encoder to drain. (The old
+                // localBsEncoder.drainEncoder() here was a no-op; removed.)
             } else if (localBsScaler == null) {
                 bsDiagSkipScaler++;
             } else {
@@ -3295,11 +4179,12 @@ public class PanoramicCameraGpu {
                 }
                 // Persist this as a fallback so next restart doesn't re-probe
                 try {
+                    // OBSERVED dims only (see persistPanoramicProbe javadoc).
                     com.overdrive.app.camera.CameraConfigResolver.persistPanoramicProbe(
                         lastDataCameraId,
                         0,
-                        width,
-                        height,
+                        getObservedProducerWidth(),
+                        getObservedProducerHeight(),
                         true,
                         true);
                     logger.info("Persisted fallback camera ID " + lastDataCameraId + " for next launch");
@@ -3369,16 +4254,86 @@ public class PanoramicCameraGpu {
                         // EGL contexts cannot be recovered from a blocked thread.
                         System.exit(0);
                     }
-                    
+
+                    // DEAD-SLOT ESCAPE (issue #170) — must be checked BEFORE the
+                    // frame-health monitor below, whose `lastFrameTime > 0` gate a
+                    // never-streamed camera cannot satisfy (restarts triggered
+                    // before the first frame deliberately leave it 0 — see
+                    // restartCameraAfterError).
+                    //
+                    // Conditions, all required:
+                    //   - legacy path only: on dilink4 the HAL routinely pauses
+                    //     frame emission on parked cars, so 25s of silence is a
+                    //     normal state there, not a dead slot — mirrors the
+                    //     dilink4SkipStallRestart esco-parity carve-out below.
+                    //   - firstFrameReceived == false: this camera has produced
+                    //     nothing since the pipeline started. Once any frame has
+                    //     arrived the normal stall/restart machinery is armed and
+                    //     owns recovery, so we stay out of its way for good.
+                    //   - !cameraYielded AND no native app active: an OEM app
+                    //     (reverse cam, AVM parking view) holding or contending
+                    //     the HAL legitimately starves frames without a yield
+                    //     event — the stall monitor below makes the same
+                    //     allowance via its contention threshold.
+                    //   - cameraObj != null, EXCEPT mid-walk: a candidate whose
+                    //     open failed leaves cameraObj null, and the walk must
+                    //     still advance past it rather than freeze forever.
+                    //   - no restart or HAL-recovery already in flight, so we
+                    //     never race a close/open we don't own.
+                    boolean nativeAppHoldsHal = cameraCoordinator != null
+                            && cameraCoordinator.isNativeAppActive();
+                    if (!USE_ESCO_SURFACE_TEXTURE_PATH
+                            && !firstFrameReceived
+                            && !cameraYielded
+                            && !nativeAppHoldsHal
+                            && (cameraObj != null || deadSlotWalkActive)
+                            && !restartInProgress.get()
+                            && !halRecoveryEscalated
+                            && !deadSlotWalkExhausted
+                            && lastCameraStartTime > 0
+                            && (now - lastCameraStartTime) > FIRST_FRAME_DEAD_SLOT_MS
+                            && glHandler != null) {
+                        long deadFor = now - lastCameraStartTime;
+                        logger.warn("DEAD SLOT: camera id "
+                            + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID)
+                            + (cameraObj != null
+                                ? " opened but delivered ZERO frames in " + deadFor
+                                    + "ms — the HAL accepted the open but cannot stream"
+                                    + " this slot (BYD 2602/pano_h reports a 0x0 preview"
+                                    + " here)."
+                                : " failed to reopen during the fallback walk.")
+                            + " Trying next panoramic candidate.");
+                        glHandler.post(this::advanceToNextCandidateCameraId);
+                    }
+
                     // SOTA: Frame health monitor — detect stalled camera feed
                     // If GL thread is alive but no new frames for FRAME_STALL_THRESHOLD_MS,
                     // the camera HAL may be starved or dead.
                     // Decision is contention-aware: if native app is active, use longer
                     // threshold and require consecutive stalls before yielding.
-                    if (!cameraYielded && lastFrameTime > 0 && 
+                    // On dilink4 read the GENUINE-arrival clock, not
+                    // lastFrameTime: the latter used to be refreshed by every
+                    // render-loop tick (updateTexImage no-ops without throwing),
+                    // which made this detector structurally unable to see a
+                    // frozen HAL. lastRealFrameTimeSt only moves on a real
+                    // onFrameAvailable. Legacy keeps lastFrameTime exactly as
+                    // before — its acquireLatestImage() null-check already made
+                    // lastFrameTime a true arrival signal there.
+                    long stallClock = USE_ESCO_SURFACE_TEXTURE_PATH
+                        ? lastRealFrameTimeSt : lastFrameTime;
+                    // dilink4: releaseCameraConsumer() zeroes lastRealFrameTimeSt on
+                    // every reopen, so `stallClock > 0` alone would permanently
+                    // suppress this detector after the FIRST recovery attempt for a
+                    // producer that never comes back. Fall back to the open time so a
+                    // reopen that delivers nothing is still measurable. Legacy is
+                    // untouched — its clock is not zeroed this way.
+                    if (USE_ESCO_SURFACE_TEXTURE_PATH && stallClock <= 0) {
+                        stallClock = lastCameraStartTime;
+                    }
+                    if (!cameraYielded && stallClock > 0 &&
                         timeSinceHeartbeat < GL_THREAD_TIMEOUT_MS) {
-                        long timeSinceFrame = now - lastFrameTime;
-                        
+                        long timeSinceFrame = now - stallClock;
+
                         // Use longer threshold when native app is active — transient
                         // CPU/IO stalls shouldn't trigger a yield that interrupts recording
                         boolean nativeActive = cameraCoordinator != null && 
@@ -3407,36 +4362,102 @@ public class PanoramicCameraGpu {
                             // flight. Don't post bare restarts on top of it — the
                             // pipeline clears this latch via notePipelineRestarted()
                             // once its full teardown + warmup restart completes.
-                            logger.info("Frame stall while HAL-recovery escalation in flight — "
-                                + "deferring to warmup-routed restart.");
+                            //
+                            // Once per episode. These two suppression branches were
+                            // unreachable on dilink4 before the stall clock was
+                            // fixed; at 1 Hz they are pure spam (the message is
+                            // invariant and no action follows).
+                            // Throttle on dilink4 ONLY. On legacy this line kept
+                            // its original once-per-tick cadence: the requirement
+                            // is zero behavioural change for non-dilink4 cars, and
+                            // "behaviour" includes log cadence a field engineer may
+                            // be reading. Note the dilink4 branch also latches
+                            // stallEpisodeLogged, which is why it must not run on
+                            // legacy — it would suppress the later FRAME STALL
+                            // anchor for an episode that legacy does act on.
+                            if (!USE_ESCO_SURFACE_TEXTURE_PATH || !stallEpisodeLogged) {
+                                logger.info("Frame stall while HAL-recovery escalation in flight — "
+                                    + "deferring to warmup-routed restart.");
+                                if (USE_ESCO_SURFACE_TEXTURE_PATH) stallEpisodeLogged = true;
+                            }
                         } else if (timeSinceFrame > stallThreshold
                                 && timeSinceCameraStart < FRAME_STALL_WARMUP_GRACE_MS) {
-                            logger.info("Frame stall suppressed — within post-open warmup grace ("
-                                + timeSinceCameraStart + "ms < " + FRAME_STALL_WARMUP_GRACE_MS
-                                + "ms; BYD HAL first-frame latency is 5-8s). Not restarting yet.");
+                            // Once per warmup window on dilink4, unchanged
+                            // once-per-tick on legacy (see the note above — no
+                            // legacy log-cadence changes). Re-arms on the next
+                            // camera open, since lastCameraStartTime changes.
+                            if (!USE_ESCO_SURFACE_TEXTURE_PATH
+                                    || warmupGraceLoggedForStartMs != lastCameraStartTime) {
+                                if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                                    warmupGraceLoggedForStartMs = lastCameraStartTime;
+                                }
+                                logger.info("Frame stall suppressed — within post-open warmup grace ("
+                                    + timeSinceCameraStart + "ms < " + FRAME_STALL_WARMUP_GRACE_MS
+                                    + "ms; BYD HAL first-frame latency is 5-8s). Not restarting yet.");
+                            }
                         } else if (timeSinceFrame > stallThreshold) {
-                            logger.warn("FRAME STALL: No frames for " + timeSinceFrame + "ms" +
-                                (nativeActive ? " (native app active)" : ""));
-                            // Reset lastFrameTime to prevent repeated triggers
+                            // EPISODE-THROTTLED on dilink4. A parked byd_apa HAL
+                            // legitimately pauses frame emission for minutes, and
+                            // the dilink4 branch below deliberately takes no
+                            // action — so re-announcing every ~5s would be pure
+                            // spam (~1400 lines/hour) with no new information.
+                            // Log the first stall of an episode, then stay quiet
+                            // until frames actually resume (which clears the
+                            // latch in consumeSurfaceTextureFrame).
+                            boolean firstOfEpisode = !stallEpisodeLogged;
+                            if (firstOfEpisode) {
+                                // Anchor the episode so we can report TRUE elapsed
+                                // time later. The stall clock itself is reset below
+                                // (otherwise the detector re-fires every tick), so
+                                // timeSinceFrame alone always reads ~one threshold
+                                // and a 5-second hiccup would be indistinguishable
+                                // from a 5-hour freeze.
+                                stallEpisodeStartMs = now - timeSinceFrame;
+                                stallEpisodeNextLogMs = now + STALL_RELOG_STEP_MS;
+                            }
+                            long episodeMs = stallEpisodeStartMs > 0
+                                ? now - stallEpisodeStartMs : timeSinceFrame;
+                            // Legacy logs every stall (its detector acts on them).
+                            // dilink4 takes NO action, so log the first, then
+                            // re-log on an escalating cadence carrying the real
+                            // elapsed time — bounded volume, duration still
+                            // diagnosable.
+                            boolean relogDue = USE_ESCO_SURFACE_TEXTURE_PATH
+                                && stallEpisodeNextLogMs > 0 && now >= stallEpisodeNextLogMs;
+                            if (firstOfEpisode || !USE_ESCO_SURFACE_TEXTURE_PATH || relogDue) {
+                                logger.warn("FRAME STALL: No frames for " + timeSinceFrame + "ms" +
+                                    (nativeActive ? " (native app active)" : "")
+                                    + (USE_ESCO_SURFACE_TEXTURE_PATH
+                                        ? " (dilink4: from last REAL onFrameAvailable; episode "
+                                          + (episodeMs / 1000) + "s)" : ""));
+                                if (relogDue) {
+                                    // Escalate 1min → 5min → 30min → 30min…
+                                    long step = (episodeMs < 300_000L) ? 300_000L
+                                              : (episodeMs < 1_800_000L) ? 1_800_000L
+                                              : 1_800_000L;
+                                    stallEpisodeNextLogMs = now + step;
+                                }
+                            }
+                            // dilink4-only latch. On legacy nothing reads it (the
+                            // log condition short-circuits on
+                            // !USE_ESCO_SURFACE_TEXTURE_PATH), and leaving it
+                            // unwritten keeps legacy state byte-identical.
+                            if (USE_ESCO_SURFACE_TEXTURE_PATH) stallEpisodeLogged = true;
+                            // Reset the clock this detector actually read, or the
+                            // next tick re-fires immediately. On dilink4 that is
+                            // lastRealFrameTimeSt; touching only lastFrameTime
+                            // there would leave the stall latched forever.
                             lastFrameTime = now;
+                            if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                                lastRealFrameTimeSt = now;
+                            }
 
-                            // ESCO-PARITY: dilink4 has NO frame-stall-driven
-                            // restart. esco's PanoCameraRecord (`gl/C5920a.java`,
-                            // `PanoCameraRecordService.java:174-200`) only
-                            // restarts on actual `onCameraError` HAL events,
-                            // capped at 5 retries with backoff. There is NO
-                            // 4 s no-frame watchdog in esco. On parked cars
-                            // the HAL routinely pauses frame emission (no
-                            // consumer, AVC reaped) and a stall-driven
-                            // close+reopen produces the all-zero frames the
-                            // user reports. The HAL onEvent path
-                            // (BydCameraCoordinator → onCameraError) still
-                            // catches genuine fatal events (8/1000/1002) and
-                            // routes through the throttled restart at
-                            // line 547 (DILINK4_ERROR_RESTART_MIN_INTERVAL_MS).
-                            boolean dilink4SkipStallRestart = USE_ESCO_SURFACE_TEXTURE_PATH;
-                            if (dilink4SkipStallRestart) {
-                                logger.info("Frame stall on dilink4 — NOT restarting (esco-parity, await real HAL error)");
+                            // dilink4: bounded stall-driven restart (esco caps at 5
+                            // reopens too, but its watchdog can't fire for a
+                            // producer that dies parked, so we don't copy it).
+                            if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                                maybeRestartStalledDilink4Producer(now, episodeMs,
+                                    firstOfEpisode);
                             } else if (cameraCoordinator != null) {
                                 if (nativeActive) {
                                     // Contention path: require consecutive stalls before yielding
@@ -3486,7 +4507,207 @@ public class PanoramicCameraGpu {
             "cameraId=" + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID) + ", " +
             "probe=" + (autoProbeCameras ? "ACTIVE" : "OFF") + ")");
     }
-    
+
+    /**
+     * DiLink 4 only: reopen the camera when the byd_apa producer has stopped
+     * emitting and a consumer is starved.
+     *
+     * <p>Throttled on {@code lastCameraStartTime} rather than a
+     * "last restart" field of its own. That is deliberate: every reopen path
+     * runs {@code releaseCameraConsumer()}, which zeroes
+     * {@code lastRealFrameTimeSt}, and the watchdog's {@code stallClock > 0}
+     * guard then suppresses this whole branch until a real frame arrives. A
+     * private attempt counter therefore could not be trusted — it either never
+     * advanced past 1 (dead producer) or was wiped by a single stray frame from
+     * a half-alive HAL, reopening every ~13s forever.
+     * {@code lastCameraStartTime} is refreshed by every open and never zeroed,
+     * so "how long since we last tried" is always answerable.
+     *
+     * @return true if a reopen was posted
+     */
+    private boolean maybeRestartStalledDilink4Producer(long now, long episodeMs,
+                                                       boolean firstOfEpisode) {
+        // Any stall voids accumulated proof-of-recovery: it must be earned inside ONE
+        // continuous run. Otherwise a HAL dribbling 3 frames per reopen would sum
+        // 3+3+3+... to the threshold, refill the budget, and reopen forever.
+        dilink4RecoveryProofFrames = 0;
+        dilink4RecoveryProofSinceMs = 0L;
+        // Reopening only helps if something is starved RIGHT NOW. recorderLaneEnabled
+        // is true for the whole parked-sentry population, so it cannot be the test:
+        // an in-flight clip or a live stream can.
+        GpuMosaicRecorder recForStall = recorder;
+        HardwareEventRecorderGpu encForStall = encoder;
+        boolean consumerStarved =
+            (recForStall != null && recForStall.isRecording())
+            || (encForStall != null && encForStall.isWritingToFile())
+            || streamEncoder != null;
+        if (!consumerStarved) {
+            if (firstOfEpisode) {
+                logger.info("Frame stall on dilink4 — no starved consumer,"
+                    + " leaving producer paused");
+            }
+            return false;
+        }
+        // Floor on the LATER of "last successful open" and "last reopen we posted".
+        // lastCameraStartTime alone is not enough: it is written only after a
+        // successful open (line ~2460), so a reopen that throws or times out would
+        // leave it stale and let the remaining attempts fire at stall cadence
+        // (~5s) instead of 60s apart.
+        long lastAttemptAnchor = Math.max(lastCameraStartTime, dilink4LastStallRestartMs);
+        long sinceLastAttempt = lastAttemptAnchor > 0
+            ? now - lastAttemptAnchor : Long.MAX_VALUE;
+        if (sinceLastAttempt < DILINK4_ERROR_RESTART_MIN_INTERVAL_MS) {
+            if (firstOfEpisode) {
+                logger.info("Frame stall on dilink4 — last camera open/reopen was "
+                    + sinceLastAttempt + "ms ago, within the "
+                    + (DILINK4_ERROR_RESTART_MIN_INTERVAL_MS / 1000)
+                    + "s reopen floor; waiting");
+            }
+            return false;
+        }
+        if (dilink4StallRecoveryExhausted) {
+            return false;
+        }
+        if (dilink4StallRestartAttempts >= DILINK4_STALL_RESTART_MAX_ATTEMPTS) {
+            dilink4StallRecoveryExhausted = true;
+            logger.error("Frame stall on dilink4: " + dilink4StallRestartAttempts
+                + " reopens failed to revive the producer — giving up until frames"
+                + " resume or ACC cycles. Sentry clips will hold pre-roll only.");
+            return false;
+        }
+        dilink4StallRestartAttempts++;
+        dilink4LastStallRestartMs = now;
+        logger.warn("Frame stall on dilink4 — reopening camera (attempt "
+            + dilink4StallRestartAttempts + "/" + DILINK4_STALL_RESTART_MAX_ATTEMPTS
+            + ", episode " + (episodeMs / 1000) + "s)");
+        if (glHandler != null) {
+            glHandler.post(() -> restartCameraAfterError());
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Dead-slot escape (issue #170): move to the next panoramic camera candidate
+     * after the current one opened but never produced a frame.
+     *
+     * <p>MUST run on the GL thread — it mutates {@code cameraIdOverride} and
+     * hands off to {@link #restartCameraAfterError()}, which owns the
+     * close/reopen sequence (including the encoder drainer, event-callback
+     * re-registration and {@code onPostReacquire}). Reusing that path rather
+     * than open-coding a second close/open keeps the two in lockstep.
+     */
+    private void advanceToNextCandidateCameraId() {
+        // Re-validate on the GL thread: the watchdog observed this up to a tick
+        // ago, and a first frame (or someone else's restart) may have landed in
+        // between. Cheap insurance against tearing down a camera that just
+        // started working.
+        if (firstFrameReceived || cameraYielded
+                || restartInProgress.get() || halRecoveryEscalated
+                || deadSlotWalkExhausted) {
+            return;
+        }
+        if (cameraCoordinator != null && cameraCoordinator.isNativeAppActive()) {
+            return;
+        }
+        // Mid-walk a failed candidate open leaves cameraObj null and the walk
+        // must still move past it; outside the walk, null means we never held
+        // a camera at all — no slot evidence, nothing to escape from.
+        if (cameraObj == null && !deadSlotWalkActive) {
+            return;
+        }
+        // Re-check the trigger itself, not just the flags. The watchdog posts
+        // this once per 1s tick while the condition holds, so a GL-thread
+        // stall of >1s at the boundary queues DUPLICATE posts; the first one
+        // switches ids and reopens (refreshing lastCameraStartTime), and
+        // without this check the stale second post would advance again with
+        // zero warmup — burning the new candidate's 25s window, or falsely
+        // latching exhaustion while it is still warming up. Every reopen
+        // refreshes lastCameraStartTime, so this single predicate makes
+        // stale and duplicate posts self-neutralizing. (Exception: after a
+        // FAILED candidate open, startCamera never reached the refresh, the
+        // window is stale by construction, and advancing immediately is
+        // exactly right — no point waiting 25s for a camera that is not open.)
+        if (lastCameraStartTime <= 0
+                || (System.currentTimeMillis() - lastCameraStartTime) <= FIRST_FRAME_DEAD_SLOT_MS) {
+            return;
+        }
+
+        int currentId = cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID;
+        int nextId = PanoCameraFallbackOrder.next(
+            resolveHalPanoCameraIdHint(), deadSlotTriedCameraIds);
+
+        if (nextId == PanoCameraFallbackOrder.NO_CANDIDATE) {
+            // Latch so this logs once rather than every watchdog tick. Leaving
+            // the camera on its current ID is deliberate: a user can always pin
+            // a slot explicitly via POST /api/surveillance/config
+            // {"manualCameraId":N}.
+            deadSlotWalkExhausted = true;
+            // Hand recovery back to the pre-existing machinery. Walk restarts
+            // deliberately keep lastFrameTime at 0 so each candidate gets its
+            // full first-frame window (see restartCameraAfterError); with the
+            // walk over, arm the frame-stall monitor so the bare-restart +
+            // zero-frame-escalation path owns the slot again — post-exhaustion
+            // behaviour is then identical to pre-walk behaviour.
+            lastFrameTime = System.currentTimeMillis();
+            logger.error("Dead-slot walk exhausted — tried camera ids "
+                + deadSlotTriedCameraIds + " and none delivered a frame. Leaving"
+                + " camera on id " + currentId + " for the normal restart path."
+                + " If this vehicle streams on another slot, pin it with"
+                + " POST /api/surveillance/config {\"manualCameraId\": N}.");
+            return;
+        }
+
+        logger.warn("Dead-slot fallback: switching panoramic camera id "
+            + currentId + " -> " + nextId + " (tried so far: "
+            + deadSlotTriedCameraIds + ")");
+
+        // An attempted candidate counts as tried even if its open fails —
+        // otherwise a candidate that throws at open would be retried on every
+        // watchdog pass, forever, with the escalation path suppressed.
+        deadSlotTriedCameraIds.add(nextId);
+        cameraIdOverride = nextId;
+        // The zero-frame reopen evidence was gathered against a DIFFERENT
+        // physical slot, so it says nothing about this one. Without this reset
+        // the escalation counter would reach its threshold mid-walk and hand
+        // off to the warmup-routed full restart, which reopens the same dead
+        // slot — exactly the loop this method exists to break.
+        consecutiveZeroFrameRestarts = 0;
+        deadSlotWalkActive = true;
+        // The saved config's validated/manual privilege belongs to the id it
+        // was saved FOR — a different slot must earn persistence through the
+        // frame-15/50 pixel checks (which also carry the manual-override
+        // guard). Re-enabling validation here is what lets the recovered id be
+        // confirmed and written back on configs that skip validation.
+        skipFrameValidation = false;
+
+        restartCameraAfterError();
+    }
+
+    /**
+     * Panoramic camera ID from the HAL's own tag map, resolved once and cached.
+     *
+     * <p>Returns -1 when {@code BmmCameraInfo} is unavailable — the norm on
+     * DiLink 3.0, where only the native {@code BMMCamProp} holds the mapping and
+     * no Java API exposes it. {@link PanoCameraFallbackOrder} handles that by
+     * falling through to the raw-strip slot.
+     */
+    private int resolveHalPanoCameraIdHint() {
+        if (halPanoCameraIdHint == Integer.MIN_VALUE) {
+            int discovered;
+            try {
+                discovered = AvmCameraHelper.discoverPanoCameraId();
+            } catch (Throwable t) {
+                logger.warn("BmmCameraInfo pano-id lookup failed: " + t.getMessage());
+                discovered = -1;
+            }
+            halPanoCameraIdHint = discovered;
+            logger.info("Dead-slot fallback: BmmCameraInfo panoramic hint = "
+                + (discovered >= 0 ? String.valueOf(discovered) : "unavailable"));
+        }
+        return halPanoCameraIdHint;
+    }
+
     /**
      * SOTA: Yields the camera to the native BYD AVM app.
      * 
@@ -3499,14 +4720,47 @@ public class PanoramicCameraGpu {
      */
     private void yieldCameraInternal() {
         logger.info("Yielding camera to native AVM app...");
-        
+
         // CRITICAL: Finalize active recording BEFORE closing camera.
+        // FIX: Same bounded-yield pattern as restartCameraAfterError — onPreYield()
+        // does muxer.stop() + FUSE rename which can wedge indefinitely on a flaky
+        // USB/SD mount. Run on a worker thread with heartbeat ticking.
         if (yieldListener != null) {
-            try {
-                yieldListener.onPreYield();
-                logger.info("Pre-yield: recording finalized");
-            } catch (Exception e) {
-                logger.warn("Pre-yield callback error: " + e.getMessage());
+            final java.util.concurrent.atomic.AtomicBoolean yieldDone =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+            final java.util.concurrent.atomic.AtomicReference<Exception> yieldError =
+                new java.util.concurrent.atomic.AtomicReference<>(null);
+            Thread yieldThread = new Thread(() -> {
+                try {
+                    yieldListener.onPreYield();
+                } catch (Exception e) {
+                    yieldError.set(e);
+                } finally {
+                    yieldDone.set(true);
+                }
+            }, "PreYield-Yield");
+            yieldThread.setDaemon(true);
+            yieldThread.start();
+
+            long yieldStart = System.currentTimeMillis();
+            long yieldTimeout = 8000;
+            while (!yieldDone.get() &&
+                   (System.currentTimeMillis() - yieldStart) < yieldTimeout) {
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                lastGlThreadHeartbeat = System.currentTimeMillis();
+            }
+
+            if (yieldDone.get()) {
+                Exception err = yieldError.get();
+                if (err != null) {
+                    logger.warn("Pre-yield callback error: " + err.getMessage());
+                } else {
+                    logger.info("Pre-yield: recording finalized");
+                }
+            } else {
+                logger.error("Pre-yield: onPreYield TIMED OUT after " + yieldTimeout
+                    + "ms — FUSE mount wedged, proceeding with yield "
+                    + "(recording may be truncated)");
             }
         }
         
@@ -4003,12 +5257,56 @@ public class PanoramicCameraGpu {
 
         try {
             // CRITICAL: Finalize active recording BEFORE closing camera.
+            // FIX: onPreYield() calls muxer.stop() + FUSE rename which can block
+            // 10+ seconds on a wedged USB mount. Running it inline on the GL thread
+            // starves the heartbeat and the watchdog kills the daemon — the root
+            // cause of mid-drive trip loss. Run it on a bounded worker thread and
+            // keep the heartbeat alive while we wait. The recording MUST finalize
+            // before camera close (otherwise moov atom is never written), so we
+            // wait up to 8 seconds — well within the 10s warmup watchdog timeout.
             if (yieldListener != null) {
-                try {
-                    yieldListener.onPreYield();
-                    logger.info("Pre-restart: recording finalized");
-                } catch (Exception e) {
-                    logger.warn("Pre-restart callback error: " + e.getMessage());
+                final java.util.concurrent.atomic.AtomicBoolean yieldDone =
+                    new java.util.concurrent.atomic.AtomicBoolean(false);
+                final java.util.concurrent.atomic.AtomicReference<Exception> yieldError =
+                    new java.util.concurrent.atomic.AtomicReference<>(null);
+                Thread yieldThread = new Thread(() -> {
+                    try {
+                        yieldListener.onPreYield();
+                    } catch (Exception e) {
+                        yieldError.set(e);
+                    } finally {
+                        yieldDone.set(true);
+                    }
+                }, "PreYield-Finalize");
+                yieldThread.setDaemon(true);
+                yieldThread.start();
+
+                // Keep heartbeat alive while waiting for FUSE I/O to complete
+                long yieldStart = System.currentTimeMillis();
+                long yieldTimeout = 8000; // 8s — within the 10s warmup watchdog budget
+                while (!yieldDone.get() &&
+                       (System.currentTimeMillis() - yieldStart) < yieldTimeout) {
+                    try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                    lastGlThreadHeartbeat = System.currentTimeMillis();
+                }
+
+                if (yieldDone.get()) {
+                    Exception err = yieldError.get();
+                    if (err != null) {
+                        logger.warn("Pre-restart callback error: " + err.getMessage());
+                    } else {
+                        logger.info("Pre-restart: recording finalized");
+                    }
+                } else {
+                    // Timed out — the FUSE mount is wedged. The recording file will be
+                    // left as .tmp (recovered on next startup by orphan tmp sweep).
+                    // Proceeding with camera close is safe: the muxer is already writing
+                    // to a file descriptor (not the camera), so closing the camera won't
+                    // corrupt whatever did get flushed. The next onFileSaved will still
+                    // fire once the mount unblocks (or the file stays .tmp and is reaped).
+                    logger.error("Pre-restart: onPreYield TIMED OUT after " + yieldTimeout
+                        + "ms — FUSE mount wedged, proceeding with camera restart "
+                        + "(recording may be truncated)");
                 }
             }
             
@@ -4017,15 +5315,19 @@ public class PanoramicCameraGpu {
                 clearStreamingComponents();
                 logger.info("Pre-restart: streaming components detached");
             }
-            
+
+            // Update heartbeat before drainer join (which can block 2s each)
+            lastGlThreadHeartbeat = System.currentTimeMillis();
+
             // FORTIFY FIX: Stop encoder drainer threads BEFORE closing camera.
             if (encoder != null) {
                 encoder.stopDrainerForCameraClose();
             }
+            lastGlThreadHeartbeat = System.currentTimeMillis();
             if (streamEncoder != null) {
                 streamEncoder.stopDrainerForCameraClose();
             }
-            
+
             // Close with proper cleanup + notify service
             if (cameraObj != null) {
                 closeCameraForPath(cameraObj);
@@ -4038,7 +5340,7 @@ public class PanoramicCameraGpu {
 
             // Brief pause to let HAL settle
             Thread.sleep(500);
-            
+
             // Update heartbeat so watchdog doesn't kill us during restart
             lastGlThreadHeartbeat = System.currentTimeMillis();
             
@@ -4120,7 +5422,18 @@ public class PanoramicCameraGpu {
             // (FRAME_STALL_WARMUP_GRACE_MS) gives the BYD HAL its full 5-8s
             // first-frame latency before any stall can fire again. startCamera
             // already set lastCameraStartTime; align lastFrameTime to it.
-            lastFrameTime = System.currentTimeMillis();
+            //
+            // EXCEPT before the very first frame (issue #170): arming the stall
+            // monitor for a camera that has never streamed would let it seize
+            // ownership of a dead slot at ~9s and churn same-id bare restarts —
+            // each one refreshing lastCameraStartTime and starving the
+            // dead-slot walk's 25s window, so later fallback candidates would
+            // never be tried. Leaving it 0 keeps the never-streamed state's
+            // recovery with the walk (which re-arms the stall monitor when it
+            // exhausts); it also keeps the dead-slot field comment's invariant
+            // — "the stall monitor's lastFrameTime > 0 gate a never-streamed
+            // camera cannot satisfy" — actually true across restarts.
+            lastFrameTime = firstFrameReceived ? System.currentTimeMillis() : 0;
 
             // Restart encoder drainer now that camera is open again
             if (encoder != null) {
@@ -4132,7 +5445,10 @@ public class PanoramicCameraGpu {
                 cameraCoordinator.setupEventCallback(cameraObj);
             }
             
-            // Resume recording/surveillance after camera restart
+            // Resume recording/surveillance after camera restart.
+            // Update heartbeat first: onPostReacquire → startRecording →
+            // ensureStorageReady can block up to 4s on a flaky mount.
+            lastGlThreadHeartbeat = System.currentTimeMillis();
             if (yieldListener != null) {
                 try {
                     yieldListener.onPostReacquire();
@@ -4141,9 +5457,9 @@ public class PanoramicCameraGpu {
                     logger.warn("Post-restart callback error: " + e.getMessage());
                 }
             }
-            
+
             logger.info("Camera restarted successfully after error");
-            
+
         } catch (Exception e) {
             logger.error("Camera restart failed: " + e.getMessage());
             // If restart fails, the watchdog will eventually kill the process
@@ -4159,6 +5475,12 @@ public class PanoramicCameraGpu {
     public void stop() {
         logger.info( "Stopping GPU camera pipeline...");
         running = false;
+        // Also stop the attach-time helper threads. They deliberately do NOT test
+        // `running` (start() spawns them before it sets running = true, so that
+        // test would kill them on every cold start) — this sentinel is their only
+        // shutdown signal on a stop that doesn't route through
+        // releaseCameraConsumer.
+        cameraTornDown = true;
 
         // Stop watchdog
         if (watchdogThread != null) {
@@ -4340,7 +5662,12 @@ public class PanoramicCameraGpu {
             // torn down before its 5-8s first-frame warmup can complete
             // (the recording-blackout reopen loop). startCamera set
             // lastCameraStartTime; align lastFrameTime to it.
-            lastFrameTime = System.currentTimeMillis();
+            //
+            // Pre-first-frame, leave it 0 for the same reason as
+            // restartCameraAfterError: the dead-slot walk owns the
+            // never-streamed state, and arming the stall monitor here would
+            // let its same-id churn starve the walk's 25s window.
+            lastFrameTime = firstFrameReceived ? System.currentTimeMillis() : 0;
             logger.info("Camera reopened successfully");
 
         } catch (Exception e) {
@@ -4485,6 +5812,19 @@ public class PanoramicCameraGpu {
     }
 
     /**
+     * Sets the stream client-presence probe read by PASS 1B. When it returns
+     * false (no live-view client on either the port-8887 or /ws path), the
+     * render loop skips the stream raster + encode. Pass
+     * {@code WebSocketStreamServer::hasActiveClients}. A null probe restores the
+     * fail-open default (always render), so a wiring gap never blacks the stream.
+     */
+    public void setStreamClientProbe(java.util.function.BooleanSupplier probe) {
+        this.streamClientProbe = (probe != null) ? probe : (() -> true);
+        // Reset the edge tracker so the next active frame forces a fresh IDR.
+        this.streamWasActive = false;
+    }
+
+    /**
      * Publishes the dedicated blind-spot lane's scaler+encoder to the render
      * loop (PASS 1C). The fields are volatile so the render loop's per-frame
      * snapshot read sees the write, and so cross-thread readers (calibration /
@@ -4566,6 +5906,10 @@ public class PanoramicCameraGpu {
     public void clearStreamingComponents() {
         this.streamScaler = null;
         this.streamEncoder = null;
+        this.streamFrameStride = 1;
+        this.streamStrideCounter = 0;
+        this.streamClientProbe = () -> true;
+        this.streamWasActive = false;
     }
     
     /**
@@ -4685,13 +6029,34 @@ public class PanoramicCameraGpu {
                 logger.warn("Live setCameraFps failed: " + t.getMessage());
             }
         }
+        // Keep the stream-lane stride in sync: a recording-mode change can move
+        // the camera HAL rate (e.g. 15→30) while a live stream is active, and the
+        // stride is camFps/streamFps. No-op when no stream encoder is attached.
+        updateStreamFrameStride();
     }
-    
+
     /**
      * Gets the target FPS setting.
      */
     public int getTargetFps() {
         return targetFps;
+    }
+
+    /**
+     * Pin the AI-lane motion-readback cadence to a fixed wall-clock interval
+     * (ms), independent of the HAL delivery rate; 0 restores the default
+     * frame-count modulo. Caches the value and forwards to the live AiLaneGl if
+     * present (re-applied at the next lazy bring-up otherwise). Used by the
+     * parked-idle throttle so dropping/ramping the HAL fps does NOT change how
+     * often motion detection runs.
+     */
+    public void setAiReadbackMinIntervalMs(long ms) {
+        long clamped = Math.max(0L, ms);
+        this.aiReadbackMinIntervalMs = clamped;
+        AiLaneGl lane = aiLaneGl;
+        if (lane != null) {
+            lane.setReadbackMinIntervalMs(clamped);
+        }
     }
 
     /**
@@ -4724,6 +6089,44 @@ public class PanoramicCameraGpu {
      */
     public int getRecorderFrameStride() {
         return recorderFrameStride;
+    }
+
+    /**
+     * Recompute the stream-lane draw stride from the current camera target fps
+     * and the stream encoder's configured fps. Call after enabling streaming or
+     * changing the stream quality preset. Stride 1 = every camera frame drawn to
+     * the stream encoder (no savings). Values > 1 skip frames to match the
+     * encoder's lower fps — same approach as {@link #setRecorderFrameStride}.
+     */
+    public void updateStreamFrameStride() {
+        HardwareEventRecorderGpu enc = streamEncoder;
+        if (enc == null) {
+            streamFrameStride = 1;
+            return;
+        }
+        int camFps = targetFps;
+        int sFps = enc.getFps();
+        int stride = (sFps > 0 && camFps > sFps) ? camFps / sFps : 1;
+        // NEVER decimate on dilink4. This HAL emits at its own fixed low rate
+        // (~4.5 fps observed) and refuses setCameraFps, so `targetFps` is a request
+        // it ignored — comparing it against the encoder's rate is meaningless here,
+        // and any stride > 1 would throw away real frames from a source that is
+        // already starving the encoder. (Concretely: the SMOOTH preset asks 25
+        // while the encoder is clamped to 10, giving stride 2 and halving an
+        // already-slow feed.) Legacy keeps the full stride behaviour, where
+        // targetFps is genuinely honoured by the HAL and skipping saves real work.
+        if (USE_ESCO_SURFACE_TEXTURE_PATH && stride > 1) {
+            logger.info("dilink4: forcing stream stride 1 (was " + stride
+                + ") — HAL rate is fixed and below the request, so decimating"
+                + " would drop real frames");
+            stride = 1;
+        }
+        if (stride != streamFrameStride) {
+            streamFrameStride = Math.max(1, stride);
+            streamStrideCounter = 0;
+            logger.info("Stream frame stride set to " + streamFrameStride
+                + " (camera " + camFps + " fps → stream " + sFps + " fps)");
+        }
     }
 
     /**

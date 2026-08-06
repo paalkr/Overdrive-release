@@ -69,6 +69,13 @@
             android:defaultValue="/vehicle-control" />
     </fragment>
 
+    <!-- Projection (native only — cast + live mirror of the driver cluster) -->
+    <fragment
+        android:id="@+id/projectionFragment"
+        android:name="com.overdrive.app.ui.fragment.ProjectionFragment"
+        android:label="@string/rail_projection"
+        tools:layout="@layout/fragment_projection" />
+
     <!-- Trips (web canonical) -->
     <fragment
         android:id="@+id/tripsFragment"
@@ -91,6 +98,30 @@
             android:name="page_path"
             app:argType="string"
             android:defaultValue="/charging" />
+    </fragment>
+
+    <!-- Automations (web canonical) -->
+    <fragment
+        android:id="@+id/automationsFragment"
+        android:name="com.overdrive.app.ui.fragment.WebViewFragment"
+        android:label="@string/rail_automations"
+        tools:layout="@layout/fragment_webview">
+        <argument
+            android:name="page_path"
+            app:argType="string"
+            android:defaultValue="/automations" />
+    </fragment>
+
+    <!-- Key Mapping (web canonical) -->
+    <fragment
+        android:id="@+id/keyMappingFragment"
+        android:name="com.overdrive.app.ui.fragment.WebViewFragment"
+        android:label="@string/rail_key_mapping"
+        tools:layout="@layout/fragment_webview">
+        <argument
+            android:name="page_path"
+            app:argType="string"
+            android:defaultValue="/key-mapping" />
     </fragment>
 
     <!-- Integrations: roll-up of Telegram + ABRP + MQTT -->

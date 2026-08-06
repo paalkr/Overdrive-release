@@ -39,7 +39,7 @@
         <!--  treats this view's id (`navigationRail`) the same way it      -->
         <!--  treated NavigationRailView.                                    -->
         <!-- ============================================================== -->
-        <androidx.core.widget.NestedScrollView
+        <com.overdrive.app.ui.widget.SwipeExpandableRailScrollView
             android:id="@+id/navigationRailScroll"
             android:layout_width="80dp"
             android:layout_height="match_parent"
@@ -55,6 +55,18 @@
                 android:gravity="center_horizontal"
                 android:orientation="vertical"
                 android:paddingBottom="16dp">
+
+                <!-- Accessible alternative to the horizontal expand/collapse swipe. -->
+                <ImageButton
+                    android:id="@+id/railExpandButton"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="4dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/rail_expand"
+                    android:padding="12dp"
+                    android:src="@drawable/ic_chevron_right"
+                    app:tint="?attr/colorOnSurfaceVariant" />
 
                 <!-- Rail header (language button) was here. The language
                      affordance moved to the toolbar end-cluster so it sits
@@ -82,12 +94,27 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
                 <include
+                    android:id="@+id/railDestProjection"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+                <include
                     android:id="@+id/railDestTrips"
                     layout="@layout/item_rail_destination"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
                 <include
                     android:id="@+id/railDestCharging"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+                <include
+                    android:id="@+id/railDestAutomations"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+                <include
+                    android:id="@+id/railDestKeyMapping"
                     layout="@layout/item_rail_destination"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
@@ -132,7 +159,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
             </LinearLayout>
-        </androidx.core.widget.NestedScrollView>
+        </com.overdrive.app.ui.widget.SwipeExpandableRailScrollView>
 
         <!-- ============================================================== -->
         <!--  Main stage                                                     -->
@@ -171,9 +198,10 @@
                       `btnCopyUrl`, `urlBar` IDs are preserved here even though
                       the bottom URL strip is gone — MainActivity reads them
                       to update tunnel state. `urlStatusDot` is the dot inside
-                      the pill (same drawable swap logic). `urlBar` is now the
-                      pill's outer LinearLayout so the same visibility toggling
-                      keeps working.
+                      the pill (same drawable swap logic). The status pill
+                      starts hidden and appears only for a genuinely starting
+                      or running tunnel; the surrounding `urlBar` stays visible
+                      so the language affordance remains reachable.
                     -->
                     <LinearLayout
                         android:id="@+id/urlBar"
@@ -194,7 +222,8 @@
                             android:gravity="center_vertical"
                             android:orientation="horizontal"
                             android:paddingHorizontal="14dp"
-                            android:paddingVertical="8dp">
+                            android:paddingVertical="8dp"
+                            android:visibility="gone">
 
                             <View
                                 android:id="@+id/urlStatusDot"
@@ -217,7 +246,7 @@
                                 android:fontFamily="monospace"
                                 android:maxWidth="280dp"
                                 android:singleLine="true"
-                                android:text="@string/url_connecting"
+                                android:text="@string/dashboard_no_tunnel"
                                 android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
                                 android:textColor="?attr/colorPrimary"
                                 android:textIsSelectable="true" />

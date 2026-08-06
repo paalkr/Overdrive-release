@@ -79,6 +79,14 @@ class DaemonLauncher(
         private var accSentryLaunchStartedAt = 0L
         @Volatile
         private var cameraLaunchStartedAt = 0L
+        // Telegram needs the same guard: boot (+15s timer), the ACC-off edge,
+        // the 30s health check and a user tap can all call launchTelegramDaemon
+        // within the same window. Each deploys start_telegram.sh and nohup's it,
+        // so without a guard several watchdogs end up alive; every daemon they
+        // spawn SIGKILLs the others via killOldInstances, those watchdogs
+        // respawn, and the loop re-announces "bot ready" on each cycle.
+        @Volatile
+        private var telegramLaunchStartedAt = 0L
 
         /** True if a launch guard set at [startedAt] is still active (held + unexpired). */
         private fun guardHeld(startedAt: Long): Boolean {
@@ -213,6 +221,12 @@ class DaemonLauncher(
                 "LOG_FILE=\"$ACC_SENTRY_DAEMON_LOG\"",
                 "LOCK_FILE=\"$lockFile\"",
                 "SENTINEL=\"/data/local/tmp/acc_sentry_daemon.disabled\"",
+                // "Vehicle ON only" parked-shutdown marker (ParkedShutdown.MARKER_PATH).
+                // Present → the whole stack is terminated for the parked window; the
+                // watchdog must exit instead of respawning, same as the user .disabled
+                // sentinel. Cleared on the ACC-on edge. Never exists in onAndOff mode, so
+                // this gate is inert there (watchdog behaves byte-identically).
+                "PARKED=\"/data/local/tmp/overdrive_parked_shutdown\"",
                 "PROXY_ARGS=\"$proxyArgs\"",
                 "",
                 "/system/bin/device_config put activity_manager max_phantom_processes 2147483647 > /dev/null 2>&1",
@@ -222,7 +236,7 @@ class DaemonLauncher(
                 "echo \"[\$(date)] Waiting for system boot to complete...\" >> \$LOG_FILE",
                 "BOOT_WAIT=0",
                 "while [ \"\$(getprop sys.boot_completed)\" != \"1\" ] && [ \$BOOT_WAIT -lt 120 ]; do",
-                "  if [ -f \"\$SENTINEL\" ]; then",
+                "  if [ -f \"\$SENTINEL\" ] || [ -f \"\$PARKED\" ]; then",
                 "    echo \"[\$(date)] Daemon disabled by user during boot-wait. Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
@@ -241,7 +255,7 @@ class DaemonLauncher(
                 // per respawn). Both truncate in place — see helper docs.
                 *logRotateGuardLines().toTypedArray(),
                 "",
-                "  if [ -f \"\$SENTINEL\" ]; then",
+                "  if [ -f \"\$SENTINEL\" ] || [ -f \"\$PARKED\" ]; then",
                 "    echo \"[\$(date)] Daemon disabled by user (sentinel file exists). Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
@@ -254,7 +268,7 @@ class DaemonLauncher(
                 "  wait \$DAEMON_PID",
                 "  EXIT_CODE=\$?",
                 "  kill \$ROTATE_PID 2>/dev/null; wait \$ROTATE_PID 2>/dev/null",
-                "  if [ -f \"\$SENTINEL\" ]; then",
+                "  if [ -f \"\$SENTINEL\" ] || [ -f \"\$PARKED\" ]; then",
                 "    echo \"[\$(date)] Daemon disabled by user (sentinel written during shutdown). Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
@@ -301,6 +315,7 @@ class DaemonLauncher(
                 "LOG_FILE=\"$TELEGRAM_DAEMON_LOG\"",
                 "LOCK_FILE=\"/data/local/tmp/telegram_bot_daemon.lock\"",
                 "SENTINEL=\"/data/local/tmp/telegram_bot_daemon.disabled\"",
+                "PARKED=\"/data/local/tmp/overdrive_parked_shutdown\"",
                 "RETRY_COUNT=0",
                 "HEALTHY_UPTIME_SEC=300",
                 "",
@@ -308,7 +323,7 @@ class DaemonLauncher(
                 // Catch a log left oversized by a previous run before relaunch;
                 // real-time bounding is the poller co-process below.
                 *logRotateGuardLines().toTypedArray(),
-                "  if [ -f \"\$SENTINEL\" ]; then",
+                "  if [ -f \"\$SENTINEL\" ] || [ -f \"\$PARKED\" ]; then",
                 "    echo \"[\$(date)] Daemon disabled by user (sentinel file exists). Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
@@ -324,7 +339,7 @@ class DaemonLauncher(
                 "  END_EPOCH=\$(awk '{print int(\$1)}' /proc/uptime 2>/dev/null || date +%s)",
                 "  UPTIME_SEC=\$((END_EPOCH - START_EPOCH))",
                 "  if [ \$UPTIME_SEC -lt 0 ]; then UPTIME_SEC=0; fi",
-                "  if [ -f \"\$SENTINEL\" ]; then",
+                "  if [ -f \"\$SENTINEL\" ] || [ -f \"\$PARKED\" ]; then",
                 "    echo \"[\$(date)] Daemon disabled by user (sentinel written during shutdown). Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
@@ -381,6 +396,7 @@ class DaemonLauncher(
                 "LOG_FILE=\"$CAMERA_DAEMON_LOG\"",
                 "LOCK_FILE=\"/data/local/tmp/camera_daemon.lock\"",
                 "SENTINEL=\"/data/local/tmp/camera_daemon.disabled\"",
+                "PARKED=\"/data/local/tmp/overdrive_parked_shutdown\"",
                 "RETRY_COUNT=0",
                 "HEALTHY_UPTIME_SEC=300",
                 // Record THIS supervisor loop's PID so the kill-readers
@@ -395,7 +411,7 @@ class DaemonLauncher(
                 // Catch a log left oversized by a previous run before relaunch;
                 // real-time bounding is the poller co-process below.
                 *logRotateGuardLines().toTypedArray(),
-                "  if [ -f \"\$SENTINEL\" ]; then",
+                "  if [ -f \"\$SENTINEL\" ] || [ -f \"\$PARKED\" ]; then",
                 "    echo \"[\$(date)] Daemon disabled by user (sentinel file exists). Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
@@ -411,7 +427,7 @@ class DaemonLauncher(
                 "  END_EPOCH=\$(awk '{print int(\$1)}' /proc/uptime 2>/dev/null || date +%s)",
                 "  UPTIME_SEC=\$((END_EPOCH - START_EPOCH))",
                 "  if [ \$UPTIME_SEC -lt 0 ]; then UPTIME_SEC=0; fi",
-                "  if [ -f \"\$SENTINEL\" ]; then",
+                "  if [ -f \"\$SENTINEL\" ] || [ -f \"\$PARKED\" ]; then",
                 "    echo \"[\$(date)] Daemon disabled by user (sentinel written during shutdown). Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
@@ -1234,9 +1250,35 @@ class DaemonLauncher(
      * Handles Telegram bot polling and notifications.
      */
     fun launchTelegramDaemon(callback: LaunchCallback) {
+        // Single-flight, same self-healing timestamped guard the camera and
+        // acc-sentry launches use. Boot, ACC-off, the 30s health check and a
+        // user tap can otherwise each deploy their own watchdog concurrently
+        // (see telegramLaunchStartedAt) and produce a respawn loop that
+        // re-announces "bot ready" every cycle.
+        if (guardHeld(telegramLaunchStartedAt)) {
+            logManager.info(TAG, "TelegramBotDaemon launch already in progress, skipping")
+            callback.onLog("Launch already in progress")
+            callback.onLaunched()
+            return
+        }
+        telegramLaunchStartedAt = System.currentTimeMillis()
+
         logManager.info(TAG, "Launching TelegramBotDaemon...")
         callback.onLog("Launching TelegramBotDaemon...")
-        
+
+        // Release the guard on every terminal outcome of the async chain.
+        val guarded = object : LaunchCallback {
+            override fun onLog(message: String) = callback.onLog(message)
+            override fun onLaunched() {
+                telegramLaunchStartedAt = 0L
+                callback.onLaunched()
+            }
+            override fun onError(error: String) {
+                telegramLaunchStartedAt = 0L
+                callback.onError(error)
+            }
+        }
+
         // Check if already running
         adbShellExecutor.execute(
             command = "ps -A | grep $TELEGRAM_DAEMON_PROCESS | grep -v grep",
@@ -1245,14 +1287,35 @@ class DaemonLauncher(
                     if (output.trim().isNotEmpty()) {
                         logManager.info(TAG, "TelegramBotDaemon already running: ${output.trim()}")
                         callback.onLog("TelegramBotDaemon already running")
-                        callback.onLaunched()
+                        // Clear the disable sentinel before reporting success —
+                        // same handshake the camera path does on its
+                        // already-running short-circuit. We are being asked to
+                        // start, so a leftover sentinel (e.g. the app-update
+                        // sweep's, which is never cleared for optional daemons)
+                        // must not survive: the supervising watchdog gate-exits
+                        // on it at the daemon's next exit, turning a live daemon
+                        // into a permanently-stopped one with no user action.
+                        // Gated in the rm's own callback so onLaunched() only
+                        // fires once the file is actually gone.
+                        adbShellExecutor.execute(
+                            command = "rm -f /data/local/tmp/telegram_bot_daemon.disabled "
+                                + "2>/dev/null; echo done",
+                            callback = object : AdbShellExecutor.ShellCallback {
+                                override fun onSuccess(o: String) { guarded.onLaunched() }
+                                override fun onError(e: String) {
+                                    logManager.warn(TAG,
+                                        "Sentinel rm failed on already-running short-circuit: $e")
+                                    guarded.onLaunched()
+                                }
+                            }
+                        )
                         return
                     }
-                    launchTelegramDaemonInternal(callback)
+                    launchTelegramDaemonInternal(guarded)
                 }
-                
+
                 override fun onError(error: String) {
-                    launchTelegramDaemonInternal(callback)
+                    launchTelegramDaemonInternal(guarded)
                 }
             }
         )
@@ -2074,6 +2137,74 @@ class DaemonLauncher(
         )
     }
     
+    /**
+     * ONE `ps -A` snapshot for the whole daemon set, matched in-process.
+     *
+     * The per-daemon [isDaemonRunning] probe costs a full `/proc` walk AND — because
+     * [AdbShellExecutor.getOrCreateConnection] runs a `dadb.shell("echo ok")`
+     * liveness check before every command — TWO adb shell sessions, all serialized
+     * on a process-wide lock. Probing N daemons individually therefore costs 2N
+     * adb sessions + N `/proc` walks per tick. `adbd` is a shared SYSTEM service,
+     * so that load is stolen from the whole head unit, not just from us.
+     *
+     * This takes a single snapshot and lets the caller test every daemon against
+     * it, cutting the health check to 2 adb sessions + 1 `/proc` walk per tick.
+     *
+     * `-o ARGS` is explicit rather than strictly required. Bare `ps -A` on toybox
+     * prints the NAME column, which is argv[0] (basename, width 27 — and unbounded
+     * when stdout is not a tty), NOT the 15-char kernel `comm` (that is the separate
+     * CMD field). Verified on-device: `ps -A -o ...,NAME` printed
+     * "acc_sentry_daemon" (17 chars) and "com.overdrive.app" (17 chars) in full, so
+     * long names are not truncated and bare `ps -A` would in fact have worked.
+     * We pass `-o ARGS` anyway so the column set is pinned by us and cannot drift
+     * with a vendor's default-field list.
+     *
+     * @param callback receives the raw `ps -A -o ARGS` output, or null if the probe
+     *   failed (callers must treat null as "unknown", never as "dead").
+     */
+    fun snapshotProcessTable(callback: (String?) -> Unit) {
+        adbShellExecutor.execute(
+            command = "ps -A -o ARGS",
+            callback = object : AdbShellExecutor.ShellCallback {
+                override fun onSuccess(output: String) { callback(output) }
+                override fun onError(error: String) { callback(null) }
+            }
+        )
+    }
+
+    /**
+     * Tests one daemon against a [snapshotProcessTable] (`ps -A -o ARGS`) result.
+     * Semantics match the old per-daemon `ps -A | grep <name> | grep -v grep`.
+     *
+     * Deliberately NO watchdog-script exclusion. It looks like the supervising
+     * shells (`sh /data/local/tmp/start_cam_daemon.sh`) could false-positive a dead
+     * daemon as alive, but no watchdog FILENAME actually contains a full
+     * DaemonType.processName: start_cam_daemon.sh lacks the `byd_` of
+     * "byd_cam_daemon"; start_acc_sentry.sh lacks `_daemon`; start_telegram.sh is not
+     * "telegram_bot_daemon"; start_singbox.sh is not "sing-box" (hyphen). The one
+     * that would match — start_zrok.sh vs "zrok" — is moot because ZROK is routed off
+     * this snapshot path entirely (see DaemonStartupManager.runHealthCheck, which
+     * dispatches it to checkTunnelHealth for the edge-stale probe).
+     * A `.sh` filter therefore excludes nothing real while being the only
+     * false-NEGATIVE vector here: any daemon whose argv ever contained ".sh" would
+     * read DEAD forever and be relaunched every tick.
+     *
+     * SENTRY needs the bespoke rule the launch path documents (`grep -w` +
+     * `grep -v acc_`): "sentry_daemon" is a substring of "acc_sentry_daemon", so
+     * without the exclusion a running ACC-Sentry would mask a dead Sentry daemon.
+     */
+    fun processAliveIn(snapshot: String, processName: String): Boolean {
+        val lines = snapshot.lineSequence()
+            .filter { it.isNotBlank() }
+        return if (processName == SENTRY_DAEMON_PROCESS) {
+            lines.any { line ->
+                line.contains(processName) && !line.contains("acc_")
+            }
+        } else {
+            lines.any { it.contains(processName) }
+        }
+    }
+
     /**
      * Check if a daemon is running.
      * Uses ps with grep which is more reliable on Android than pgrep.

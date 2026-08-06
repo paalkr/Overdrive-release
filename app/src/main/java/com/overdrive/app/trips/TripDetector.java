@@ -30,6 +30,10 @@ public class TripDetector {
 
     // Constants
     static final long PARK_DEBOUNCE_MS = 120_000;    // 2 minutes
+    /** Max age of a GPS fix for its speed to veto the park transition. Beyond
+     *  this, gear P wins — a cached/disk-restored speed must not wedge the
+     *  detector in ACTIVE. 10s is generous vs the ~1s fix cadence. */
+    static final long GPS_SPEED_MAX_AGE_MS = 10_000;
     static final long MIN_TRIP_DURATION_MS = 60_000;  // 1 minute
     static final double MIN_TRIP_DISTANCE_KM = 0.2;   // 200 meters
 
@@ -141,11 +145,23 @@ public class TripDetector {
      */
     private void handleActiveGearChange(int newGear) {
         if (newGear == GearMonitor.GEAR_P) {
-            // Check speed — only start debounce if speed is 0
+            // Check speed — only start debounce if speed is 0.
+            //
+            // STALENESS GUARD: GpsMonitor.getSpeed() is a cached field that is also
+            // restored from disk at startup, so it can report a non-zero speed from
+            // a fix minutes or hours old (e.g. GPS lost in a garage, or the value
+            // reloaded after a restart). Gear P is a far more reliable "the car
+            // stopped" signal than a stale speed sample. Without this guard the
+            // detector never leaves ACTIVE, the trip only closes on ACC-off, and its
+            // recorded duration is inflated by the whole parked interval.
             float speed = GpsMonitor.getInstance().getSpeed();
-            if (speed <= 0.5f) {
+            long fixAgeMs = System.currentTimeMillis() - GpsMonitor.getInstance().getLastUpdate();
+            boolean speedTrustworthy = fixAgeMs >= 0 && fixAgeMs <= GPS_SPEED_MAX_AGE_MS;
+            if (speed <= 0.5f || !speedTrustworthy) {
                 // Start park debounce timer
-                logger.info("Gear P + speed=0 → starting " + (PARK_DEBOUNCE_MS / 1000) + "s debounce");
+                logger.info("Gear P + speed=" + speed + "m/s"
+                    + (speedTrustworthy ? " (stopped)" : " IGNORED (fix " + fixAgeMs + "ms old)")
+                    + " → starting " + (PARK_DEBOUNCE_MS / 1000) + "s debounce");
                 state = State.PARK_PENDING;
                 parkStartTime = System.currentTimeMillis();
                 startParkDebounceTimer();
@@ -199,6 +215,24 @@ public class TripDetector {
             logger.error("Failed to read start kWh: " + e.getMessage());
         }
 
+        // Cumulative HAL electricity counter (kWh). The end delta is the metered
+        // energy drawn — the only electric source fine enough to measure a short
+        // trip, since remaining-kWh is derived from an integer SoC. Captured for
+        // BEV and PHEV alike (unlike the fuel counter, which is PHEV-only).
+        //
+        // Require strictly > 0: a lifetime counter on any car that has ever
+        // driven is positive, so an exact 0 means this trim doesn't populate it.
+        // Leaving the -1 sentinel makes the energy cascade fall back to the
+        // remaining-kWh delta rather than booking a false 0 kWh.
+        try {
+            double elecConStart = VehicleDataMonitor.getInstance().getTotalElecCon();
+            if (!Double.isNaN(elecConStart) && elecConStart > 0) {
+                activeTrip.elecConStart = elecConStart;
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to read start elec accumulator: " + e.getMessage());
+        }
+
         // PHEV-only: snapshot drivetrain + tank level. computeIsPhev caches
         // its verdict for 60s so this is one reflection call worst-case.
         // BEVs leave fuelPctStart at -1 (sentinel for "no fuel data") and
@@ -249,6 +283,9 @@ public class TripDetector {
         try {
             startOdometerKm = OdometerReader.getInstance().readOdometerKm();
             if (startOdometerKm > 0) {
+                // Persist the absolute reading for display (distanceKm is the
+                // delta; this is the odometer value shown on the trip card).
+                activeTrip.odometerStartKm = startOdometerKm;
                 logger.info("Start odometer: " + startOdometerKm + " km");
             }
         } catch (Exception e) {
@@ -325,6 +362,19 @@ public class TripDetector {
             logger.error("Failed to read end kWh: " + e.getMessage());
         }
 
+        // End of the cumulative electricity counter. Strictly > 0 for the same
+        // reason as the start read; the analytics cascade additionally requires
+        // end >= start so a firmware counter reset falls through to the coarser
+        // tiers instead of yielding a negative energy figure.
+        try {
+            double elecConEnd = VehicleDataMonitor.getInstance().getTotalElecCon();
+            if (!Double.isNaN(elecConEnd) && elecConEnd > 0) {
+                activeTrip.elecConEnd = elecConEnd;
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to read end elec accumulator: " + e.getMessage());
+        }
+
         // PHEV end-of-trip fuel snapshot. We re-check isPhev here so that a
         // vehicle reclassified mid-trip (e.g. computeIsPhev cache TTL flipped
         // the verdict) still records a consistent end value.
@@ -372,13 +422,63 @@ public class TripDetector {
         double endOdometerKm = -1;
         try {
             endOdometerKm = OdometerReader.getInstance().readOdometerKm();
+            if (endOdometerKm > 0) {
+                // Persist the absolute end reading for display (paired with the
+                // start snapshot; the card shows start→end, distanceKm the delta).
+                activeTrip.odometerEndKm = endOdometerKm;
+            }
         } catch (Exception e) {
             logger.warn("Failed to read end odometer: " + e.getMessage());
         }
 
+        // Whether the start/end pair is self-consistent enough to display.
+        boolean odometerPairTrusted = false;
         if (startOdometerKm > 0 && endOdometerKm > startOdometerKm) {
-            activeTrip.distanceKm = endOdometerKm - startOdometerKm;
-            logger.info("Distance from odometer: " + String.format("%.2f", activeTrip.distanceKm) + " km");
+            double odoDelta = endOdometerKm - startOdometerKm;
+            // Sanity-gate the delta against what the elapsed time physically allows
+            // (200 km/h ceiling, +1 km of slack so rounding never rejects a short
+            // trip) before booking it as the exact hardware distance. Failing it
+            // falls through to the GPS paths below.
+            //
+            // Register and scale consistency across the two edges is guaranteed at the
+            // source — OdometerReader decides ONCE which register it trusts and never
+            // mixes them — so what remains to catch here is a wrong UNIT factor,
+            // which is self-consistent and therefore invisible to any internal check.
+            double maxPlausibleKm = 1.0 + (200.0 * activeTrip.durationSeconds / 3600.0);
+
+            // NOT cross-checked against the recorder's distance, in either direction.
+            // It looks like an independent witness but it is not: its primary source
+            // is CAN wheel speed scaled by the SAME unit factor this odometer uses
+            // (BydDataCollector.getSpeedToKmhFactor), so a wrong unit factor skews
+            // both by the identical ratio and the comparison silently always passes.
+            // Where the two DO diverge — the recorder's GPS-haversine fallback, used
+            // when the speed channel is stale — the recorder is the less trustworthy
+            // one (parked jitter accretes phantom distance), so acting on a
+            // disagreement would discard the good reading for the bad one.
+            //
+            // A wrong unit factor therefore cannot be detected here at all, and is
+            // deliberately left to be fixed at its source rather than papered over
+            // with a check that cannot see it.
+            if (odoDelta > maxPlausibleKm) {
+                logger.warn("Odometer delta implausible (" + String.format("%.2f", odoDelta)
+                        + " km in " + activeTrip.durationSeconds + "s, max "
+                        + String.format("%.2f", maxPlausibleKm) + ") — ignoring, falling back to GPS");
+            } else {
+                activeTrip.distanceKm = odoDelta;
+                odometerPairTrusted = true;
+                logger.info("Distance from odometer: " + String.format("%.2f", activeTrip.distanceKm) + " km");
+            }
+        }
+
+        // The absolute start/end readings are shown on the trip card. Publish them
+        // only when the delta between them was actually trusted above: otherwise the
+        // card would display a pair whose own difference contradicts the distance
+        // shown beside it (and, if the two reads disagreed, an odometer that appears
+        // to run backwards). Suppressed means the tiles hide, which reads as
+        // "unavailable" rather than as confidently wrong numbers.
+        if (!odometerPairTrusted) {
+            activeTrip.odometerStartKm = 0;
+            activeTrip.odometerEndKm = 0;
         }
 
         // Fallback: GPS haversine distance from recorder
@@ -435,7 +535,9 @@ public class TripDetector {
         logger.info("Trip finalized: duration=" + activeTrip.durationSeconds + "s, distance="
                 + activeTrip.distanceKm + "km, SoC=" + activeTrip.socStart + "→" + activeTrip.socEnd + "%"
                 + ", kWh=" + String.format("%.2f", activeTrip.kwhStart) + "→" + String.format("%.2f", activeTrip.kwhEnd)
-                + " (used=" + String.format("%.2f", activeTrip.getEnergyUsedKwh()) + " kWh)");
+                + ", elecCon=" + String.format("%.3f", activeTrip.elecConStart) + "→" + String.format("%.3f", activeTrip.elecConEnd)
+                + " (used=" + String.format("%.3f", activeTrip.getEnergyUsedKwh()) + " kWh"
+                + (activeTrip.hasMeteredEnergy() ? ", metered" : ", derived") + ")");
 
         // Check minimum thresholds
         long durationMs = activeTrip.endTime - activeTrip.startTime;
@@ -558,8 +660,12 @@ public class TripDetector {
      */
     private void checkForOrphanedTrips() {
         logger.info("Checking for orphaned trips...");
-        // Actual DB recovery is done in TripAnalyticsManager.initComponents()
-        // since TripDatabase isn't available at TripDetector construction time.
+        // Recovery from orphaned .jsonl.gz files (surviving telemetry from a
+        // mid-drive daemon crash with no DB row) is handled by the auto-recovery
+        // hook in TripAnalyticsManager.initComponents() which calls
+        // TripDatabase.recoverTripsFromDisk() on a background thread at startup.
+        // TripDatabase isn't available at TripDetector construction time, and the
+        // scan involves FUSE I/O that shouldn't block detector readiness.
     }
 
     // ==================== UTILITY ====================

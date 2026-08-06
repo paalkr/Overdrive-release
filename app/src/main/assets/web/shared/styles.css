@@ -447,6 +447,31 @@ input, select { font-family: inherit; }
     animation: none;
 }
 
+/* Compact status pills (for example Live, vehicle lock, and monitoring).
+   Android System WebView 58 does not support flex `gap`, so the dot owns the
+   spacing. Keep that compatibility detail here instead of reimplementing it
+   in every page-specific pill. */
+.compact-status-pill {
+    display: -webkit-inline-flex;
+    display: inline-flex;
+    -webkit-align-items: center;
+    align-items: center;
+}
+
+.compact-status-pill > .compact-status-pill__dot {
+    display: inline-block;
+    -webkit-flex: 0 0 auto;
+    flex: 0 0 auto;
+    margin-right: 6px;
+    margin-right: var(--compact-status-pill-dot-gap, 6px);
+}
+
+[dir="rtl"] .compact-status-pill > .compact-status-pill__dot {
+    margin-right: 0;
+    margin-left: 6px;
+    margin-left: var(--compact-status-pill-dot-gap, 6px);
+}
+
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
@@ -455,6 +480,15 @@ input, select { font-family: inherit; }
 /* === MAIN CONTENT === */
 .main-content {
     flex: 1;
+    /* A flex item defaults to min-width:auto, which lets it grow to its widest
+       non-wrapping descendant instead of the flex container's width. On a narrow
+       (mobile) viewport a long, nowrap child — e.g. a key-mapping binding row's
+       action name — then stretched .main-content past the screen, and because
+       .card / .page-body are overflow:hidden the surplus was CLIPPED off the right
+       edge (the reported crop). min-width:0 lets the item shrink to the container
+       so the descendants' own overflow:hidden + text-overflow:ellipsis truncate as
+       intended. No effect when content already fits (verified: desktop unchanged). */
+    min-width: 0;
     margin-left: var(--sidebar-width);
     min-height: 100vh;
     min-height: calc(var(--vh, 1vh) * 100);
@@ -895,6 +929,27 @@ input, select { font-family: inherit; }
 }
 
 .checkbox-item input { display: none; }
+
+/* === TELEMETRY OVERLAY FIELD PICKER ===========================
+ * Chip grid for choosing which telemetry fields burn into recordings.
+ * Reuses the .checkbox-item chip look (active = brand-teal fill). The
+ * wrapper indents slightly under its parent toggle row and animates in
+ * when the overlay is enabled. Purely additive — no other page uses it. */
+.telemetry-fields {
+    padding: 4px 0 12px;
+    border-bottom: none;
+}
+.telemetry-fields-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-top: 4px;
+}
+.telemetry-fields-grid .checkbox-item {
+    padding: 8px 14px;
+    font-size: 12px;
+    user-select: none;
+}
 
 /* === M3 OUTLINED TEXT FIELD ====================================
  * SOTA input pattern used by BYD Cloud and any future credential / data-entry

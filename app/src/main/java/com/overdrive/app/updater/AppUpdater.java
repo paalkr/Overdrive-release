@@ -612,6 +612,57 @@ public class AppUpdater {
                         return;
                     }
 
+                    // VERSION-NEWER OFFER (checked BEFORE the timestamp gate, like
+                    // the cross-channel offer above). The timestamp baseline records
+                    // "when we last CHECKED", not the updated_at of the build the
+                    // user is actually running — so on a rolling tag (braveheart) a
+                    // user who sideloaded/flashed an OLDER APK, or whose baseline got
+                    // seeded/poisoned to the current-remote updated_at (first-run seed
+                    // below, the out-of-band reseed, or a failed install that rolled
+                    // the baseline forward to remote), is PERMANENTLY suppressed by
+                    // the updated_at compare even though a strictly-newer build is
+                    // live. Guard against that with a baseline-INDEPENDENT check: if
+                    // the remote label parses to a strictly-higher numeric version
+                    // than the running build, offer it unconditionally. This is
+                    // positive-only (it can only ADD an offer, never suppress one) so
+                    // it can't cause downgrade-spam; a same-or-lower remote version —
+                    // including an in-place re-upload that keeps the same version but
+                    // bumps updated_at — falls through to the timestamp path, which
+                    // already handles that case correctly. Both numbers must parse
+                    // (numericVersion returns "" for a bare/unknown label) and belong
+                    // to THIS channel, or we skip the shortcut and defer to timestamp.
+                    //
+                    // Compare against getDisplayVersion() — the VERSION_FILE-first
+                    // label — NOT getInstalledVersion() (raw BuildConfig). On a
+                    // rolling tag the compiled versionName may stay pinned across
+                    // re-uploads (it is pinned at 33.0 today), so BuildConfig would
+                    // report a stale number and this shortcut would RE-OFFER the
+                    // just-installed build forever. VERSION_FILE is advanced ONLY on
+                    // pm-install success (persistVersionToFile on the rc==0 path) to
+                    // the real filename-derived label, and restored on failure, so it
+                    // faithfully tracks what actually landed. A fresh sideload (no
+                    // VERSION_FILE) falls back to the BuildConfig identity, which is
+                    // then the user's true flashed version — still correct for the
+                    // strand case. getDisplayVersion always yields a label for the
+                    // running channel (VERSION_FILE is channel-guarded to "" on a
+                    // cross-channel value, then it drops to BuildConfig), so the
+                    // channel check below holds.
+                    String remoteNumeric = numericVersion(remoteVersion);
+                    String installedLabel = getDisplayVersion(context);
+                    String installedNumeric =
+                            (channelOfLabel(installedLabel) != null
+                                    && channel.equals(channelOfLabel(installedLabel)))
+                                    ? numericVersion(installedLabel) : "";
+                    if (!remoteNumeric.isEmpty() && !installedNumeric.isEmpty()
+                            && isNewerVersion(installedNumeric, remoteNumeric)) {
+                        Log.i(TAG, "Version-newer offer (installed " + installedNumeric
+                                + " < remote " + remoteNumeric + ") — offering " + remoteVersion
+                                + " regardless of timestamp baseline");
+                        runCallback(() -> callback.onUpdateAvailable(
+                                currentVersion, remoteVersion, releaseNotes));
+                        return;
+                    }
+
                     // Update detection: compare asset updated_at timestamp only.
                     // Version comparison is unreliable since versionName may not be bumped
                     // when the APK is replaced on the same release tag.
@@ -1033,6 +1084,184 @@ public class AppUpdater {
         });
     }
 
+    // ==================== COMPANION APK INSTALL (OverDrive Launcher, WP-H) ====================
+    //
+    // Silent install of a SEPARATE companion package (com.overdrive.launcher)
+    // from its OWN GitHub release track. This is fully ADDITIVE and REUSES the
+    // download + `pm install` primitives of the core self-update path
+    // ({@link #firstApkAsset}, {@link #buildClient}, {@link #downloadApkOkHttp} /
+    // {@link #buildDownloadCommand}, {@link #runShell}), but deliberately does
+    // NOT touch ANY of core's self-update bookkeeping:
+    //   - no {@link #stopAllDaemons()} / kill cascade (we are NOT replacing
+    //     OURSELVES, so no core process needs to die),
+    //   - no per-channel baseline / VERSION_FILE / PREF_JUST_UPDATED writes
+    //     (those track CORE's version, not the companion's),
+    //   - no `am start` relaunch of MainActivity.
+    // `pm install -r` of a DIFFERENT package never kills core's process, so the
+    // simple synchronous flow the pre-daemon app-process path used is sufficient
+    // and safe from either UID (runShell tunnels through the ADB daemon launcher
+    // when the app UID can't write /data/local/tmp). The core self-update
+    // methods ({@link #downloadAndInstall} / {@link #runDetachedInstall}) are
+    // left BYTE-IDENTICAL by this addition.
+    private static final String COMPANION_APK_PATH =
+            "/data/local/tmp/overdrive_companion.apk";
+
+    /** No-op shell callback for fire-and-forget cleanup commands. */
+    private static final com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback NOOP_SHELL =
+            new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                @Override public void onLog(String m) {}
+                @Override public void onLaunched() {}
+                @Override public void onError(String e) {}
+            };
+
+    /**
+     * Resolve, download, and silently install a companion APK from a GitHub
+     * release track that is INDEPENDENT of core's update channels. Runs on the
+     * shared {@link #executor}. The companion (e.g. {@code com.overdrive.launcher})
+     * is a fully optional add-on: this method has no side effect on core's own
+     * version/state, and core behaves identically whether or not it is ever
+     * called.
+     *
+     * <p>Serializes against the core self-update via the SAME process-wide
+     * {@link #tryBeginInstall()} gate so a companion install and a core update
+     * can't race the shared {@code /data/local/tmp} staging + {@code pm install}.
+     *
+     * @param repo     {@code "owner/name"} GitHub repo of the companion release
+     *                 track (parameterized — the companion ships separately from
+     *                 core, so its repo/tag are supplied by the caller)
+     * @param tag      release tag to install (e.g. {@code "prod"})
+     * @param callback progress / success / error surface — SAME contract as the
+     *                 core install ({@link InstallCallback})
+     */
+    public void installCompanionApk(String repo, String tag, InstallCallback callback) {
+        cancelled = false;
+        executor.execute(() -> {
+            boolean gateHeld = false;
+            try {
+                if (repo == null || repo.isEmpty() || tag == null || tag.isEmpty()) {
+                    postInstallError(callback, "No companion release configured");
+                    return;
+                }
+                if (!tryBeginInstall()) {
+                    postInstallError(callback, "Another install is already in progress");
+                    return;
+                }
+                gateHeld = true;
+
+                // Step 1: resolve the first APK asset on the companion release.
+                // Reuses the exact GitHub-release asset resolution the core path
+                // uses (firstApkAsset), just against the companion repo/tag.
+                postProgress(callback, "Resolving launcher release...");
+                String apiUrl = "https://api.github.com/repos/" + repo
+                        + "/releases/tags/" + tag;
+                OkHttpClient client = buildClient(15, 15);
+                Request request = new Request.Builder()
+                        .url(apiUrl)
+                        .header("Accept", "application/vnd.github.v3+json")
+                        .build();
+                String downloadUrl;
+                try (Response response = client.newCall(request).execute()) {
+                    if (!response.isSuccessful()) {
+                        postInstallError(callback, "GitHub API error: HTTP " + response.code());
+                        return;
+                    }
+                    JSONObject release = new JSONObject(response.body().string());
+                    String[] apk = firstApkAsset(release.optJSONArray("assets"));
+                    if (apk == null) {
+                        postInstallError(callback, "No APK found in launcher release");
+                        return;
+                    }
+                    downloadUrl = apk[0];
+                }
+
+                // Step 2: download to a companion-specific path (NEVER the core
+                // APK_PATH, so a concurrent core update and this can't clobber
+                // each other's staged bytes). Same two transfer paths as the
+                // core install: direct OkHttp when we can write /data/local/tmp
+                // (daemon UID), else the ADB-tunnelled shell download.
+                postProgress(callback, "Downloading launcher...");
+                runCallback(() -> callback.onDownloadProgress(-1));
+                final String[] dlResult = {null};
+                if (canWriteLocalTmp()) {
+                    try {
+                        downloadApkOkHttp(downloadUrl, COMPANION_APK_PATH, callback);
+                        dlResult[0] = "OK";
+                    } catch (Exception e) {
+                        dlResult[0] = "ERROR: " + (e.getMessage() == null ? "download failed" : e.getMessage());
+                    }
+                } else {
+                    final boolean[] dlDone = {false};
+                    String downloadCmd = buildDownloadCommand(downloadUrl, COMPANION_APK_PATH);
+                    runShell(downloadCmd, new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                        @Override public void onLog(String m) { dlResult[0] = m; }
+                        @Override public void onLaunched() { dlDone[0] = true; synchronized (dlDone) { dlDone.notify(); } }
+                        @Override public void onError(String e) { dlResult[0] = "ERROR: " + e; dlDone[0] = true; synchronized (dlDone) { dlDone.notify(); } }
+                    });
+                    synchronized (dlDone) { if (!dlDone[0]) dlDone.wait(300000); }
+                }
+
+                if (cancelled) {
+                    runShell("rm -f " + COMPANION_APK_PATH, NOOP_SHELL);
+                    postInstallError(callback, "Cancelled");
+                    return;
+                }
+                String dlOutput = dlResult[0] != null ? dlResult[0] : "";
+                if (dlOutput.startsWith("ERROR") || !dlOutput.contains("OK")) {
+                    postInstallError(callback, "Download failed: " + dlOutput);
+                    return;
+                }
+                runCallback(() -> callback.onDownloadProgress(100));
+
+                // Step 3: size sanity check (same >=1MB floor as the core path).
+                final boolean[] szDone = {false};
+                final String[] szResult = {null};
+                runShell("stat -c%s " + COMPANION_APK_PATH + " 2>/dev/null || echo 0",
+                        new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                    @Override public void onLog(String m) { szResult[0] = m.trim(); }
+                    @Override public void onLaunched() { szDone[0] = true; synchronized (szDone) { szDone.notify(); } }
+                    @Override public void onError(String e) { szResult[0] = "0"; szDone[0] = true; synchronized (szDone) { szDone.notify(); } }
+                });
+                synchronized (szDone) { if (!szDone[0]) szDone.wait(10000); }
+                long fileSize = 0;
+                try { fileSize = Long.parseLong(szResult[0].trim()); } catch (Exception ignored) {}
+                if (fileSize < 1_000_000) {
+                    runShell("rm -f " + COMPANION_APK_PATH, NOOP_SHELL);
+                    postInstallError(callback, "Invalid APK (size: " + fileSize + ")");
+                    return;
+                }
+
+                // Step 4: `pm install -r` the companion. NO daemon kill, NO
+                // relaunch, NO baseline writes — this replaces a DIFFERENT
+                // package, so core keeps running untouched.
+                postProgress(callback, "Installing launcher...");
+                final boolean[] done = {false};
+                final String[] result = {null};
+                String installCmd = "pm install -r " + COMPANION_APK_PATH
+                        + "; rm -f " + COMPANION_APK_PATH;
+                runShell(installCmd, new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                    @Override public void onLog(String m) { Log.i(TAG, "Companion install: " + m); result[0] = m; }
+                    @Override public void onLaunched() { done[0] = true; synchronized (done) { done.notify(); } }
+                    @Override public void onError(String e) { result[0] = "ERROR: " + e; done[0] = true; synchronized (done) { done.notify(); } }
+                });
+                synchronized (done) { if (!done[0]) done.wait(120000); }
+
+                String output = result[0] != null ? result[0] : "";
+                if (output.toLowerCase().contains("success")) {
+                    postProgress(callback, "Launcher installed.");
+                    runCallback(callback::onSuccess);
+                } else {
+                    runShell("rm -f " + COMPANION_APK_PATH, NOOP_SHELL);
+                    postInstallError(callback, "Install failed: " + output);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Companion install error: " + e.getMessage());
+                postInstallError(callback, e.getMessage());
+            } finally {
+                if (gateHeld) endInstall();
+            }
+        });
+    }
+
     /**
      * Build a shell command that downloads a URL to a file path.
      * Uses Java's URL class via a shell one-liner (no curl/wget dependency).
@@ -1373,6 +1602,10 @@ public class AppUpdater {
         if (!safePriorTs.isEmpty()) {
             script.append("  echo '").append(safePriorTs).append("' > ")
                   .append(timestampFileForChannel(safeChannel)).append("\n");
+            // World-readable so the app process (UID 10xxx) reads the same
+            // restored baseline the daemon (UID 2000) just wrote — matches the
+            // saveLastUpdateTimestamp / VERSION_FILE chmod contract.
+            script.append("  chmod 644 ").append(timestampFileForChannel(safeChannel)).append(" 2>/dev/null\n");
         } else {
             script.append("  rm -f ").append(timestampFileForChannel(safeChannel)).append("\n");
         }
@@ -1654,14 +1887,26 @@ public class AppUpdater {
         // the lock between rm and pkill.
         //
         // Per-daemon disable sentinels remain set after this returns; the
-        // subsequent install script (buildInstallScript) clears them right
-        // before `am start`.
+        // subsequent install script (buildInstallScript) clears the CORE ones
+        // right before `am start`. The OPTIONAL ones (telegram, zrok, …) are
+        // deliberately left in place so a durable user stop survives the update.
+        //
+        // The telegram sentinel is written ONLY IF ABSENT (`[ -f ] || echo`)
+        // rather than with a plain `>`. A clobbering write destroyed the
+        // distinction the ACC-off auto-start gate depends on: it reads the
+        // sentinel's TEXT to tell a machine stop ("stopAllDaemons sweep" — safe
+        // to disregard) from a durable user stop ("disabled by ui"). Overwriting
+        // a pre-existing "disabled by ui" made a real user stop indistinguishable
+        // from our own, and honouring the text then left a parked-only bot unable
+        // to auto-start ever again after any update. Preserving the original text
+        // keeps both readings correct with no ambiguity to resolve downstream.
         String sweepScript =
                 "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/zrok.disabled\n" +
                 "chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null\n" +
                 "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
-                "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled\n" +
+                "[ -f /data/local/tmp/telegram_bot_daemon.disabled ] || "
+                + "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/telegram_bot_daemon.disabled 2>/dev/null\n" +
                 "rm -f /data/local/tmp/cam_watchdog.pid 2>/dev/null\n" +
                 "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/start_acc_sentry.sh /data/local/tmp/start_zrok.sh /data/local/tmp/start_telegram.sh 2>/dev/null\n" +
@@ -1900,7 +2145,7 @@ public class AppUpdater {
             final String src = UPDATE_TIMESTAMP_FILE;
             final String dst = timestampFileForChannel(channel);
             runShell("[ -f " + src + " ] && [ ! -f " + dst + " ] && cp " + src + " " + dst
-                            + " 2>/dev/null; echo done",
+                            + " && chmod 644 " + dst + " 2>/dev/null; echo done",
                     new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
                         @Override public void onLog(String m) {}
                         @Override public void onLaunched() {}
@@ -1941,27 +2186,42 @@ public class AppUpdater {
     private String getLastUpdateTimestamp(String channel) {
         String prefKey = prefKeyForChannel(channel);
         String tsFile = timestampFileForChannel(channel);
-        // Try SharedPreferences first (fast)
-        String ts = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(prefKey, "");
-        if (!ts.isEmpty()) return ts;
 
-        // Fall back to filesystem (survives app reinstall)
+        // FILE-FIRST — the world-readable /data/local/tmp file is the single
+        // cross-UID source of truth, exactly like persistedGithubVersion() does
+        // for the display label. The daemon (UID 2000) owns the install and
+        // advances this baseline; the app process (UID 10xxx) runs its OWN
+        // MainActivity update check with its OWN per-UID SharedPreferences.
+        //
+        // The old order (SP-first, file only when SP empty) meant that after a
+        // daemon-side install the app's stale-but-non-empty SP won, the freshly
+        // advanced file was never consulted, apkUpdated stayed true, and the
+        // popup re-offered the just-installed version on every check — forever.
+        // Every path that writes SP also writes the file (first-run seed +
+        // install both save both), so the file is always at least as current as
+        // any per-UID SP. Read it first and reconcile SP from it.
         try {
             File f = new File(tsFile);
             if (f.exists()) {
                 java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
-                ts = r.readLine();
+                String ts = r.readLine();
                 r.close();
                 if (ts != null && !ts.isEmpty()) {
-                    // Sync back to SharedPreferences
+                    // Reconcile this process's SP cache so a same-process
+                    // repeat read is fast and the two never diverge.
                     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                             .edit().putString(prefKey, ts).apply();
                     return ts;
                 }
             }
         } catch (Exception ignored) {}
-        return "";
+
+        // File absent/unreadable — fall back to this process's SP cache. This
+        // covers the pre-first-install state and any ROM where the app UID
+        // can't read the file; in both cases SP-only degrades to per-UID
+        // detection, which is still correct within a single process.
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(prefKey, "");
     }
 
 
@@ -1981,7 +2241,17 @@ public class AppUpdater {
         String safeTs = isoSafe(timestamp);
         if (safeTs.isEmpty()) return; // don't write a malformed/empty baseline file
         try {
-            runShell("echo '" + safeTs + "' > " + tsFile,
+            // chmod 644 so the OTHER UID can read it cross-process. The daemon
+            // (UID 2000) owns the install and advances this baseline, but the
+            // app process (UID 10xxx) runs its own MainActivity update check
+            // and reads this file as the shared source of truth (see
+            // getLastUpdateTimestamp). Without the chmod the daemon's write
+            // lands mode 0600 (unreadable by the app UID), so the app keeps
+            // reading its own stale per-UID SharedPreferences baseline and
+            // re-offers the just-installed version forever. Mirrors the
+            // VERSION_FILE writes, which chmod 644 for the same reason.
+            runShell("echo '" + safeTs + "' > " + tsFile
+                            + "; chmod 644 " + tsFile + " 2>/dev/null",
                     new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
                 @Override public void onLog(String m) {}
                 @Override public void onLaunched() {}

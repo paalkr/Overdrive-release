@@ -58,7 +58,8 @@ class RoadSenseOverlayService : Service() {
     private var themedCtx: Context? = null
 
     @Volatile private var expanded = false
-    private var pollRunnable: Runnable? = null
+    // Written from the IO thread (self-stop) and the main thread (start/destroy).
+    @Volatile private var pollRunnable: Runnable? = null
 
     // Render change-gate (perf): the poll loop posts a main-thread render() every
     // POLL_MS. render() mutates the visible pill (setColorFilter/setText/setRotation
@@ -69,7 +70,12 @@ class RoadSenseOverlayService : Service() {
     // when nothing visible changed) but FOLDS IN the time-derived `stale` flag (so a
     // quiet daemon still transitions Scanning→Idle past STALE_MS) and the pending
     // hazardId (so the rising-edge force-expand still fires). Read off the IO thread.
-    private var lastRenderSig: String? = null
+    // @Volatile: written on the IO poll thread (the change-gate) AND on the main
+    // thread by createOverlay(), which nulls it to force a repaint of a freshly
+    // inflated view. Without volatile the IO thread can keep a cached signature and
+    // leave a re-inflated pill (relocalize / onConfigurationChanged, which call
+    // createOverlay with no following render) showing all-default values.
+    @Volatile private var lastRenderSig: String? = null
 
     // Bound views (re-bound on each (re)inflate).
     private var pillRoot: View? = null
@@ -108,11 +114,23 @@ class RoadSenseOverlayService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         ioThread = android.os.HandlerThread("roadsense-overlay-io").also { it.start() }
         ioHandler = Handler(ioThread!!.looper)
-        createOverlay()
-        startPolling()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // The daemon can launch us via `am`, and START_STICKY can recreate us later.
+        // Check the complete lifecycle policy before creating the window so a stale
+        // overlay cannot flash between onCreate and onStartCommand.
+        val shouldShow = try {
+            RoadSenseConfig.snapshot(forceReload = true).overlayShouldShow()
+        } catch (t: Throwable) {
+            Log.w(TAG, "visibility config unavailable - stopping: ${t.message}")
+            false
+        }
+        if (!shouldShow) {
+            Log.i(TAG, "RoadSense disabled or overlay hidden - stopping")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         // Self-guard the overlay permission here too (not only at the app-side
         // startIfPermitted call site): the daemon launches us via `am` (startFromDaemon)
         // on ACC-on + feature-on, which bypasses the app-side canDrawOverlays gate. If
@@ -123,17 +141,55 @@ class RoadSenseOverlayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        if (overlayView == null) {
+            createOverlay()
+            // addView failure nulls overlayView; bail rather than leave a
+            // foreground service with no window.
+            if (overlayView == null) {
+                Log.w(TAG, "overlay window could not be created — stopping")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            instance = this
+        }
+        // Unconditional: the poller can have self-terminated on a config flip
+        // while the window survived. startPolling() is itself idempotent.
+        startPolling()
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        if (instance === this) instance = null
         pollRunnable?.let { ioHandler?.removeCallbacks(it) }
+        pollRunnable = null
         ioThread?.quitSafely()
         ioThread = null
         ioHandler = null
         stopArrowPulse()
         removeOverlay()
+    }
+
+    /** Re-inflate the overlay against the current app locale/theme. Called when the
+     *  user switches the in-app language while the overlay is live — a bare Service
+     *  doesn't get onConfigurationChanged for an AppCompat per-app locale change, so
+     *  the pill would otherwise stay in the previous language until the next restart.
+     *  Mirrors onConfigurationChanged's rebuild (arrow-pulse reset + re-inflate). */
+    private fun relocalize() {
+        handler.post { rebuildOverlay() }
+    }
+
+    /** Re-inflate in place. Stops the service if the new window can't be added,
+     *  rather than leaving a foreground notification with nothing on screen. */
+    private fun rebuildOverlay() {
+        if (overlayView == null) return
+        stopArrowPulse()
+        removeOverlay()
+        createOverlay()
+        if (overlayView == null) {
+            Log.w(TAG, "overlay rebuild failed — stopping")
+            stopSelf()
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -148,7 +204,7 @@ class RoadSenseOverlayService : Service() {
         // "already running, same severity" fast-path never rebinds, so the new arrow
         // stops pulsing entirely after a single rotation. Cancelling resets the
         // pulse state so the next render rebuilds it against the freshly-bound views.
-        if (overlayView != null) { stopArrowPulse(); removeOverlay(); createOverlay() }
+        rebuildOverlay()
     }
 
     // ── Window lifecycle (mirrors StatusOverlayService) ────────────────────────
@@ -373,6 +429,17 @@ class RoadSenseOverlayService : Service() {
             interpolator = android.view.animation.AccelerateDecelerateInterpolator()
             val glow = hazardGlow
             addUpdateListener { a ->
+                // NOTE: a ~15fps throttle was tried here and REVERTED. Because the
+                // throttle drops whichever tick happens to be last, it frequently
+                // swallowed the animator's FINAL frame, leaving arrow/glow frozen at
+                // an arbitrary mid-breath scale/alpha on a severity change (the
+                // hazard-cleared path is covered by stopArrowPulse's idle restore,
+                // but a severity flip is not). It also read as visible stepping at
+                // the shortest period (360ms = nearest hazard, most urgent), giving
+                // only ~5 applied steps per half-breath — the opposite of the
+                // "smoothly intensifies" beacon the surrounding retarget logic
+                // exists to protect. Any future throttle must snap to the final
+                // value on cancel and stay well above the 360ms-period step budget.
                 val s = a.animatedValue as Float
                 arrow.scaleX = s
                 arrow.scaleY = s
@@ -408,28 +475,40 @@ class RoadSenseOverlayService : Service() {
     // ── Poll + render ──────────────────────────────────────────────────────────
 
     private fun startPolling() {
+        // Idempotent: a second post would orphan the first loop.
+        if (pollRunnable != null) return
         // The poll loop lives on the IO thread: it does the UCM disk read/parse,
         // then posts the pure view-update onto the main thread. Keeps forceReload
         // off the UI looper (audit UI #3).
         val r = object : Runnable {
             override fun run() {
-                // Visibility self-guard: the user can hide the overlay (roadSense.
-                // overlayVisible=false) while we're already running — e.g. the daemon
-                // launched us on ACC-on and the user then flips the toggle, or a remote
-                // (tunnel/browser) write lands. The app-side onResume/keepalive gate only
-                // runs when the Activity is touched, so without this a daemon-launched
-                // overlay would linger on screen after being hidden. readState() already
-                // refreshed the UCM cache this tick, so this is a cache-fresh read (no
-                // extra disk hit). Stop cleanly — startFromDaemon/startIfPermitted will
-                // bring us back if the user re-enables.
-                if (!RoadSenseConfig.snapshot().overlayVisible) {
+                // Lifecycle self-guard: either the RoadSense master switch or the
+                // overlay preference can turn this window off while it is running.
+                // This also covers remote/tunnel writes when no Activity callback runs.
+                if (!RoadSenseConfig.snapshot().overlayShouldShow()) {
+                    // Clear before stopping: the loop ends here, and a start that
+                    // arrives before stopSelf() completes must be able to re-post.
+                    pollRunnable = null
                     handler.post { stopSelf() }
                     return
                 }
                 val state = readState()
                 val warnMode = currentWarnMode()
+
                 // Skip the main-thread render when nothing render-relevant changed —
                 // avoids a continuous ~2.5Hz pill redraw fighting the map's frames.
+                //
+                // NOTE: an idle-detach was tried here (remove the window after N
+                // seconds with no hazard, re-add on the next hazard) and REVERTED.
+                // It cost real capability for a small compositor saving: the pill is
+                // the feature's only "am I alive / calibrating" affordance AND the
+                // host for the quick-toggles and the drag-to-reposition handle, and
+                // nothing but a hazard could bring it back — so a clean drive went
+                // permanently dark with no way for the user to re-summon it. It also
+                // mis-handled a mid-drive service restart (START_STICKY / a daemon
+                // re-launch on a regime edge), where the grace window elapsed during
+                // the cold UCM read and the overlay then stayed hidden for the whole
+                // trip. Do not re-add without a user-reachable re-summon path.
                 val sig = renderSignature(state, warnMode)
                 if (sig != lastRenderSig) {
                     lastRenderSig = sig
@@ -729,15 +808,46 @@ class RoadSenseOverlayService : Service() {
     }
 
     private fun themedContext(): Context {
-        val mode = androidx.appcompat.app.AppCompatDelegate.getDefaultNightMode()
-        val uiNight = when (mode) {
-            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES -> Configuration.UI_MODE_NIGHT_YES
-            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO -> Configuration.UI_MODE_NIGHT_NO
-            else -> return this
-        }
         val cfg = Configuration(resources.configuration)
-        cfg.uiMode = (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or uiNight
-        return createConfigurationContext(cfg)
+        var overridden = false
+
+        // Day/night: a bare Service runs against the system configuration, so
+        // AppCompatDelegate.setDefaultNightMode() doesn't reach the overlay unless
+        // we mirror it onto the config here (matches StatusOverlayService).
+        val mode = androidx.appcompat.app.AppCompatDelegate.getDefaultNightMode()
+        when (mode) {
+            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES -> {
+                cfg.uiMode = (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                        Configuration.UI_MODE_NIGHT_YES
+                overridden = true
+            }
+            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO -> {
+                cfg.uiMode = (cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                        Configuration.UI_MODE_NIGHT_NO
+                overridden = true
+            }
+            else -> { /* follow-system — leave uiMode alone */ }
+        }
+
+        // Locale: the app's in-app language (AppCompatDelegate.setApplicationLocales,
+        // set from LocaleManager in OverdriveApplication) is applied to Activities but
+        // NOT to a bare Service — its Resources stay on the SYSTEM locale, so getString()
+        // for the roadsense_* pill/caption strings would ignore the user's chosen
+        // language. Pull the app locale list and set it on the config so the overlay
+        // resolves the values-<lang>/ strings the rest of the app uses.
+        val appLocales = androidx.appcompat.app.AppCompatDelegate.getApplicationLocales()
+        if (!appLocales.isEmpty) {
+            val locale = appLocales[0]
+            if (locale != null) {
+                val locList = android.os.LocaleList(locale)
+                android.os.LocaleList.setDefault(locList)
+                cfg.setLocales(locList)
+                overridden = true
+            }
+        }
+
+        // No overrides (follow-system night + auto locale) → keep the service context.
+        return if (overridden) createConfigurationContext(cfg) else this
     }
 
     private fun startForegroundCompat() {
@@ -783,6 +893,17 @@ class RoadSenseOverlayService : Service() {
     }
 
     companion object {
+        /** Live instance while the overlay window is up, for the locale-change
+         *  relocalize hook. @Volatile: written on the main thread (onCreate/onDestroy),
+         *  read from the language-picker call site. */
+        @Volatile private var instance: RoadSenseOverlayService? = null
+
+        /** Re-inflate the running overlay in the newly-selected app language. No-op if
+         *  the overlay isn't currently up. Call after AppCompatDelegate.setApplicationLocales. */
+        fun relocalizeIfRunning() {
+            instance?.relocalize()
+        }
+
         private const val TAG = "RoadSense/Overlay"
         private const val CHANNEL = "roadsense_overlay"
         private const val NOTIFICATION_ID = 9986
@@ -806,9 +927,22 @@ class RoadSenseOverlayService : Service() {
         // day/night theme via themeColor()/colorDim() (R.color.status_*), matching
         // StatusOverlayService so the overlay tracks the active theme.
 
-        /** Start only if overlay permission is granted (StatusOverlayService gate).
+        /** Start only if RoadSense wants the overlay and permission is granted.
          *  This is the APP-process path (MainActivity / DaemonKeepaliveService). */
-        fun startIfPermitted(context: Context): Boolean {
+        @JvmOverloads
+        fun startIfPermitted(context: Context, knownShouldShow: Boolean? = null): Boolean {
+            // Reuse a decision the caller already computed — syncWithConfig reads
+            // the config, and re-reading here doubled a disk read + JSON parse.
+            val shouldShow = knownShouldShow ?: try {
+                RoadSenseConfig.snapshot(forceReload = true).overlayShouldShow()
+            } catch (t: Throwable) {
+                Log.w(TAG, "visibility config unavailable - not starting: ${t.message}")
+                false
+            }
+            if (!shouldShow) {
+                Log.i(TAG, "RoadSense disabled or overlay hidden - not starting")
+                return false
+            }
             if (!Settings.canDrawOverlays(context)) {
                 Log.w(TAG, "no overlay permission — not starting")
                 return false
@@ -819,6 +953,31 @@ class RoadSenseOverlayService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, RoadSenseOverlayService::class.java))
+        }
+
+        /**
+         * Reconcile the app-side service with the persisted master + visibility flags.
+         * Native UI entry points use this so they cannot disagree about lifecycle.
+         */
+        fun syncWithConfig(context: Context): Boolean {
+            val shouldShow = try {
+                RoadSenseConfig.snapshot(forceReload = true).overlayShouldShow()
+            } catch (t: Throwable) {
+                Log.w(TAG, "visibility config unavailable - stopping: ${t.message}")
+                false
+            }
+            return syncWithConfig(context, shouldShow)
+        }
+
+        /** Reconcile with a pre-computed decision, for callers that already read the
+         *  config off the main thread (snapshot(forceReload) hits disk). */
+        fun syncWithConfig(context: Context, shouldShow: Boolean): Boolean {
+            return if (shouldShow) {
+                startIfPermitted(context, shouldShow)
+            } else {
+                stop(context)
+                false
+            }
         }
 
         /** Fully-qualified component for the daemon's `am` launch. */
@@ -837,19 +996,40 @@ class RoadSenseOverlayService : Service() {
          * Fire-and-forget (no waitFor) — runs on the daemon tick thread.
          */
         fun startFromDaemon() {
-            execAm("am start-foreground-service -n $COMPONENT")
+            execAm("am", "start-foreground-service", "-n", COMPONENT)
         }
 
         /** Stop the overlay FROM THE DAEMON (ACC-off / feature-off). */
         fun stopFromDaemon() {
-            execAm("am stopservice -n $COMPONENT")
+            execAm("am", "stopservice", "-n", COMPONENT)
         }
 
-        private fun execAm(cmd: String) {
-            try {
-                Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
-            } catch (t: Throwable) {
-                Log.w(TAG, "exec failed [$cmd]: ${t.message}")
+        /** Serialized + waitFor so a stop and a following start can't reach
+         *  ActivityManager out of order (fast master OFF→ON would kill the overlay). */
+        private val amExecutor: java.util.concurrent.ExecutorService =
+            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread(r, "roadsense-overlay-am").apply { isDaemon = true }
+            }
+
+        private fun execAm(vararg argv: String) {
+            amExecutor.execute {
+                var proc: Process? = null
+                try {
+                    // No shell: destroy() must target `am` itself, not a wrapper.
+                    proc = Runtime.getRuntime().exec(argv)
+                    // Bounded: an `am` blocked on a wedged system_server would
+                    // otherwise park this single thread and stall every later call.
+                    if (!proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                        Log.w(TAG, "exec timed out [${argv.joinToString(" ")}]")
+                        proc.destroy()
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "exec failed [${argv.joinToString(" ")}]: ${t.message}")
+                } finally {
+                    try { proc?.inputStream?.close() } catch (_: Throwable) {}
+                    try { proc?.errorStream?.close() } catch (_: Throwable) {}
+                    try { proc?.outputStream?.close() } catch (_: Throwable) {}
+                }
             }
         }
     }

@@ -37,6 +37,38 @@ class WebViewFragment : Fragment() {
         const val ARG_PAGE_PATH = "page_path"
         private const val KEY_SAVED_URL = "saved_url"
 
+        // ── Key-mapping capture bridge ────────────────────────────────────
+        // The Key Mapping "press a button to capture it" box lives in the
+        // WebView, but hardware buttons hit the NATIVE AccessibilityService
+        // (onKeyEvent) — they never become WebView DOM keydown events. So the
+        // dispatcher, while the page is in capture mode, forwards the keycode to
+        // the live WebView here; onCapturedKey(...) pushes it into the page via
+        // evaluateJavascript (window.KM.onNativeKey). captureArmed lets the
+        // dispatcher cheaply know whether to forward+consume (during capture) vs.
+        // run the normal mapping. Set by the page through
+        // AndroidBridge.setKeyCapture(bool).
+        @Volatile private var liveWebView: WebView? = null
+        @JvmStatic @Volatile var captureArmed: Boolean = false
+            private set
+
+        /** Called by the a11y dispatcher (app process) when a hardware key
+         *  arrives during capture. Pushes the keycode into the page on the UI
+         *  thread. No-op if no page is live. Best-effort. */
+        @JvmStatic
+        fun onCapturedKey(keyCode: Int) {
+            val wv = liveWebView ?: return
+            wv.post {
+                try {
+                    wv.evaluateJavascript(
+                        "window.KM && window.KM.onNativeKey && window.KM.onNativeKey(" + keyCode + ");",
+                        null)
+                } catch (_: Throwable) { /* page navigated away */ }
+            }
+        }
+
+        /** Page toggles capture mode via AndroidBridge.setKeyCapture(). */
+        @JvmStatic fun setCaptureArmed(armed: Boolean) { captureArmed = armed }
+
         // CDN strategy short-circuit. The fetch loop tries HTTP-proxy →
         // SOCKS-proxy → direct in order. On the head unit's mobile data
         // path each failing attempt eats up to (connect + read) ms, and
@@ -202,14 +234,18 @@ class WebViewFragment : Fragment() {
         '[data-app-shell="1"] #panelMap .map-overlay-actions { top: 14px !important; right: 14px !important; gap: 10px !important; }',
         '[data-app-shell="1"] .btn-map-float { width: 44px !important; height: 44px !important; }',
         '[data-app-shell="1"] .btn-map-float svg { width: 20px !important; height: 20px !important; }',
-        // Camera hotspot labels — clamp width and slightly shrink the
-        // negative offsets so labels don't clip the .seamless-camera-view
-        // when the WebView is in landscape windowed mode.
+        // Camera hotspot labels — keep a generous translated-label clamp,
+        // but preserve the page's paint-independent pill size and opposing
+        // left/right anchors. The former negative-offset rules set both
+        // horizontal edges after the page moved to right:/left: anchoring,
+        // squeezing LEFT/RIGHT down to an ellipsis on the head unit.
         '[data-app-shell="1"] .cam-hotspot .hotspot-label {',
-        '   max-width: 64px; white-space: nowrap; overflow: hidden;',
-        '   text-overflow: ellipsis; padding: 3px 7px; font-size: 9px; }',
-        '[data-app-shell="1"] .cam-hotspot[data-cam="4"] .hotspot-label { left: -34px !important; }',
-        '[data-app-shell="1"] .cam-hotspot[data-cam="2"] .hotspot-label { right: -34px !important; }',
+        '   max-width: 74px; white-space: nowrap; overflow: hidden;',
+        '   text-overflow: ellipsis; padding: 4px 6px; font-size: 11px; }',
+        '[data-app-shell="1"] .cam-hotspot[data-cam="4"] .hotspot-label {',
+        '   left: auto !important; right: calc(100% + 4px) !important; }',
+        '[data-app-shell="1"] .cam-hotspot[data-cam="2"] .hotspot-label {',
+        '   right: auto !important; left: calc(100% + 4px) !important; }',
 
         // === Page-specific carry-overs (kept from previous behaviour) ===
         '#safeLocMap { z-index: 1 !important; position: relative !important; overflow: hidden !important; }',
@@ -382,6 +418,9 @@ class WebViewFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         webView = view.findViewById(R.id.webView)
+        // Publish the live WebView so the key-mapping capture bridge can push
+        // native hardware keycodes into whatever page is showing.
+        liveWebView = webView
         loadingOverlay = view.findViewById(R.id.loadingOverlay)
         errorOverlay = view.findViewById(R.id.errorOverlay)
         btnRetry = view.findViewById(R.id.btnRetry)
@@ -405,8 +444,28 @@ class WebViewFragment : Fragment() {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
+            // allowFileAccess stays FALSE — the page never needs file:// and
+            // leaving it off keeps the local-file attack surface closed.
             settings.allowFileAccess = false
-            settings.allowContentAccess = false
+            // allowContentAccess MUST be true, and this is not optional for
+            // uploads to work at all.
+            //
+            // onShowFileChooser hands the WebView a content:// Uri from
+            // ACTION_GET_CONTENT. When the page then does
+            // `FileReader.readAsDataURL(input.files[0])`, the WebView itself has to
+            // resolve that content:// Uri through the ContentResolver to produce
+            // the bytes. With allowContentAccess=false that read is refused, so
+            // readAsDataURL never yields data and the upload silently never sends
+            // its POST — which is exactly the observed symptom: the picker opens,
+            // a file is chosen, and the daemon log shows only GET /api/audio/library
+            // with no POST ever arriving. Affects BOTH upload paths that use this
+            // idiom (audio-library.js and the screen-deterrent image in
+            // surveillance.js).
+            //
+            // This does NOT widen the page's reach: content:// access is limited to
+            // providers that have granted this app a URI permission — i.e. exactly
+            // the file the user just picked in the system picker.
+            settings.allowContentAccess = true
             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             // Respect server Cache-Control headers. The daemon serves HTML with no-store
             // and shared static assets (CSS/JS/fonts/icons, ~360KB total) with a 24h
@@ -418,8 +477,12 @@ class WebViewFragment : Fragment() {
             // Resolve background color from the active theme so the WebView's
             // outer chrome flips with light/dark mode.
             setBackgroundColor(resolveThemeBackground())
-            // Enable hardware acceleration for video playback
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            // WebView is already hardware-accelerated by default; promoting to
+            // LAYER_TYPE_HARDWARE allocates a persistent full-window GPU texture
+            // and adds a render-into-layer + composite pass on every invalidation
+            // (~10-30×/sec during live video). Removed: LAYER_TYPE_NONE is the
+            // correct default for continuously-animating content.
+            setLayerType(View.LAYER_TYPE_NONE, null)
 
             webViewClient = object : WebViewClient() {
                 
@@ -1121,15 +1184,13 @@ class WebViewFragment : Fragment() {
         fun syncRoadSenseOverlay(): String {
             return try {
                 val ctx = context ?: return "no_context"
+                // Read here (WebView worker): snapshot(forceReload) hits disk.
                 val shouldShow = com.overdrive.app.roadsense.config.RoadSenseConfig
                     .snapshot(forceReload = true).overlayShouldShow()
                 ctx.mainExecutor.execute {
                     try {
-                        if (shouldShow) {
-                            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.startIfPermitted(ctx)
-                        } else {
-                            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.stop(ctx)
-                        }
+                        com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
+                            .syncWithConfig(ctx, shouldShow)
                     } catch (e: Exception) {
                         android.util.Log.w("WebViewFragment", "syncRoadSenseOverlay apply failed: ${e.message}")
                     }
@@ -1167,6 +1228,19 @@ class WebViewFragment : Fragment() {
                 android.util.Log.w("WebViewFragment", "openHazardMap bridge failed: ${e.message}")
                 "error"
             }
+        }
+
+        /**
+         * Key Mapping capture toggle. The capture box calls this with true when
+         * "Capture a key" is armed and false when it disarms. While armed, the
+         * native AccessibilityService (KeyMapDispatcher) forwards the next
+         * hardware keycode into the page (window.KM.onNativeKey) and consumes it,
+         * instead of running the normal mapping — so a physical button that never
+         * reaches the WebView DOM can still be captured.
+         */
+        @android.webkit.JavascriptInterface
+        fun setKeyCapture(armed: Boolean) {
+            setCaptureArmed(armed)
         }
 
         @android.webkit.JavascriptInterface
@@ -1407,6 +1481,15 @@ class WebViewFragment : Fragment() {
         // Re-apply theme on resume so a user toggle while the page was
         // backgrounded is reflected without requiring a full reload.
         webView?.let { it.evaluateJavascript(buildThemeInjectJs(), null) }
+        // Android WebView versions used by older BYD head units do not always
+        // deliver a reliable visible-side Page Visibility event. Give pages an
+        // explicit lifecycle signal as well; stream.js deduplicates this with
+        // visibilitychange so only one decoder/socket is created.
+        webView?.evaluateJavascript(
+            "(function(){if(window.BYD&&BYD.stream&&BYD.stream.resumeAfterBackground){" +
+                "BYD.stream.resumeAfterBackground(true);}})();",
+            null
+        )
     }
 
     /**
@@ -1495,6 +1578,41 @@ class WebViewFragment : Fragment() {
     }
 
     override fun onPause() {
+        // Disarm key-capture when the keymap page leaves the foreground.
+        // captureArmed is a process-wide static that used to be cleared only in
+        // onDestroyView — arming capture then leaving the app (HOME / app-switch)
+        // left the a11y service (KeyMapDispatcher) consuming and swallowing every
+        // system-wide hardware key until the WebView resumed and the JS self-heal
+        // ran. Clearing it here bounds capture consumption to the foreground page.
+        if (captureArmed) {
+            captureArmed = false
+            // Mirror the reset into the page so its capturing flag + capture-box
+            // label reset too (best-effort — the page may already be gone). We
+            // prefer an explicit external setter if the page exposes one; else we
+            // fall back to toggling ONLY when the box is still armed so we never
+            // accidentally RE-arm capture on a page that already disarmed itself.
+            webView?.let { wv ->
+                wv.post {
+                    try {
+                        wv.evaluateJavascript(
+                            "(function(){try{" +
+                                "if(window.KM&&window.KM.setCaptureExternally){window.KM.setCaptureExternally(false);return;}" +
+                                "var b=document.getElementById('kmCaptureBox');" +
+                                "if(b&&b.classList&&b.classList.contains('armed')&&window.KM&&window.KM.toggleCapture){window.KM.toggleCapture();}" +
+                                "}catch(e){}})();",
+                            null)
+                    } catch (_: Throwable) { /* page navigated away */ }
+                }
+            }
+        }
+        // Native pause counterpart to the onResume resume signal: these head
+        // units don't always deliver the Page Visibility event, and webView
+        // .onPause() stops neither JS timers nor the socket.
+        webView?.evaluateJavascript(
+            "(function(){if(window.BYD&&BYD.stream&&BYD.stream.pauseForBackground){" +
+                "BYD.stream.pauseForBackground();}})();",
+            null
+        )
         webView?.onPause()
         super.onPause()
     }
@@ -1513,7 +1631,10 @@ class WebViewFragment : Fragment() {
             (wv.parent as? ViewGroup)?.removeView(wv)
             wv.destroy()
         }
+        // Drop the capture-bridge ref if it points at this (now-destroyed) view.
+        if (liveWebView === webView) liveWebView = null
         webView = null
+        captureArmed = false
         super.onDestroyView()
     }
 }

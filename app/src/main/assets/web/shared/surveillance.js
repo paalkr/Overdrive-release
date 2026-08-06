@@ -52,6 +52,8 @@ BYD.surveillance = {
         motionHeatmap: false,
         filterDebugLog: false,
         discardEmptyBrightMotionEvents: false,
+        discardEmptyMotionAtNight: false,
+        motionSalienceEnabled: false,
         // Per-quadrant sensitivity / zone overrides. Keys: Q0=front, Q1=right,
         // Q2=rear, Q3=left. Absent key = inherit global. The "Side-cam Boost"
         // UI writes to Q1 + Q3.
@@ -70,11 +72,25 @@ BYD.surveillance = {
         // (plain rolling 4-cam recording, no motion, no AI). Backward-compat:
         // installs that pre-date this key see the smart default.
         accOffMode: 'smart',
+        // Arm mode: 'lock' (arm on door-lock, disarm on unlock, 60s fallback when
+        // lock state is unreadable, default) | 'power' (arm immediately on
+        // power-off, disarm on power-on). Both honor safe locations + schedules.
+        armMode: 'lock',
+        // Operating mode: 'onAndOff' (default, full behaviour — keep-awake + post-OFF
+        // surveillance run after the car is off) | 'onOnly' (let the head unit sleep
+        // once parked; only-while-driving features run). Backward-compat: installs that
+        // pre-date this key see the onAndOff default. Read by every post-OFF daemon gate.
+        operatingMode: 'onAndOff',
         // Keep ONLY the USB/data rail powered after ACC OFF (e.g. to charge a phone
         // while parked). Default true (unchanged out-of-box behaviour); turning it
         // off lets just that rail sleep on the next ACC-OFF cycle to save the 12V
         // battery. Does NOT affect the cameras — parked surveillance is unaffected.
         keepUsbPowerOnAccOff: true,
+        // Low-power-while-parked master toggle (mirrors camera.surveillanceIdleThrottle
+        // + oemDashcam.idleThrottleWhenParked, which are driven together). Default
+        // false = today's behaviour (full idle frame rate). Hydrated from
+        // /api/settings/unified on load; persisted immediately on toggle.
+        lowPowerWhileParked: false,
         // OEM dashcam surveillance mode mirror — 'off' | 'continuous' | 'smart'.
         // Hydrated by loadOemDashcam() from /api/oem-dashcam/config and
         // pushed back to the same endpoint on Apply (oem-tab branch in
@@ -159,17 +175,33 @@ BYD.surveillance = {
     },
 
     async init() {
+        // loadConfig() must land FIRST and alone — every loader below reads or
+        // writes this.config, and updateUI() renders from it.
+        //
+        // The rest are idempotent reads of independent endpoints, so they run
+        // in PARALLEL. They used to be seven sequential `await`s, which made
+        // first paint wait on 11 serial round-trips (loadConfig is itself a
+        // 3-deep chain and loadOemDashcam a 2-deep one). On a head unit where
+        // the storage endpoints take a few hundred ms each against a large
+        // library, that serialization — not any single slow call — is what made
+        // this page take seconds to become usable, with Apply disabled, the OEM
+        // picker dimmed and the Detection tab inert the whole time.
+        // Same fix recording.js already carries (see its init()): ~11 RTTs → ~3.
         await this.loadConfig();
-        await this.loadStorageStats();
-        await this.loadCameraFps();
-        await this.loadGeocoding();
-        // Sentry's own composition layout (independent of the dashcam layout).
-        await this.loadSurveillanceLayout();
-        // Dedicated OEM Dashcam tab — load the mode picker, telemetry
-        // toggle, status badge, and native DVR control on init so the
-        // user can land directly on the OEM tab and find populated state.
-        await this.loadOemDashcam();
-        await this.loadOemNativeDvr();
+        await Promise.all([
+            this.loadStorageStats(),
+            this.loadCameraFps(),
+            this.loadGeocoding(),
+            // Sentry's own composition layout (independent of the dashcam layout).
+            this.loadSurveillanceLayout(),
+            // Dedicated OEM Dashcam tab — load the mode picker, telemetry
+            // toggle, status badge, and native DVR control on init so the
+            // user can land directly on the OEM tab and find populated state.
+            this.loadOemDashcam(),
+            this.loadOemNativeDvr(),
+            // ACC-off surveillance telemetry overlay (own master + field selection).
+            this.loadSurvTelemetryOverlay(),
+        ]);
         this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
         this.startClock();
@@ -438,6 +470,27 @@ BYD.surveillance = {
         try {
             const resp = await fetch('/api/recordings/stats');
             const data = await resp.json();
+            // Recordings index is down — zeroed counters are not
+            // authoritative, so show "--" instead of claiming zero events.
+            // Flag it so the 10s poller backs off rather than issuing a
+            // permanent 6-req/min 503 stream at the daemon.
+            if (data.indexUnavailable) {
+                this._indexDown = true;
+                var sdIds = ['survStorageUsed', 'survStorageLimit'];
+                for (var si = 0; si < sdIds.length; si++) {
+                    var sel = document.getElementById(sdIds[si]);
+                    if (sel) sel.textContent = '--';
+                }
+                var sFill = document.getElementById('survStorageFill');
+                if (sFill) sFill.style.width = '0%';
+                // Same as recording.js: today's event count is only written in
+                // the success branch and would otherwise keep its "0 →"
+                // default, asserting no events today.
+                var sToday = document.getElementById('eventsToday');
+                if (sToday) sToday.textContent = '--';
+                return;
+            }
+            this._indexDown = false;
             if (data.success) {
                 const usedEl = document.getElementById('survStorageUsed');
                 const limitEl = document.getElementById('survStorageLimit');
@@ -979,8 +1032,13 @@ BYD.surveillance = {
             if (!this.hasUnsavedChanges) {
                 this.reloadConfig();
             }
-            this.loadStorageStats();
-            
+            // Back off to every 3rd tick (10s → 30s) while the recordings
+            // index is down, same rationale as recording.js.
+            this._statsSkip = (this._statsSkip || 0) + 1;
+            if (!this._indexDown || this._statsSkip % 3 === 0) {
+                this.loadStorageStats();
+            }
+
             // Refresh CDR info if SD card is selected
             if (this.config.surveillanceStorageType === 'SD_CARD' && this.storageInfo.sdCardAvailable) {
                 this.loadCdrConfig();
@@ -1006,6 +1064,17 @@ BYD.surveillance = {
         } catch (e) {
             console.warn('Failed to load config:', e);
         }
+
+        // Storage settings run CONCURRENTLY with the unified read below rather
+        // than serially after it. Both must come after the config spread above
+        // (which wholesale-replaces this.config and would clobber their writes),
+        // but they touch disjoint keys — unified writes rectifyStrength /
+        // segmentDurationMinutes / lowPowerWhileParked, storage writes
+        // surveillanceLimitMb / surveillanceStorageType / storageInfo.* — so
+        // there is no ordering dependency between them. This takes
+        // /api/settings/storage (the expensive one) off the tail of the serial
+        // chain, where it was gating everything downstream of loadConfig().
+        const storageSettingsPromise = this.loadStorageSettings();
 
         // Pull rectifyStrength from the unified-config recording section.
         // The surveillance API doesn't surface it (it lives under recording.*
@@ -1037,13 +1106,18 @@ BYD.surveillance = {
                     var card = document.getElementById('survRectifyCard');
                     if (card) card.style.display = (mode === 'dilink4') ? 'none' : '';
                 } catch (_) {}
+                // Low-power-while-parked: read the pano flag (the OEM flag is kept in
+                // lockstep by toggleLowPowerMode). Absent → false (today's default).
+                this.config.lowPowerWhileParked =
+                    !!(uData.config.camera && uData.config.camera.surveillanceIdleThrottle === true);
             }
         } catch (e) {
             console.warn('Failed to load rectifyStrength: ' + (e && e.message));
         }
 
-        // Load storage settings
-        await this.loadStorageSettings();
+        // Join the storage read kicked off above. loadStorageSettings() swallows
+        // its own errors, so this can't reject and reach callers.
+        await storageSettingsPromise;
     },
 
     sizeToDistance(size) {
@@ -1221,26 +1295,10 @@ BYD.surveillance = {
         }
     },
 
-    updateDistance(value) {
-        this.config.distance = parseInt(value);
-        this.config.minObjectSize = (this.distanceMap[value] || {}).size || 0.08;
-        document.getElementById('distanceValue').textContent = this.distanceLabel(value) || BYD.i18n.t('surveillance.label_default_size');
-        document.getElementById('distanceHint').textContent = this.distanceHint(value) || '';
-        this.markChanged();
-    },
-
-    updateSensitivity(value) {
-        this.config.sensitivity = parseInt(value);
-        document.getElementById('sensitivityValue').textContent = this.sensitivityLabel(value) || BYD.i18n.t('surveillance.label_default');
-        document.getElementById('sensitivityHint').textContent = this.sensitivityHint(value) || '';
-        this.markChanged();
-    },
-
-    updateFlashImmunity(value) {
-        this.config.flashImmunity = parseInt(value);
-        document.getElementById('flashImmunityValue').textContent = this.flashImmunityMap[value] || 'MEDIUM';
-        this.markChanged();
-    },
+    // Removed: updateDistance / updateSensitivity / updateFlashImmunity — the v1
+    // sliders they drove no longer exist on any page (superseded by the v2
+    // sensitivity slider and the detection-zone buttons) and nothing called them.
+    // Their unguarded getElementById(...).textContent would have thrown.
 
     updateDetection() {
         this.config.detectPerson = document.getElementById('detectPerson').checked;
@@ -1448,6 +1506,186 @@ BYD.surveillance = {
                   BYD.utils.toast(localized || 'Could not save mode', 'error');
               }
           });
+    },
+
+    setArmMode(mode) {
+        if (mode !== 'lock' && mode !== 'power') return;
+        const prev = this.config.armMode || 'lock';
+        if (prev === mode) return;
+
+        this.config.armMode = mode;
+        // Reflect button state immediately so the click feels responsive
+        // before the network round-trip resolves.
+        document.querySelectorAll('#armModeBtns .btn-toggle').forEach(btn =>
+            btn.classList.toggle('active', btn.dataset.value === mode));
+        this.applyArmModeUI();
+
+        const self = this;
+        fetch('/api/surveillance/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ armMode: mode })
+        }).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+          .then(() => {
+              if (self.savedConfig) self.savedConfig.armMode = mode;
+              self.markChanged();
+              if (BYD.utils && BYD.utils.toast) {
+                  const k = mode === 'power'
+                      ? 'surveillance.arm_saved_power'
+                      : 'surveillance.arm_saved_lock';
+                  const fallback = mode === 'power'
+                      ? 'Arms on power-off'
+                      : 'Arms on door lock';
+                  const localized = BYD.i18n && BYD.i18n.t ? BYD.i18n.t(k) : null;
+                  BYD.utils.toast(localized || fallback, 'success');
+              }
+          })
+          .catch(() => {
+              // Revert in-memory + UI on failure so the displayed state
+              // matches the server.
+              self.config.armMode = prev;
+              document.querySelectorAll('#armModeBtns .btn-toggle').forEach(btn =>
+                  btn.classList.toggle('active', btn.dataset.value === prev));
+              self.applyArmModeUI();
+              if (BYD.utils && BYD.utils.toast) {
+                  const localized = BYD.i18n && BYD.i18n.t
+                      ? BYD.i18n.t('surveillance.arm_save_failed') : null;
+                  BYD.utils.toast(localized || 'Could not save arm mode', 'error');
+              }
+          });
+    },
+
+    /**
+     * Update the arm-mode hint paragraph based on the current armMode.
+     * Called from setArmMode() and the load path (updateV2UI). Cosmetic only.
+     */
+    applyArmModeUI() {
+        const mode = this.config.armMode || 'lock';
+        const hintKey = mode === 'power'
+            ? 'surveillance.arm_hint_power'
+            : 'surveillance.arm_hint_lock';
+        const hintEl = document.getElementById('armModeHint');
+        if (hintEl) {
+            hintEl.setAttribute('data-i18n', hintKey);
+            hintEl.textContent = (BYD.i18n && BYD.i18n.t)
+                ? (BYD.i18n.t(hintKey) || hintEl.textContent)
+                : hintEl.textContent;
+        }
+    },
+
+    /**
+     * Operating mode: 'onAndOff' (full behaviour) | 'onOnly' (let the head unit sleep
+     * after the car is off). Optimistic set → POST /api/surveillance/config → revert +
+     * toast on failure. Mirrors setArmMode(). Takes effect on the next ACC cycle (the
+     * daemons re-read the mtime-gated config); no live restart, matching arm mode.
+     */
+    setOperatingMode(mode) {
+        if (mode !== 'onAndOff' && mode !== 'onOnly') return;
+        const prev = this.config.operatingMode || 'onAndOff';
+        if (prev === mode) return;
+
+        this.config.operatingMode = mode;
+        document.querySelectorAll('#operatingModeBtns .btn-toggle').forEach(btn =>
+            btn.classList.toggle('active', btn.dataset.value === mode));
+        this.applyOperatingModeUI();
+
+        const self = this;
+        fetch('/api/surveillance/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ operatingMode: mode })
+        }).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+          .then(() => {
+              if (self.savedConfig) self.savedConfig.operatingMode = mode;
+              self.markChanged();
+              if (BYD.utils && BYD.utils.toast) {
+                  const k = mode === 'onOnly'
+                      ? 'surveillance.operating_mode_saved_on_only'
+                      : 'surveillance.operating_mode_saved_on_off';
+                  const fallback = mode === 'onOnly'
+                      ? 'Sleeps when the car is off'
+                      : 'Keeps working while parked';
+                  const localized = BYD.i18n && BYD.i18n.t ? BYD.i18n.t(k) : null;
+                  BYD.utils.toast(localized || fallback, 'success');
+              }
+          })
+          .catch(() => {
+              self.config.operatingMode = prev;
+              document.querySelectorAll('#operatingModeBtns .btn-toggle').forEach(btn =>
+                  btn.classList.toggle('active', btn.dataset.value === prev));
+              self.applyOperatingModeUI();
+              if (BYD.utils && BYD.utils.toast) {
+                  const localized = BYD.i18n && BYD.i18n.t
+                      ? BYD.i18n.t('surveillance.operating_mode_save_failed') : null;
+                  BYD.utils.toast(localized || 'Could not save operating mode', 'error');
+              }
+          });
+    },
+
+    /**
+     * Update the operating-mode hint paragraph based on the current operatingMode.
+     * Called from setOperatingMode() and the load path (updateV2UI). Cosmetic only.
+     */
+    applyOperatingModeUI() {
+        const mode = this.config.operatingMode || 'onAndOff';
+        const inert = (mode === 'onOnly');
+        const hintKey = inert
+            ? 'surveillance.operating_mode_hint_on_only'
+            : 'surveillance.operating_mode_hint_on_off';
+        const hintEl = document.getElementById('operatingModeHint');
+        if (hintEl) {
+            hintEl.setAttribute('data-i18n', hintKey);
+            hintEl.textContent = (BYD.i18n && BYD.i18n.t)
+                ? (BYD.i18n.t(hintKey) || hintEl.textContent)
+                : hintEl.textContent;
+        }
+
+        // Inert-state reflection: in "On Only" mode Overdrive fully shuts down when
+        // parked, so every post-vehicle-OFF surveillance control is meaningless. Dim +
+        // disable them (and their hints) so the user isn't tuning knobs that can't apply,
+        // and show one explanatory note. Mirrors applyAccOffModeUI's dim idiom
+        // (opacity + pointer-events, Chrome-58/ES5-safe). We DO NOT dim the operating-mode
+        // row itself (or the user couldn't switch back). Restored (inert=false) on onAndOff.
+        const self = this;
+        const dimRow = function (controlId) {
+            const el = document.getElementById(controlId);
+            if (!el) return;
+            const row = el.closest ? el.closest('.setting-row') : null;
+            if (row) {
+                row.style.opacity = inert ? '0.45' : '';
+                row.style.pointerEvents = inert ? 'none' : '';
+            }
+        };
+        const dimHint = function (hintId) {
+            const h = document.getElementById(hintId);
+            if (h) { h.style.opacity = inert ? '0.45' : ''; }
+        };
+        // Post-OFF surveillance controls (all inert when onOnly).
+        ['survEnabled', 'survKeepUsbPower', 'survLowPowerMode', 'lowSocCutoffSlider']
+            .forEach(dimRow);
+        dimHint('lowSocCutoffHint');
+        // Arm-mode + ACC-off-mode are btn-groups (no single input id) — dim by their
+        // container's row + hint, and disable the buttons so it's not merely visual.
+        ['armModeBtns', 'accOffModeBtns'].forEach(function (grpId) {
+            const grp = document.getElementById(grpId);
+            if (grp) {
+                const row = grp.closest ? grp.closest('.setting-row') : null;
+                if (row) {
+                    row.style.opacity = inert ? '0.45' : '';
+                    row.style.pointerEvents = inert ? 'none' : '';
+                }
+                const btns = grp.querySelectorAll('.btn-toggle');
+                for (let i = 0; i < btns.length; i++) btns[i].disabled = inert;
+            }
+        });
+        dimHint('armModeHint');
+        dimHint('accOffModeHint');
+        // Disable the underlying inputs too (defensive — not touch-only).
+        ['survEnabled', 'survKeepUsbPower', 'survLowPowerMode', 'lowSocCutoffSlider']
+            .forEach(function (id) { const el = document.getElementById(id); if (el) el.disabled = inert; });
+        // Explanatory note (shown only when inert).
+        const note = document.getElementById('postOffDisabledNotice');
+        if (note) note.style.display = inert ? '' : 'none';
     },
 
     /**
@@ -1679,6 +1917,51 @@ BYD.surveillance = {
     },
 
     /**
+     * Low-power-while-parked master toggle. Drives BOTH pipelines together:
+     * camera.surveillanceIdleThrottle (pano surveillance camera) and
+     * oemDashcam.idleThrottleWhenParked (OEM forward dashcam). Persists immediately
+     * (no Apply button) to /api/settings/unified, optimistic with revert-on-failure.
+     * Both flags default OFF, so turning this on is the single opt-in that activates
+     * the parked idle frame-rate throttle across the whole recording stack.
+     */
+    toggleLowPowerMode() {
+        const el = document.getElementById('survLowPowerMode');
+        if (!el) return;
+        const on = el.checked;
+        const self = this;
+        const t = (k, fb) => (BYD.i18n && BYD.i18n.t ? (BYD.i18n.t(k) || fb) : fb);
+
+        this.config.lowPowerWhileParked = on;
+
+        // Persist the two section flags in parallel. Both must land for the feature
+        // to behave coherently; if either fails we revert the toggle + config.
+        const postSection = (section, data) => fetch('/api/settings/unified', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ section: section, data: data })
+        }).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)));
+
+        Promise.all([
+            postSection('camera', { surveillanceIdleThrottle: on }),
+            postSection('oemDashcam', { idleThrottleWhenParked: on })
+        ]).then(function () {
+            if (BYD.utils && BYD.utils.toast) {
+                const msg = on
+                    ? t('surveillance.low_power_saved_on', 'Low-power mode on — camera idles at a low frame rate while parked')
+                    : t('surveillance.low_power_saved_off', 'Low-power mode off — camera stays at full frame rate while parked');
+                BYD.utils.toast(msg, 'success');
+            }
+        }).catch(function () {
+            // Revert on failure so the toggle never diverges from persisted state.
+            self.config.lowPowerWhileParked = !on;
+            if (el) el.checked = !on;
+            if (BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(t('surveillance.low_power_save_failed', 'Could not save low-power mode'), 'error');
+            }
+        });
+    },
+
+    /**
      * Show/hide the inline "recording to Internal because USB power is off" warning.
      * Visible only when keepUsbPowerOnAccOff is explicitly false. Safe to call any
      * time (load, toggle, storage change).
@@ -1809,10 +2092,33 @@ BYD.surveillance = {
         this.markChanged();
     },
 
+    updateMotionSalience() {
+        var el = document.getElementById('v2MotionSalience');
+        this.config.motionSalienceEnabled = (el && el.checked) || false;
+        this.markChanged();
+    },
+
     updateDiscardEmptyMotion() {
         var el = document.getElementById('v2DiscardEmptyMotion');
         this.config.discardEmptyBrightMotionEvents = (el && el.checked) || false;
+        // The night sub-toggle only makes sense while the primary discard is on;
+        // disable + visually gray it out when the parent is off.
+        this._syncNightDiscardEnabled();
         this.markChanged();
+    },
+
+    updateDiscardEmptyMotionAtNight() {
+        var el = document.getElementById('v2DiscardEmptyMotionNight');
+        this.config.discardEmptyMotionAtNight = (el && el.checked) || false;
+        this.markChanged();
+    },
+
+    _syncNightDiscardEnabled() {
+        var parentOn = !!this.config.discardEmptyBrightMotionEvents;
+        var row = document.getElementById('discardEmptyMotionNightRow');
+        var nightEl = document.getElementById('v2DiscardEmptyMotionNight');
+        if (nightEl) nightEl.disabled = !parentOn;
+        if (row) row.style.opacity = parentOn ? '1' : '0.45';
     },
     
     _deselectPresetIfCustom() {
@@ -2166,9 +2472,10 @@ BYD.surveillance = {
     /**
      * Draw the heatmap overlay on the canvas.
      * 
-     * In mosaic mode (viewMode=0), draws a 2x2 grid:
+     * In mosaic mode (viewMode=0), draws a 2x2 grid matching the recorder's
+     * mosaic (Q0=front, Q1=right, Q2=rear, Q3=left):
      *   [0: FRONT]  [1: RIGHT]
-     *   [2: LEFT ]  [3: REAR ]
+     *   [2: REAR ]  [3: LEFT ]
      *
      * In single-camera mode (viewMode=1-4), draws only the active quadrant
      * filling the full canvas. viewMode mapping: 1=Front, 2=Right, 3=Rear, 4=Left.
@@ -2196,8 +2503,13 @@ BYD.surveillance = {
         // the raw / DVR stream — the canvas was already cleared above.
         if (viewMode === 5 || viewMode === 6) return;
 
-        // Map viewMode to quadrant ID: 1→0(front), 2→1(right), 3→3(rear), 4→2(left)
-        var viewModeToQuadrant = { 1: 0, 2: 1, 3: 3, 4: 2 };
+        // Map viewMode to quadrant ID. Quadrant order is Q0=front, Q1=right,
+        // Q2=rear, Q3=left (MotionPipelineV2.QUADRANT_NAMES) and the stream's
+        // single-view modes are 1=front, 2=right, 3=rear, 4=left (the uViewMode
+        // branches in GpuStreamScaler's fragment shader), so this is the identity
+        // shift. It previously mapped 3→3 and 4→2, painting the LEFT camera's
+        // blocks while the user was watching the REAR stream and vice versa.
+        var viewModeToQuadrant = { 1: 0, 2: 1, 3: 2, 4: 3 };
         var singleQuadrant = (viewMode > 0) ? viewModeToQuadrant[viewMode] : -1;
         
         // In single-camera mode, the heatmap fills the full canvas
@@ -2208,17 +2520,22 @@ BYD.surveillance = {
         var blockW = quadW / gridCols;
         var blockH = quadH / gridRows;
 
+        // Mosaic layout, matching the recorder's output and the GL shader's
+        // uViewMode==0 rearrange: Front=TL, Right=TR, Rear=BL, Left=BR.
+        // Q2 is REAR (bottom-LEFT) and Q3 is LEFT (bottom-RIGHT) — these two were
+        // transposed in both the positions and the labels, which is what made
+        // left-camera motion appear as rear-camera motion on the debug heatmap.
         var quadPositions = [
-            [0, 0],  // 0: front  — top-left
-            [1, 0],  // 1: right  — top-right
-            [1, 1],  // 2: left   — bottom-right
-            [0, 1]   // 3: rear   — bottom-left
+            [0, 0],  // 0: front — top-left
+            [1, 0],  // 1: right — top-right
+            [0, 1],  // 2: rear  — bottom-left
+            [1, 1]   // 3: left  — bottom-right
         ];
         var quadLabels = [
             BYD.i18n.t('surveillance.camera_front'),
             BYD.i18n.t('surveillance.camera_right'),
-            BYD.i18n.t('surveillance.camera_left'),
-            BYD.i18n.t('surveillance.camera_rear')
+            BYD.i18n.t('surveillance.camera_rear'),
+            BYD.i18n.t('surveillance.camera_left')
         ];
         var threatLabels = [
             '',
@@ -2364,12 +2681,33 @@ BYD.surveillance = {
             btn.classList.toggle('active', btn.dataset.value === accOffMode));
         this.applyAccOffModeUI();
 
+        // Arm mode — reflect the loaded value on the toggle group and refresh
+        // its hint. Default to 'lock' if the server omitted the field (older
+        // daemon build).
+        const armMode = this.config.armMode || 'lock';
+        document.querySelectorAll('#armModeBtns .btn-toggle').forEach(btn =>
+            btn.classList.toggle('active', btn.dataset.value === armMode));
+        this.applyArmModeUI();
+
+        // Operating mode — reflect the loaded value on the toggle group and refresh
+        // its hint. Default to 'onAndOff' if the server omitted the field (older daemon
+        // build) so the switch shows the real out-of-box default.
+        const operatingMode = this.config.operatingMode || 'onAndOff';
+        document.querySelectorAll('#operatingModeBtns .btn-toggle').forEach(btn =>
+            btn.classList.toggle('active', btn.dataset.value === operatingMode));
+        this.applyOperatingModeUI();
+
         // Keep USB powered while parked — default true when the server omits the
         // field (older daemon build) so the switch shows the real out-of-box default.
         const keepUsb = document.getElementById('survKeepUsbPower');
         if (keepUsb) keepUsb.checked = (this.config.keepUsbPowerOnAccOff !== false);
         // Reflect the "recording to Internal because USB power is off" notice.
         this.updateUsbPowerStorageNotice();
+
+        // Low-power-while-parked toggle. Default OFF when the field is absent
+        // (older config / opt-in feature) so the switch shows the real default.
+        const lowPower = document.getElementById('survLowPowerMode');
+        if (lowPower) lowPower.checked = (this.config.lowPowerWhileParked === true);
 
         // Low-battery (HV SoC) cutoff slider. 0 renders as "Off".
         const socCutoff = document.getElementById('lowSocCutoffSlider');
@@ -2522,8 +2860,13 @@ BYD.surveillance = {
         // Discard non-actor recordings (detection tab) — user-facing toggle,
         // so use setToggle for the Chrome-58 slider repaint (the developer
         // toggles above can stay plain).
+        setToggle(document.getElementById('v2MotionSalience'),
+                  !!this.config.motionSalienceEnabled);
         setToggle(document.getElementById('v2DiscardEmptyMotion'),
                   !!this.config.discardEmptyBrightMotionEvents);
+        setToggle(document.getElementById('v2DiscardEmptyMotionNight'),
+                  !!this.config.discardEmptyMotionAtNight);
+        this._syncNightDiscardEnabled();
 
         // Telegram start-ping opt-in
         setToggle(document.getElementById('v2TelegramSendStartPing'),
@@ -2597,7 +2940,8 @@ BYD.surveillance = {
             // Folded in from the (removed) Advanced tab — these motion-
             // detection diagnostics belong with detection.
             'motionHeatmap', 'filterDebugLog',
-            'discardEmptyBrightMotionEvents'
+            'discardEmptyBrightMotionEvents', 'discardEmptyMotionAtNight',
+            'motionSalienceEnabled'
         ],
         recording: [
             // Backend reads these EXACT names — preRecordSeconds (no "ing").
@@ -2834,20 +3178,74 @@ BYD.surveillance = {
                 // overwrite our partial commit.
                 this._skipSavedConfigSnapshot = true;
             } else {
-                // Build a partial body containing only the active tab's fields.
-                // The daemon's surveillance config endpoint is a partial-merge
-                // writer, so omitted keys retain their prior values.
+                // Build a partial body containing only the active tab's DIRTY
+                // fields (config differs from the savedConfig baseline). The
+                // daemon's surveillance config endpoint is a partial-merge
+                // writer, so omitted keys retain their prior values. Sending
+                // only dirty keys (not the whole tab) prevents a stale client
+                // — or a silent mis-tap on an unrelated control — from riding
+                // along with an Apply and clobbering flags the user never
+                // touched (on-car incident: an Apply carried all four detect*
+                // classes false alongside a preset change, disabling AI for
+                // 14 minutes). Fall back to sending the field when there is no
+                // baseline to diff against (savedConfig missing the key).
                 const partial = {};
                 for (let i = 0; i < fields.length; i++) {
                     const key = fields[i];
-                    if (this.config[key] !== undefined) partial[key] = this.config[key];
+                    if (this.config[key] === undefined) continue;
+                    const baseline = this.savedConfig ? this.savedConfig[key] : undefined;
+                    if (baseline !== undefined &&
+                        JSON.stringify(this.config[key]) === JSON.stringify(baseline)) {
+                        continue; // unchanged — let the daemon keep its value
+                    }
+                    partial[key] = this.config[key];
                 }
-                const configResp = await fetch('/api/surveillance/config', {
+                let configResp = await fetch('/api/surveillance/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(partial)
                 });
                 if (!configResp.ok) throw new Error('Config save failed: ' + configResp.status);
+                let configData = null;
+                try { configData = await configResp.json(); } catch (_) {}
+                // Daemon guard: a save whose RESULT would disable every object
+                // class is rejected with code=all_classes_off (HTTP 200,
+                // success:false). Ask the user to confirm via the themed
+                // dialog; on confirm, retry the same body with the explicit
+                // override flag. Fail SAFE when the modal helper is missing
+                // (core.js not loaded): do NOT auto-confirm — surface the
+                // rejection, mirroring the keep-USB consent pattern.
+                if (configData && configData.success === false &&
+                        configData.code === 'all_classes_off') {
+                    const t = (BYD.i18n && BYD.i18n.t) ? BYD.i18n.t.bind(BYD.i18n) : null;
+                    let confirmed = false;
+                    if (BYD.utils && BYD.utils.confirmDialog) {
+                        confirmed = await BYD.utils.confirmDialog({
+                            title: (t && t('surveillance.confirm_disable_all_classes_title'))
+                                || 'Disable all object classes?',
+                            body: (t && t('surveillance.confirm_disable_all_classes'))
+                                || 'AI detection turns off entirely: events only trigger on raw motion and are rate-limited. Real events may be missed.',
+                            confirmLabel: (t && t('surveillance.confirm_disable_all_classes_ok'))
+                                || 'Disable anyway',
+                            cancelLabel: (t && t('common.cancel')) || 'Cancel',
+                            danger: true
+                        });
+                    }
+                    if (!confirmed) {
+                        throw new Error(configData.error || 'all object classes would be disabled');
+                    }
+                    partial.confirmDisableAllClasses = true;
+                    configResp = await fetch('/api/surveillance/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(partial)
+                    });
+                    if (!configResp.ok) throw new Error('Config save failed: ' + configResp.status);
+                    try { configData = await configResp.json(); } catch (_) {}
+                }
+                if (configData && configData.success === false) {
+                    throw new Error(configData.error || 'config save rejected');
+                }
             }
 
             // Recording-tab branch handles per-key savedConfig promotion
@@ -3992,6 +4390,123 @@ BYD.surveillance = {
             }
         } catch (e) {
             if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.layout_update_failed'), 'error');
+        }
+    },
+
+    // ==================== Surveillance Telemetry Overlay ====================
+    // ACC-off flow. Own master toggle + field selection, never shared with the
+    // ACC-on recording overlay. Self-contained here because recording.js isn't
+    // loaded on this page.
+
+    _telemetryCatalog: null,
+    _telemetryFields: { accOn: [], surveillance: [], oemDashcam: [] },
+
+    async loadSurvTelemetryOverlay() {
+        try {
+            const resp = await fetch('/api/settings/telemetry-overlay');
+            const data = await resp.json();
+            if (!data.success) return;
+            const toggle = document.getElementById('survTelemetryOverlayEnabled');
+            if (toggle) toggle.checked = !!data.surveillanceEnabled;
+            this._telemetryCatalog = data.fieldCatalog || null;
+            if (data.fields) this._telemetryFields = data.fields;
+            this.renderSurvTelemetryFields();
+            this.updateSurvTelemetryFieldsVisibility(!!(toggle && toggle.checked));
+        } catch (e) {
+            console.warn('Failed to load surveillance telemetry overlay:', e);
+        }
+    },
+
+    survTelemetryFieldLabel(key) {
+        const fallback = {
+            speed: 'Speed', gear: 'Gear', accelPedal: 'Accelerator',
+            brakePedal: 'Brake', seatbeltDriver: 'Driver seatbelt',
+            seatbeltPassenger: 'Passenger seatbelt', turnSignals: 'Turn signals',
+            timestamp: 'Date & time', batteryPercent: 'Battery %',
+            voltage12v: '12V voltage', lowBeam: 'Low beam',
+            highBeam: 'High beam', location: 'GPS location',
+            vin: 'VIN'
+        };
+        const i18nKey = 'recording.telemetry_field_' + key;
+        const t = (BYD.i18n && BYD.i18n.t) ? BYD.i18n.t(i18nKey) : null;
+        return (t && t !== i18nKey) ? t : (fallback[key] || key);
+    },
+
+    renderSurvTelemetryFields() {
+        const grid = document.getElementById('telemetryFieldsSurveillanceGrid');
+        if (!grid || !this._telemetryCatalog) return;
+        const selected = new Set(this._telemetryFields.surveillance || []);
+        grid.innerHTML = '';
+        this._telemetryCatalog.forEach(f => {
+            const label = document.createElement('label');
+            label.className = 'checkbox-item' + (selected.has(f.key) ? ' active' : '');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.id = 'telField_surveillance_' + f.key;
+            cb.checked = selected.has(f.key);
+            cb.addEventListener('change', () => {
+                label.classList.toggle('active', cb.checked);
+                this.toggleSurvTelemetryField();
+            });
+            const span = document.createElement('span');
+            span.textContent = this.survTelemetryFieldLabel(f.key);
+            label.appendChild(cb);
+            label.appendChild(span);
+            grid.appendChild(label);
+        });
+    },
+
+    updateSurvTelemetryFieldsVisibility(visible) {
+        const wrap = document.getElementById('telemetryFieldsSurveillance');
+        if (wrap) wrap.style.display = visible ? '' : 'none';
+    },
+
+    async toggleSurvTelemetryField() {
+        const grid = document.getElementById('telemetryFieldsSurveillanceGrid');
+        const keys = [];
+        if (grid) grid.querySelectorAll('input[type=checkbox]').forEach(cb => {
+            if (cb.checked) keys.push(cb.id.replace('telField_surveillance_', ''));
+        });
+        this._telemetryFields.surveillance = keys;
+        try {
+            const resp = await fetch('/api/settings/telemetry-overlay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fields: { surveillance: keys } })
+            });
+            const data = await resp.json();
+            if (data.success && data.fields) this._telemetryFields = data.fields;
+        } catch (e) {
+            console.warn('Failed to update surveillance telemetry fields:', e);
+        }
+    },
+
+    async toggleSurvTelemetryOverlay() {
+        const toggle = document.getElementById('survTelemetryOverlayEnabled');
+        if (!toggle) return;
+        const enabled = toggle.checked;
+        try {
+            const resp = await fetch('/api/settings/telemetry-overlay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ surveillanceEnabled: enabled })
+            });
+            const data = await resp.json();
+            if (data.success) {
+                toggle.checked = !!data.surveillanceEnabled;
+                this.updateSurvTelemetryFieldsVisibility(!!data.surveillanceEnabled);
+                if (BYD.utils && BYD.utils.toast) {
+                    BYD.utils.toast(data.surveillanceEnabled
+                        ? BYD.i18n.t('recording.telemetry_overlay_enabled')
+                        : BYD.i18n.t('recording.telemetry_overlay_disabled'), 'success');
+                }
+            } else {
+                toggle.checked = !enabled;
+                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.overlay_update_failed'), 'error');
+            }
+        } catch (e) {
+            toggle.checked = !enabled;
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.overlay_update_failed'), 'error');
         }
     }
 };

@@ -1,25 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Keep-alive AccessibilityService config.
+  Triple-purpose config:
+   1. Process keep-alive — the binding alone gives the app the highest
+      process-priority tier so BYD firmware won't kill it (original purpose).
+   2. Physical-key mapping — flagRequestFilterKeyEvents + canRequestFilterKeyEvents
+      let onKeyEvent intercept hardware buttons (steering-wheel / dash keys) BEFORE
+      the OEM handler, so the user can rebind them. This is a standard a11y
+      capability — no root, no signature permission, no INJECT_EVENTS.
+   3. FORK-LOCAL: autostart auto-enable (AutoStartEnabler) drives BYD's
+      com.byd.appstartmanagement dialog via the a11y APIs. That needs
+      canRetrieveWindowContent + flagRetrieveInteractiveWindows to let
+      getWindows() reach BYD's dialog window (getRootInActiveWindow returns the
+      launcher, not the dialog — verified), canPerformGestures for the
+      dispatchGesture coordinate-tap fallback, and typeWindowsChanged to notice
+      the dialog appear (the enabler primarily polls, so the event is
+      belt-and-suspenders).
 
-    Historically this service was lifecycle-only (no events, no window content) —
-    its sole job was to keep the process un-killable. Phase 2a adds a once-per-
-    install "auto-enable autostart" routine (AutoStartEnabler) that drives BYD's
-    com.byd.appstartmanagement dialog via the a11y APIs, so the config now also
-    grants window-content retrieval, interactive-window access and gestures.
-
-    canRetrieveWindowContent + flagRetrieveInteractiveWindows are what let
-    getWindows() reach BYD's dialog window (getRootInActiveWindow returns the
-    launcher, not the dialog — verified). canPerformGestures backs the
-    dispatchGesture coordinate-tap fallback. Window events let us notice the
-    dialog appear (the enabler primarily polls, so these are belt-and-suspenders).
+  Event types and flags are the UNION of (2) and (3): key filtering needs no
+  window events, the enabler does, and neither capability disables the other.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
-    android:notificationTimeout="5000"
+    android:accessibilityFlags="flagRequestFilterKeyEvents|flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
+    android:canRequestFilterKeyEvents="true"
     android:canRetrieveWindowContent="true"
     android:canPerformGestures="true"
+    android:notificationTimeout="100"
     android:settingsActivity="com.overdrive.app.ui.MainActivity" />

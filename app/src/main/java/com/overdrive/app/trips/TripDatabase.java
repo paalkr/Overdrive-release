@@ -99,7 +99,14 @@ public class TripDatabase {
         }
     }
 
-    public void close() {
+    // synchronized: this NULLS the shared `connection` field, exactly like
+    // reconnect() reassigns it — so it must take the same monitor every CRUD
+    // method and ensureConnection() hold. Without it, a worker that just passed
+    // ensureConnection()==true could NPE on connection.prepareStatement, have its
+    // catch call reconnect(), and RE-OPEN the store with isInitialized=true after
+    // a deliberate close — leaving a half-dead state where writes are possible but
+    // no trip will ever start.
+    public synchronized void close() {
         if (connection != null) {
             try {
                 connection.close();
@@ -221,7 +228,18 @@ public class TripDatabase {
                 "electric_cost REAL DEFAULT 0," +
                 "ice_seconds INTEGER DEFAULT 0," +
                 "fuel_con_start REAL DEFAULT -1," +
-                "fuel_con_end REAL DEFAULT -1" +
+                "fuel_con_end REAL DEFAULT -1," +
+                // Absolute vehicle odometer (km) at trip start/end. distance_km
+                // is their delta; these are the readings shown on the trip UI.
+                // 0 = odometer was unavailable at that edge (recovered/legacy row).
+                "odometer_start_km REAL DEFAULT 0," +
+                "odometer_end_km REAL DEFAULT 0," +
+                // Cumulative HAL electricity-consumption counter (kWh) at trip
+                // start/end — the electric twin of fuel_con_*. Its delta is the
+                // metered kWh drawn, the only electric-energy source with enough
+                // resolution to measure a short trip. -1 = not captured.
+                "elec_con_start REAL DEFAULT -1," +
+                "elec_con_end REAL DEFAULT -1" +
                 ")"
             );
 
@@ -271,6 +289,39 @@ public class TripDatabase {
                 stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS fuel_con_end REAL DEFAULT -1");
             } catch (Exception e) {
                 logger.debug("trips fuel-accumulator column migration: " + e.getMessage());
+            }
+
+            // Migration: absolute odometer snapshots at trip start/end. Old rows
+            // read these as 0 (sentinel "unavailable"), which the UI renders as
+            // "--" — no regression, and distance_km (the delta) is unaffected.
+            try {
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS odometer_start_km REAL DEFAULT 0");
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS odometer_end_km REAL DEFAULT 0");
+            } catch (Exception e) {
+                logger.debug("trips odometer column migration: " + e.getMessage());
+            }
+
+            // Migration: cumulative HAL electricity-accumulator snapshots. Old
+            // rows read these as -1 (sentinel "no accumulator"), so the energy
+            // cascade falls back to the remaining-kWh delta exactly as before —
+            // no regression, and no stored energy figure is rewritten.
+            try {
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS elec_con_start REAL DEFAULT -1");
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS elec_con_end REAL DEFAULT -1");
+            } catch (Exception e) {
+                logger.debug("trips elec-accumulator column migration: " + e.getMessage());
+            }
+
+            // Migration: provenance of electricity_rate. A trip is now priced at
+            // the rate the LAST CHARGE was billed at (the energy it burned was
+            // bought then), so we record which source supplied the rate and the
+            // tariff label behind it. Old rows read '' — the UI treats that as
+            // "no provenance chip" and shows cost exactly as it did before.
+            try {
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS rate_source VARCHAR(16) DEFAULT ''");
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS rate_label VARCHAR(64) DEFAULT ''");
+            } catch (Exception e) {
+                logger.debug("trips rate-source column migration: " + e.getMessage());
             }
 
             // Routes table for O(1) similar-trip lookups
@@ -415,8 +466,10 @@ public class TripDatabase {
                 "anticipation_score, smoothness_score, speed_discipline_score, " +
                 "efficiency_score, consistency_score, micro_moments_json, telemetry_file_path, route_id, " +
                 "is_phev, fuel_pct_start, fuel_pct_end, litres_used, fuel_price_per_l, fuel_cost, " +
-                "electric_cost, ice_seconds, fuel_con_start, fuel_con_end, size_bytes, sidecar_size_bytes) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "electric_cost, ice_seconds, fuel_con_start, fuel_con_end, size_bytes, sidecar_size_bytes, " +
+                "odometer_start_km, odometer_end_km, rate_source, rate_label, " +
+                "elec_con_start, elec_con_end) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         try (PreparedStatement pstmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
             setTripParams(pstmt, trip);
@@ -424,6 +477,12 @@ public class TripDatabase {
             setTripFuelParams(pstmt, trip, 34);
             pstmt.setLong(44, trip.sizeBytes);
             pstmt.setLong(45, trip.sidecarSizeBytes);
+            pstmt.setDouble(46, trip.odometerStartKm);
+            pstmt.setDouble(47, trip.odometerEndKm);
+            pstmt.setString(48, trip.rateSource != null ? trip.rateSource : "");
+            pstmt.setString(49, trip.rateLabel != null ? trip.rateLabel : "");
+            pstmt.setDouble(50, trip.elecConStart);
+            pstmt.setDouble(51, trip.elecConEnd);
             pstmt.executeUpdate();
 
             try (ResultSet keys = pstmt.getGeneratedKeys()) {
@@ -458,7 +517,8 @@ public class TripDatabase {
                 "route_id=?, " +
                 "is_phev=?, fuel_pct_start=?, fuel_pct_end=?, litres_used=?, fuel_price_per_l=?, " +
                 "fuel_cost=?, electric_cost=?, ice_seconds=?, fuel_con_start=?, fuel_con_end=?, " +
-                "size_bytes=?, sidecar_size_bytes=? " +
+                "size_bytes=?, sidecar_size_bytes=?, odometer_start_km=?, odometer_end_km=?, " +
+                "rate_source=?, rate_label=?, elec_con_start=?, elec_con_end=? " +
                 "WHERE id=?";
 
         try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
@@ -467,7 +527,13 @@ public class TripDatabase {
             setTripFuelParams(pstmt, trip, 34);
             pstmt.setLong(44, trip.sizeBytes);
             pstmt.setLong(45, trip.sidecarSizeBytes);
-            pstmt.setLong(46, trip.id);
+            pstmt.setDouble(46, trip.odometerStartKm);
+            pstmt.setDouble(47, trip.odometerEndKm);
+            pstmt.setString(48, trip.rateSource != null ? trip.rateSource : "");
+            pstmt.setString(49, trip.rateLabel != null ? trip.rateLabel : "");
+            pstmt.setDouble(50, trip.elecConStart);
+            pstmt.setDouble(51, trip.elecConEnd);
+            pstmt.setLong(52, trip.id);
             pstmt.executeUpdate();
             logger.debug("Updated trip id=" + trip.id);
         } catch (Exception e) {
@@ -538,6 +604,43 @@ public class TripDatabase {
             }
         } catch (Exception e) {
             logger.error("Failed to get trips", e);
+            reconnect();
+        }
+        return trips;
+    }
+
+    /**
+     * List trips whose start_time falls within an explicit [fromMs, toMs]
+     * window (both epoch ms, inclusive), newest first. Backs the custom
+     * date-range filter in the Trips UI, complementing the "last N days"
+     * {@link #getTrips(int, int, int)} path.
+     *
+     * <p>Both bounds are clamped defensively: a swapped pair is reordered so
+     * callers can't produce an empty window by accident, and a non-positive
+     * upper bound falls back to "now" so an open-ended range still returns
+     * recent trips. The {@code start_time} index makes the range scan cheap.
+     */
+    public synchronized List<TripRecord> getTripsBetween(long fromMs, long toMs, int limit, int offset) {
+        List<TripRecord> trips = new ArrayList<>();
+        if (!ensureConnection()) return trips;
+        if (offset < 0) offset = 0;
+        if (toMs <= 0) toMs = System.currentTimeMillis();
+        if (fromMs > toMs) { long t = fromMs; fromMs = toMs; toMs = t; }
+
+        String sql = "SELECT * FROM trips WHERE start_time >= ? AND start_time <= ? "
+                + "ORDER BY start_time DESC LIMIT ? OFFSET ?";
+        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            pstmt.setLong(1, fromMs);
+            pstmt.setLong(2, toMs);
+            pstmt.setInt(3, limit);
+            pstmt.setInt(4, offset);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    trips.add(readTripFromResultSet(rs));
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Failed to get trips in range", e);
             reconnect();
         }
         return trips;
@@ -1793,6 +1896,8 @@ public class TripDatabase {
             o.put("energyPerKm", t.energyPerKm);
             o.put("electricityRate", t.electricityRate);
             o.put("currency", t.currency != null ? t.currency : "");
+            o.put("rateSource", t.rateSource != null ? t.rateSource : "");
+            o.put("rateLabel", t.rateLabel != null ? t.rateLabel : "");
             o.put("tripCost", t.tripCost);
             o.put("kinematicState", t.kinematicState != null ? t.kinematicState : "");
             o.put("gradientProfile", t.gradientProfile != null ? t.gradientProfile : "");
@@ -1821,6 +1926,10 @@ public class TripDatabase {
             o.put("iceSeconds", t.iceSeconds());
             o.put("fuelConStart", t.fuelConStart);
             o.put("fuelConEnd", t.fuelConEnd);
+            o.put("elecConStart", t.elecConStart);
+            o.put("elecConEnd", t.elecConEnd);
+            o.put("odometerStartKm", t.odometerStartKm);
+            o.put("odometerEndKm", t.odometerEndKm);
         } catch (Exception e) {
             logger.warn("tripToJson failed for trip start=" + t.startTime + ": " + e.getMessage());
         }
@@ -1875,6 +1984,12 @@ public class TripDatabase {
         t.iceSecondsAtomic.set(o.optInt("iceSeconds", 0));
         t.fuelConStart = o.optDouble("fuelConStart", -1);
         t.fuelConEnd = o.optDouble("fuelConEnd", -1);
+        t.elecConStart = o.optDouble("elecConStart", -1);
+        t.elecConEnd = o.optDouble("elecConEnd", -1);
+        t.odometerStartKm = o.optDouble("odometerStartKm", 0);
+        t.odometerEndKm = o.optDouble("odometerEndKm", 0);
+        t.rateSource = o.optString("rateSource", "");
+        t.rateLabel = o.optString("rateLabel", "");
         return t;
     }
 
@@ -2086,10 +2201,22 @@ public class TripDatabase {
         // otherwise return 0.0, which falsely satisfies the >=0 metered guard.
         try { trip.fuelConStart = rs.getDouble("fuel_con_start"); if (rs.wasNull()) trip.fuelConStart = -1; } catch (Exception e) { trip.fuelConStart = -1; }
         try { trip.fuelConEnd   = rs.getDouble("fuel_con_end");   if (rs.wasNull()) trip.fuelConEnd   = -1; } catch (Exception e) { trip.fuelConEnd = -1; }
+        // Same wasNull re-mapping for the electricity accumulator: a NULL read as
+        // 0.0 would look like a valid "meter says zero kWh" pair and suppress the
+        // fallback tiers, zeroing energy on every legacy row.
+        try { trip.elecConStart = rs.getDouble("elec_con_start"); if (rs.wasNull()) trip.elecConStart = -1; } catch (Exception e) { trip.elecConStart = -1; }
+        try { trip.elecConEnd   = rs.getDouble("elec_con_end");   if (rs.wasNull()) trip.elecConEnd   = -1; } catch (Exception e) { trip.elecConEnd = -1; }
         // Storage accounting (added in size-backfill migration). 0 means
         // "not yet backfilled" — see runBackfillIfNeeded().
         try { trip.sizeBytes        = rs.getLong("size_bytes"); }         catch (Exception e) { trip.sizeBytes = 0; }
         try { trip.sidecarSizeBytes = rs.getLong("sidecar_size_bytes"); } catch (Exception e) { trip.sidecarSizeBytes = 0; }
+        // Absolute odometer snapshots (0 = unavailable at that edge → UI shows "--").
+        try { trip.odometerStartKm = rs.getDouble("odometer_start_km"); } catch (Exception e) { trip.odometerStartKm = 0; }
+        try { trip.odometerEndKm   = rs.getDouble("odometer_end_km"); }   catch (Exception e) { trip.odometerEndKm = 0; }
+        // Rate provenance ("charge"/"config" + tariff label). Empty on every trip
+        // recorded before this column existed → UI omits the chip.
+        try { String rs1 = rs.getString("rate_source"); trip.rateSource = rs1 != null ? rs1 : ""; } catch (Exception e) { trip.rateSource = ""; }
+        try { String rl = rs.getString("rate_label");  trip.rateLabel  = rl != null ? rl : ""; }   catch (Exception e) { trip.rateLabel = ""; }
         return trip;
     }
 

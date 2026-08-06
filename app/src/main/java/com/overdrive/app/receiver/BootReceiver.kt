@@ -36,25 +36,40 @@ class BootReceiver : BroadcastReceiver() {
 
         Log.d(TAG, "Received broadcast: $action")
 
-        // Forward plug edges to ChargingDetector BEFORE the debounce gate.
-        // The debounce only protects daemon restarts from thrashing; plug
-        // edges must always reach the detector or a quick unplug-replug
-        // sequence will lose the second connect event and the detector will
-        // miss the start of the new charging session.
-        when (action) {
-            Intent.ACTION_POWER_CONNECTED -> {
-                try {
-                    com.overdrive.app.monitor.ChargingDetector.getInstance().onPowerConnected()
-                } catch (e: Exception) {
-                    Log.w(TAG, "ChargingDetector connect notify failed: ${e.message}")
+        // NOTE: plug edges are deliberately NOT forwarded to ChargingDetector here.
+        // ChargingDetector is a plain per-process `static final INSTANCE`
+        // (ChargingDetector.java:110), so calling it from THIS (app) process
+        // mutated a different object than the one every consumer reads — all of
+        // which (VehicleDataMonitor, BydDataCollector, MQTT, automations) run
+        // daemon-side. The calls were therefore dead: the plug edge never reached
+        // the detector that matters, and they class-loaded ChargingDetector +
+        // BydVehicleData + DaemonLogger into the app process for nothing.
+        //
+        // The daemon already registers its OWN ACTION_POWER_CONNECTED/DISCONNECTED
+        // receiver feeding its own detector (BydDataCollector.java:763-778), so the
+        // real edge path is intact and unaffected by this removal.
+
+        // "Vehicle ON only" RECOVERY must bypass the 5s debounce. While parked in onOnly
+        // the whole stack is terminated; the only automatic recovery is a recovery trigger
+        // (ACC/IGN-on, boot) reaching recoverFromPark. If a passive broadcast (WiFi state,
+        // power-connected) arrives in the same power-up burst and wins the debounce slot,
+        // a subsequent ACC_ON within 5s would be debounced away and the stack would stay
+        // dead for the whole drive. So: if a recovery trigger arrives with the parked
+        // marker present, recover NOW, before the debounce. This runs BEFORE lastStartTime
+        // is bumped, and startDaemons itself will set lastStartTime on the launch path.
+        // Guarded to the marker-present case so onAndOff (no marker) is completely unaffected.
+        if (isRecoveryTrigger(action)) {
+            try {
+                if (java.io.File(com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH).exists()) {
+                    Log.i(TAG, "Recovery trigger '$action' with parked marker — recovering pre-debounce")
+                    if (!PreferencesManager.isInitialized()) {
+                        try { PreferencesManager.init(context.applicationContext) } catch (e: Exception) {}
+                    }
+                    startDaemons(context, action)
+                    return
                 }
-            }
-            Intent.ACTION_POWER_DISCONNECTED -> {
-                try {
-                    com.overdrive.app.monitor.ChargingDetector.getInstance().onPowerDisconnected()
-                } catch (e: Exception) {
-                    Log.w(TAG, "ChargingDetector disconnect notify failed: ${e.message}")
-                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Pre-debounce recovery check failed (${e.message}) — falling through")
             }
         }
 
@@ -197,9 +212,59 @@ class BootReceiver : BroadcastReceiver() {
         }
     }
 
+    // Triggers that mean "the car is being used again" — these CLEAR the parked-shutdown
+    // marker and recover the full stack. HAL-backed ACC/IGN edges + head-unit boot.
+    private fun isRecoveryTrigger(trigger: String): Boolean = when (trigger) {
+        "com.byd.action.ACC_ON",
+        "com.byd.action.IGN_ON",
+        "com.byd.accmode.ACC_MODE_CHANGED",
+        Intent.ACTION_BOOT_COMPLETED,
+        "android.intent.action.LOCKED_BOOT_COMPLETED",
+        "android.intent.action.QUICKBOOT_POWERON",
+        "com.htc.intent.action.QUICKBOOT_POWERON" -> true
+        else -> false
+    }
+
     private fun startDaemons(context: Context, trigger: String) {
-        lastStartTime = System.currentTimeMillis()
         Log.d(TAG, "Starting daemons (trigger: $trigger)")
+
+        // "Vehicle ON only" parked-shutdown gate. While the parked-shutdown marker is
+        // present the whole stack was intentionally terminated for the parked window.
+        //  - A RECOVERY trigger (ACC/IGN-on, boot) means the car is being used again:
+        //    clear the marker and fall through to relaunch.
+        //  - Any PASSIVE trigger (screen on/off, USER_PRESENT, power-connected, wifi/
+        //    connectivity) fires while parked and must NOT resurrect the stack — return
+        //    early so parked compute stays zero. (These are the exact triggers that would
+        //    otherwise defeat the terminate.)
+        try {
+            val markerPresent = java.io.File(
+                com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH).exists()
+            if (markerPresent) {
+                if (isRecoveryTrigger(trigger)) {
+                    Log.i(TAG, "Recovery trigger '$trigger' with parked marker present — recovering (clear marker + reset boot guard)")
+                    // recoverFromPark clears the marker AND resets bootStarted so the
+                    // startOnBoot below actually redeploys the watchdogs (the app process
+                    // survives the park via the accessibility keep-alive, so bootStarted
+                    // would otherwise still be true and startOnBoot would no-op).
+                    DaemonStartupManager.recoverFromPark(context.applicationContext)
+                    // fall through to relaunch
+                } else {
+                    Log.i(TAG, "Parked-shutdown marker present + passive trigger '$trigger' — suppressing rebuild (stay asleep)")
+                    // Return WITHOUT bumping lastStartTime: a suppressed passive trigger
+                    // must not consume the debounce slot, or a real recovery trigger
+                    // arriving within 5s could be debounced away (the pre-debounce recovery
+                    // path in onReceive covers the primary case; this keeps the slot free
+                    // as defense-in-depth).
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Parked-marker gate check failed (${e.message}) — proceeding with normal start")
+        }
+
+        // Only reached on an actual launch path — bump the debounce timer here (not at the
+        // top) so suppressed passive returns above never shadow a subsequent recovery.
+        lastStartTime = System.currentTimeMillis()
 
         try {
             // Start DaemonKeepaliveService (foreground + sticky + wakelock)

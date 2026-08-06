@@ -341,7 +341,11 @@ public class SurveillanceApiHandler {
             config.put("sadThreshold", sentry != null ? sentry.getSadThreshold() : 0.05f);
             config.put("preRecordSeconds", sentryConfig.getPreRecordSeconds());
             config.put("postRecordSeconds", sentryConfig.getPostRecordSeconds());
-            config.put("totalBlocks", sentry != null ? sentry.getTotalBlocks() : 300);
+            // Fallback must match the real per-quadrant grid (10×7=70), not the
+            // old dead 640×480 figure — the ROI editor posts back a length-70
+            // roiBlocks_Q* array and applyEffectiveRoi drops any other length.
+            config.put("totalBlocks", sentry != null ? sentry.getTotalBlocks()
+                    : com.overdrive.app.surveillance.MotionPipelineV2.TOTAL_BLOCKS);
             config.put("flashImmunity", sentryConfig.getFlashImmunity());
             config.put("aiEnabled", true);
             config.put("aiConfidence", sentryConfig.getAiConfidence());
@@ -393,7 +397,8 @@ public class SurveillanceApiHandler {
             config.put("sadThreshold", 0.05f);
             config.put("sensitivity", 3);  // Default slider value
             config.put("distance", 3);     // Default slider value
-            config.put("totalBlocks", 300);
+            config.put("totalBlocks",
+                    com.overdrive.app.surveillance.MotionPipelineV2.TOTAL_BLOCKS);
             config.put("flashImmunity", 2);
             config.put("aiEnabled", true);
             config.put("aiConfidence", 0.4f);
@@ -452,6 +457,19 @@ public class SurveillanceApiHandler {
         // ACC-OFF mode: "smart" (motion + YOLO) | "continuous" (plain rolling).
         // Branched at SurveillanceEngineGpu.enable(). Default smart.
         config.put("accOffMode", survConfig.optString("accOffMode", "smart"));
+        // Arm mode: "lock" (arm on door-lock, disarm on unlock, 60s fallback when
+        // lock state unreadable) | "power" (arm immediately on ACC-off, disarm on
+        // ACC-on). Branched in CameraDaemon's ACC-off dispatch. Default lock.
+        config.put("armMode", survConfig.optString("armMode", "lock"));
+        // Operating mode: "onAndOff" (full behaviour incl. post-OFF keep-awake +
+        // surveillance) | "onOnly" (let the head unit sleep after the car is off;
+        // only-while-ON features run). Default onAndOff. Read by every post-OFF gate.
+        config.put("operatingMode", survConfig.optString("operatingMode", "onAndOff"));
+        // True once the user has EXPLICITLY set the operating mode (onboarding or
+        // Settings). Lets the onboarding daemon-ready flush distinguish an untouched
+        // default from a deliberate choice, so a stale pending value never clobbers a
+        // later Settings change. Default false = never set by a user yet.
+        config.put("operatingModeSetByUser", survConfig.optBoolean("operatingModeSetByUser", false));
         // Keep ONLY the USB/data rail powered after ACC OFF (cameras unaffected).
         // Default true; read by AccSentryDaemon on the next ACC-OFF cycle.
         config.put("keepUsbPowerOnAccOff", survConfig.optBoolean("keepUsbPowerOnAccOff", true));
@@ -497,6 +515,8 @@ public class SurveillanceApiHandler {
             config.put("motionHeatmap", sentryConfig.isMotionHeatmapEnabled());
             config.put("filterDebugLog", sentryConfig.isFilterDebugLogEnabled());
             config.put("discardEmptyBrightMotionEvents", sentryConfig.isDiscardEmptyBrightMotionEvents());
+            config.put("discardEmptyMotionAtNight", sentryConfig.isDiscardEmptyMotionAtNight());
+            config.put("motionSalienceEnabled", sentryConfig.isMotionSalienceEnabled());
             config.put("telegramSendStartPing", sentryConfig.isTelegramSendStartPing());
             // Per-tier filter now lives in the telegram unified-config section
             // (see UnifiedTelegramConfig.K_TIER_*). Wire format on
@@ -597,6 +617,23 @@ public class SurveillanceApiHandler {
                     config.put("dilink4RedMask",
                         camCfg.optBoolean("dilink4RedMask", false));
                 }
+                // DiLink 4 mosaic-viewpoint handshake result. This is the write
+                // that flips the byd_apa HAL out of single-camera dashcam mode;
+                // when it does not land, the HAL streams ONE camera and every 2x2
+                // quadrant assumption downstream is wrong — which looks to a user
+                // like a garbled or wrong-looking tile. Surfacing it here is what
+                // makes that distinguishable in the field instead of guessed at.
+                //
+                // Emitted ONLY on dilink4 so a legacy car's response payload is
+                // byte-identical to before (the values would be meaningless there
+                // anyway — the viewpoint write is never attempted).
+                if (camCfg != null
+                        && "dilink4".equalsIgnoreCase(camCfg.optString("cameraMode", "default"))) {
+                    config.put("dilink4MosaicViewpointConfirmed",
+                        com.overdrive.app.camera.BydApaViewpointHelper.isMosaicViewpointConfirmed());
+                    config.put("dilink4ViewpointRc",
+                        com.overdrive.app.camera.BydApaViewpointHelper.getLastAcquireRc());
+                }
             } catch (Exception ignored) {}
         } else {
             config.put("environmentPreset", "outdoor");
@@ -611,6 +648,8 @@ public class SurveillanceApiHandler {
             config.put("motionHeatmap", false);
             config.put("filterDebugLog", false);
             config.put("discardEmptyBrightMotionEvents", false);
+            config.put("discardEmptyMotionAtNight", false);
+            config.put("motionSalienceEnabled", false);
             config.put("telegramSendStartPing", false);
             // Tier toggles live on the telegram unified-config section, so
             // they're available even when SurveillanceConfig isn't loaded.
@@ -815,6 +854,47 @@ public class SurveillanceApiHandler {
                 sentryConfig.setMinObjectSize(minObjSize);
                 configChanged = true;
             }
+            // ALL-CLASSES-OFF GUARD. A save whose RESULTING state disables every
+            // object class silently degrades the whole trigger stack: aiEnabled
+            // flips false, the YOLO interpreter is unloaded, and the no-AI rate
+            // limit (NO_AI_MIN_GAP_MS) suppresses+resets motion sequences for 30s
+            // after every recording — real loiter events die without triggering
+            // (observed on-car 2026-07-19: a stale/mis-tapped Detection-tab Apply
+            // carried all four flags false alongside a preset change; detection
+            // was blind for 14 minutes until the next save). Compute the WOULD-BE
+            // state (request value where present, else current persisted value)
+            // and reject unless the caller explicitly confirms — the UI shows a
+            // confirmation dialog and retries with confirmDisableAllClasses:true.
+            boolean anyDetectFlagInRequest = configJson.has("detectPerson")
+                    || configJson.has("detectCar")
+                    || configJson.has("detectBike")
+                    || configJson.has("detectAnimal");
+            if (anyDetectFlagInRequest) {
+                boolean wouldPerson = configJson.has("detectPerson")
+                        ? configJson.optBoolean("detectPerson", true) : sentryConfig.isDetectPerson();
+                boolean wouldCar = configJson.has("detectCar")
+                        ? configJson.optBoolean("detectCar", true) : sentryConfig.isDetectCar();
+                boolean wouldBike = configJson.has("detectBike")
+                        ? configJson.optBoolean("detectBike", true) : sentryConfig.isDetectBike();
+                boolean wouldAnimal = configJson.has("detectAnimal")
+                        ? configJson.optBoolean("detectAnimal", false) : sentryConfig.isDetectAnimal();
+                boolean anyCurrentlyOn = sentryConfig.isDetectPerson() || sentryConfig.isDetectCar()
+                        || sentryConfig.isDetectBike() || sentryConfig.isDetectAnimal();
+                if (!wouldPerson && !wouldCar && !wouldBike && !wouldAnimal
+                        && anyCurrentlyOn
+                        && !configJson.optBoolean("confirmDisableAllClasses", false)) {
+                    CameraDaemon.log("WARN: config save would disable ALL object classes "
+                            + "(AI gate + YOLO off) — rejected without confirmDisableAllClasses");
+                    // Machine-readable code so the UI can key its confirm dialog
+                    // off it instead of matching localized error text.
+                    JSONObject rejection = new JSONObject();
+                    rejection.put("success", false);
+                    rejection.put("code", "all_classes_off");
+                    rejection.put("error", Messages.get("errors.surveillance_all_classes_off"));
+                    HttpResponse.sendJson(out, rejection.toString());
+                    return;
+                }
+            }
             if (configJson.has("detectPerson")) {
                 sentryConfig.setDetectPerson(configJson.optBoolean("detectPerson", true));
                 configChanged = true;
@@ -852,6 +932,78 @@ public class SurveillanceApiHandler {
                 configChanged = true;
             }
             
+            // Arm mode: "lock" or "power". Takes effect on the next ACC-off cycle
+            // (the door-lock gate / immediate-arm branch reads it fresh then), so
+            // no mid-session engine restart is needed here. Invalid values are
+            // rejected — getSurveillanceArmMode() falls back to "lock" anyway, but
+            // logging the bad value aids debugging.
+            if (configJson.has("armMode")) {
+                String armMode = configJson.optString("armMode", "lock");
+                if ("lock".equals(armMode) || "power".equals(armMode)) {
+                    boolean persisted = com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                            "surveillance", java.util.Collections.singletonMap("armMode", armMode));
+                    if (!persisted) {
+                        CameraDaemon.log("Failed to persist armMode=" + armMode);
+                        HttpResponse.sendJsonError(out, "Failed to save arm mode");
+                        return;
+                    }
+                    CameraDaemon.log("Arm mode set to: " + armMode);
+                    configChanged = true;
+                } else {
+                    CameraDaemon.log("Rejected armMode: " + armMode);
+                }
+            }
+
+            // Operating mode: onAndOff (default full behaviour) | onOnly (disable all
+            // post-vehicle-OFF work so the head unit can sleep). Pure persist — takes
+            // effect on the next ACC cycle when each daemon re-reads the mtime-gated
+            // config, matching armMode/keepUsbPowerOnAccOff (no mid-session restart).
+            // Invalid values are rejected; isVehicleOnOnlyMode() fails open to onAndOff.
+            if (configJson.has("operatingMode")) {
+                String opMode = configJson.optString("operatingMode", "onAndOff");
+                if ("onAndOff".equals(opMode) || "onOnly".equals(opMode)) {
+                    // Persist the mode AND a "user explicitly set this" marker in one
+                    // atomic write. The marker lets the onboarding daemon-ready flush
+                    // (OnboardingHost.flushPendingOperatingMode) tell an untouched default
+                    // ("onAndOff", never chosen) apart from a deliberate later Settings
+                    // change — without it, a stale pending onboarding choice could re-POST
+                    // over a change the user just made here. Every operatingMode write
+                    // (onboarding OR Settings) is a genuine user choice, so set it true.
+                    java.util.Map<String, Object> opModeVals = new java.util.HashMap<>();
+                    opModeVals.put("operatingMode", opMode);
+                    opModeVals.put("operatingModeSetByUser", true);
+                    boolean persisted = com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                            "surveillance", opModeVals);
+                    if (!persisted) {
+                        CameraDaemon.log("Failed to persist operatingMode=" + opMode);
+                        HttpResponse.sendJsonError(out, "Failed to save operating mode");
+                        return;
+                    }
+                    CameraDaemon.log("Operating mode set to: " + opMode);
+                    configChanged = true;
+                } else {
+                    CameraDaemon.log("Rejected operatingMode: " + opMode);
+                }
+            } else if (configJson.has("operatingModeSetByUser")) {
+                // Standalone write of the "user explicitly chose a mode" marker WITHOUT an
+                // operatingMode change. Used by onboarding reset/replay to clear the flag
+                // (operatingModeSetByUser=false) so a wiped session no longer inherits a
+                // prior session's choice marker — otherwise the daemon-ready flush would
+                // wrongly drop a legitimate NEW replay pick as if it were stale. Only the
+                // false-write is meaningful here (true is set atomically with the mode
+                // above); accept the boolean as sent.
+                boolean setByUser = configJson.optBoolean("operatingModeSetByUser", false);
+                boolean persisted = com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance", java.util.Collections.singletonMap("operatingModeSetByUser", setByUser));
+                if (!persisted) {
+                    CameraDaemon.log("Failed to persist operatingModeSetByUser=" + setByUser);
+                    HttpResponse.sendJsonError(out, "Failed to save operating mode marker");
+                    return;
+                }
+                CameraDaemon.log("operatingModeSetByUser set to: " + setByUser);
+                configChanged = true;
+            }
+
             // SOTA: Deterrent action setting (silent / flash_lights / find_car)
             if (configJson.has("deterrentAction")) {
                 String action = configJson.optString("deterrentAction", "silent");
@@ -1266,6 +1418,16 @@ public class SurveillanceApiHandler {
                         configJson.optBoolean("discardEmptyBrightMotionEvents", false));
                 configChanged = true;
             }
+            if (configJson.has("motionSalienceEnabled")) {
+                sentryConfig.setMotionSalienceEnabled(
+                        configJson.optBoolean("motionSalienceEnabled", false));
+                configChanged = true;
+            }
+            if (configJson.has("discardEmptyMotionAtNight")) {
+                sentryConfig.setDiscardEmptyMotionAtNight(
+                        configJson.optBoolean("discardEmptyMotionAtNight", false));
+                configChanged = true;
+            }
             if (configJson.has("filterDebugLog")) {
                 boolean val = configJson.optBoolean("filterDebugLog", false);
                 sentryConfig.setFilterDebugLogEnabled(val);
@@ -1330,7 +1492,13 @@ public class SurveillanceApiHandler {
                 }
             }
             
-            // Per-quadrant ROI enabled/disabled toggle (separate from polygon data)
+            // Per-quadrant ROI enabled/disabled toggle (separate from polygon/block data).
+            // Handles BOTH storage modes:
+            //   - polygon ROI: re-apply the persisted polygon on enable.
+            //   - block-tap ROI: the mask lives in unified config; on disable we must
+            //     clear the unified-config roiEnabled_* flag too, otherwise the
+            //     engine's applyEffectiveRoi() (which reads unified config) would
+            //     revive the just-disabled zone on the setConfig() re-apply below.
             {
                 String[] quadrantKeys = {"Q0", "Q1", "Q2", "Q3"};
                 for (int q = 0; q < 4; q++) {
@@ -1338,13 +1506,28 @@ public class SurveillanceApiHandler {
                     if (configJson.has(enabledKey)) {
                         boolean enabled = configJson.optBoolean(enabledKey, false);
                         if (enabled && sentryConfig.getRoiPolygon(q) != null) {
-                            // Enable ROI — apply the persisted polygon to C++
+                            // Enable polygon ROI — apply the persisted polygon to C++
                             sentryConfig.setRoiEnabled(q, true);
                             if (sentry != null) sentry.applyQuadrantRoi(q, sentryConfig.getRoiPolygon(q));
-                        } else {
-                            // Disable ROI — clear C++ mask but keep polygon in config
+                        } else if (!enabled) {
+                            // Disable ROI — clear C++ mask, keep polygon data in config,
+                            // and mirror the disable into unified config so the block-tap
+                            // mask is not revived by the engine's config re-apply.
                             sentryConfig.setRoiEnabled(q, false);
                             if (sentry != null) sentry.clearQuadrantRoi(q);
+                            try {
+                                org.json.JSONObject survCfg =
+                                    com.overdrive.app.config.UnifiedConfigManager.getSurveillance();
+                                survCfg.put(enabledKey, false);
+                                com.overdrive.app.config.UnifiedConfigManager.setSurveillance(survCfg);
+                            } catch (Exception e) {
+                                CameraDaemon.log("ROI disable persist failed Q" + q + ": " + e.getMessage());
+                            }
+                        } else {
+                            // enabled==true but no polygon: a block-tap ROI is being
+                            // enabled. The roiBlocks_* handler below carries the mask and
+                            // its own enable flag; just record the intent on sentryConfig.
+                            sentryConfig.setRoiEnabled(q, true);
                         }
                         configChanged = true;
                     }
@@ -1770,6 +1953,30 @@ public class SurveillanceApiHandler {
             HttpResponse.sendJsonSuccess(out);
             return;
         }
+        // CHECKPOINT any in-progress trip before the caller SIGKILLs us. The
+        // client's restart flow is prepare-restart + `killall -9`, which never
+        // runs the JVM shutdown hook, so the hook's trip finalize is skipped
+        // here and the trip would otherwise lose everything buffered since the
+        // last periodic flush.
+        //
+        // Deliberately checkpointActiveTrip(), NOT shutdown(). shutdown() would
+        // finalizeActiveTrip() → apply the 60s/0.2km floors → discardTrip() →
+        // DELETE the telemetry file, destroying a short trip that previously
+        // survived the kill as a recoverable file. It would also flip
+        // initialized/enabled false and close the H2 store, which strands trips
+        // dead for the rest of the process whenever the caller's SIGKILL fails
+        // (the abort-restart endpoint exists precisely because it can).
+        // Best-effort and fully guarded — never block the restart.
+        try {
+            com.overdrive.app.trips.TripAnalyticsManager tam =
+                CameraDaemon.getTripAnalyticsManager();
+            if (tam != null && tam.isEnabled() && tam.isInitialized()) {
+                CameraDaemon.log("prepare-restart: checkpointing active trip before kill");
+                tam.checkpointActiveTrip();
+            }
+        } catch (Throwable t) {
+            CameraDaemon.log("prepare-restart: trip checkpoint failed: " + t.getMessage());
+        }
         try {
             GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
             if (pipeline != null && pipeline.isRunning()) {
@@ -1823,7 +2030,14 @@ public class SurveillanceApiHandler {
         response.put("viewMode", viewMode);
         
         JSONArray quadrants = new JSONArray();
-        String[] names = {"front", "right", "left", "rear"};
+        // MUST match MotionPipelineV2.QUADRANT_NAMES: Q0=front, Q1=right, Q2=REAR,
+        // Q3=LEFT. This array had "left" and "rear" transposed, so the heatmap
+        // labelled every Q2 (rear) reading "left" and every Q3 (left) reading
+        // "rear" — i.e. enabling the debug heatmap showed motion blocks on the
+        // rear camera when the motion was actually on the left one. It was the
+        // only place in the codebase with this order (grep: EventTimelineCollector
+        // and MotionPipelineV2 both use the canonical one).
+        String[] names = MotionPipelineV2.QUADRANT_NAMES;
         
         SurveillanceEngineGpu sentry = (gpuPipeline != null) ? gpuPipeline.getSentry() : null;
         MotionPipelineV2.QuadrantResult[] results = (sentry != null) ? sentry.getV2Results() : null;

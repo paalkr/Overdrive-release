@@ -16,6 +16,8 @@ import java.io.File
  * @param rotationCount Number of rotated log files to keep
  * @param enableConsoleLog Whether to log to Android Log (logcat)
  * @param enableFileLog Whether to write logs to file
+ * @param minLevel Lowest severity that is emitted at all; anything below is dropped
+ *   before both the console and the file sink
  */
 data class LogConfig(
     val logDir: String = "",
@@ -28,7 +30,16 @@ data class LogConfig(
     val maxFileSizeMB: Int = 5,
     val rotationCount: Int = 3,
     val enableConsoleLog: Boolean = true,
-    val enableFileLog: Boolean = false
+    val enableFileLog: Boolean = false,
+    // Minimum level that is emitted at all. Mirrors DaemonLogger's existing
+    // Config.minLevel gate (default INFO), which LogManager never had: without
+    // it EVERY debug() call formatted a timestamp, built a string, hit logcat
+    // and did a synchronously-FLUSHED file append under a process-global lock.
+    // Background paths call debug() on every adb shell command, so an idle app
+    // process was doing thousands of flushed disk writes a day for lines nobody
+    // reads (the release channel strips them via R8 anyway). DEBUG is still
+    // available by passing a config with minLevel = LogLevel.DEBUG.
+    val minLevel: LogLevel = LogLevel.INFO
 ) {
     companion object {
         private var appLogDir: String? = null
@@ -92,6 +103,15 @@ data class LogConfig(
      * we clamp it to a sane 1 GB ceiling here — the gate every persist path
      * (updateLoggingConfig / importConfig) already runs through.
      */
+    /**
+     * Whether a line of [level] survives the severity gate.
+     *
+     * Kept here, as a pure function, so the policy is unit-testable without a Context,
+     * a log directory, or Android's Log — LogManager itself is a file-writing singleton
+     * and is not.
+     */
+    fun emits(level: LogLevel): Boolean = level.ordinal >= minLevel.ordinal
+
     fun isValid(): Boolean {
         if (enableFileLog && logDir.isEmpty()) return false
         return retentionHours in 1..(24 * 30) &&     // ≤ 30 days

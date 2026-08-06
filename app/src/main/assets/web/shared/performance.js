@@ -40,6 +40,10 @@ BYD.performance = {
         stats: {},
         sessions: []
     },
+
+    // Data-usage state
+    dataUsageRange: 30, // days
+    dataUsageData: { days: [], enabled: false, available: true },
     
     // Interactive tooltip state
     tooltip: {
@@ -99,6 +103,7 @@ BYD.performance = {
             try { self.renderSocChart(); } catch (_) {}
             try { self.renderVoltageChart(); } catch (_) {}
             try { self.renderThermalChart(); } catch (_) {}
+            try { self.renderDataUsageChart(); } catch (_) {}
         });
         this._themeObserver.observe(document.documentElement, {
             attributes: true,
@@ -126,6 +131,15 @@ BYD.performance = {
         // Initialize charts
         this.initCharts();
 
+        // Paint the data-usage card's DEFAULT (disabled) state immediately, before
+        // the await chain below. The card's hint + content both start display:none
+        // and only applyDataUsageState() reveals one — so if the first
+        // fetchDataUsage() (line ~169) fails/hangs, or init aborts before it, the
+        // card would otherwise sit permanently blank (no hint, no error). Painting
+        // the default here guarantees the "Enable to track…" hint shows on load;
+        // a later successful fetch upgrades it to the live state.
+        try { this.applyDataUsageState(); } catch (e) {}
+
         // SOTA: Connect to backend (starts monitoring if first client)
         await this.connect();
         
@@ -148,6 +162,9 @@ BYD.performance = {
         // — when a click hits an already-open tab, sw.js navigates the
         // existing window which only updates location.hash, no reload.
         var self = this;
+        if (BYD.i18n && typeof BYD.i18n.onChange === 'function') {
+            BYD.i18n.onChange(function() { self.fetchSohStatus(); });
+        }
         if (window.location.hash === '#soh-fix') {
             this._scrollToSohFixBanner();
         }
@@ -157,8 +174,14 @@ BYD.performance = {
             }
         });
 
+        // Fetch initial data-usage (also reflects the enabled/disabled state)
+        await this.fetchDataUsage();
+
         // Start SOC polling (less frequent)
         this.socPollInterval = setInterval(() => this.fetchSocHistory(), this.SOC_UPDATE_INTERVAL);
+
+        // Data-usage polling (every 2 minutes — matches the sampler cadence)
+        this.dataUsagePollInterval = setInterval(() => this.fetchDataUsage(), this.SOC_UPDATE_INTERVAL);
         
         // Battery health polling (every 2 minutes — same as SOC)
         this.batteryHealthPollInterval = setInterval(() => this.fetchBatteryHealth(), this.SOC_UPDATE_INTERVAL);
@@ -194,6 +217,12 @@ BYD.performance = {
                 // Page visible again - reconnect
                 console.log('[Performance] Page visible - reconnecting');
                 this.connect();
+                // Refresh IMMEDIATELY, do not wait for the next scheduled tick. Browsers throttle
+                // or freeze background timers, so the 60s SOC poll may not have fired for minutes:
+                // returning to the tab showed data as old as the moment it was backgrounded, which
+                // reads exactly like a stuck graph. connect() only restarts the heartbeat.
+                this.fetchData();
+                this.fetchSocHistory();
             }
         });
         
@@ -301,6 +330,7 @@ BYD.performance = {
         this.charts.soc = this.createChart('socChart', 'soc');
         this.charts.voltage = this.createChart('voltageChart', 'voltage');
         this.charts.thermal = this.createChart('thermalChart', 'thermal');
+        this.charts.dataUsage = this.createChart('dataUsageChart', 'dataUsage');
 
         // Setup IntersectionObserver for charts that may be below the fold on mobile
         this._setupVisibilityObserver();
@@ -463,15 +493,29 @@ BYD.performance = {
             const timeEnd = history[history.length - 1].t;
             const targetTime = timeStart + (relativeX / chartWidth) * (timeEnd - timeStart);
             dataIndex = this.findClosestTimeIndex(history, targetTime);
+        } else if (chartType === 'dataUsage') {
+            // Discrete daily BARS (not a time-series line). The bar chart uses its
+            // own padding (left:55) and slot geometry, so recompute against those
+            // rather than the shared padding above. Map mouseX → day-bar index.
+            var duDays = (this.dataUsageData && this.dataUsageData.days) || [];
+            if (!duDays.length) { this.tooltip.visible = false; return; }
+            var duPadLeft = 55, duPadRight = 15;
+            var duChartW = width - duPadLeft - duPadRight;
+            if (mouseX < duPadLeft || mouseX > width - duPadRight) {
+                this.tooltip.visible = false; this.renderDataUsageChart(); return;
+            }
+            var duSlot = duChartW / duDays.length;
+            dataIndex = Math.floor((mouseX - duPadLeft) / duSlot);
+            dataIndex = Math.max(0, Math.min(duDays.length - 1, dataIndex));
         } else {
             // Real-time charts use index-based positioning
             const data = this.getChartData(chartType);
             if (!data || data.length === 0) return;
-            
+
             dataIndex = Math.round((relativeX / chartWidth) * (data[0].length - 1));
             dataIndex = Math.max(0, Math.min(data[0].length - 1, dataIndex));
         }
-        
+
         this.tooltip.visible = true;
         this.tooltip.chartId = chartType;
         this.tooltip.x = mouseX;
@@ -545,9 +589,12 @@ BYD.performance = {
             case 'thermal':
                 this.renderThermalChart();
                 break;
+            case 'dataUsage':
+                this.renderDataUsageChart();
+                break;
         }
     },
-    
+
     resizeCharts() {
         Object.keys(this.charts).forEach(key => {
             const canvasId = key === 'cpu' ? 'cpuChart' : key === 'mem' ? 'memChart' : key === 'gpu' ? 'gpuChart' : key === 'soc' ? 'socChart' : key === 'voltage' ? 'voltageChart' : key === 'thermal' ? 'thermalChart' : key + 'Chart';
@@ -563,8 +610,9 @@ BYD.performance = {
         this.renderSocChart();
         this.renderVoltageChart();
         this.renderThermalChart();
+        this.renderDataUsageChart();
     },
-    
+
     startPolling() {
         this.fetchData();
         this.pollInterval = setInterval(() => this.fetchData(), this.UPDATE_INTERVAL);
@@ -582,6 +630,10 @@ BYD.performance = {
         if (this.batteryHealthPollInterval) {
             clearInterval(this.batteryHealthPollInterval);
             this.batteryHealthPollInterval = null;
+        }
+        if (this.dataUsagePollInterval) {
+            clearInterval(this.dataUsagePollInterval);
+            this.dataUsagePollInterval = null;
         }
         // SOTA: Disconnect from backend when stopping
         this.disconnect();
@@ -647,7 +699,16 @@ BYD.performance = {
             this.updateMetric('cpuValue', systemWholeDevice, '');   // system, % of device
             this.updateMetric('cpuAppValue', appWholeDevice, '');   // app, % of device
             this.updateBar('cpuBar', appWholeDevice);
-            this.updateMetric('cpuFreq', data.cpu.freqMhz, ' MHz');
+            // Show current / max so thermal throttling is self-evident: when the
+            // current freq sits well below max under load (and temp is high) the
+            // SoC is throttling — which drags the whole head-unit UI on this
+            // shared SDM665, not just OverDrive. maxFreqMhz is the static hardware
+            // ceiling; omitted (0) on kernels that don't expose it.
+            if (data.cpu.maxFreqMhz) {
+                this.updateMetric('cpuFreq', data.cpu.freqMhz + ' / ' + data.cpu.maxFreqMhz, ' MHz');
+            } else {
+                this.updateMetric('cpuFreq', data.cpu.freqMhz, ' MHz');
+            }
             this.updateMetric('cpuTemp', data.cpu.tempC, '°C');
             this.setCardStatus('cpuCard', appWholeDevice);
 
@@ -694,6 +755,21 @@ BYD.performance = {
         // Update GPU metrics
         if (data.gpu) {
             this.updateMetric('gpuValue', data.gpu.usage || 0, '');
+            // Honesty marker (issue #173): when the value is a hardcoded
+            // freq-ratio guess (no busy counter AND no readable max-freq, e.g.
+            // BYD 2602 firmware → gpuclk/650 = a constant 92.3%), flag it via a
+            // tooltip so a reader doesn't mistake the estimate for a real load.
+            // The displayed number is unchanged.
+            const gpuValueEl = document.getElementById('gpuValue');
+            if (gpuValueEl) {
+                if (data.gpu.usageSource === 'freq_ratio_hardcoded') {
+                    gpuValueEl.title = 'Estimated from clock ratio (no GPU busy counter available on this firmware) — not a measured load.';
+                    gpuValueEl.classList.add('estimated');
+                } else {
+                    gpuValueEl.removeAttribute('title');
+                    gpuValueEl.classList.remove('estimated');
+                }
+            }
             this.updateBar('gpuBar', data.gpu.usage || 0);
             this.updateMetric('gpuFreq', (data.gpu.freqMhz ? data.gpu.freqMhz.toFixed(0) : '--'), ' MHz');
             this.updateMetric('gpuTemp', data.gpu.tempC || '--', '°C');
@@ -1210,8 +1286,239 @@ BYD.performance = {
         ctx.fill();
     },
     
+    // ==================== DATA USAGE METHODS ====================
+
+    /** Human-readable bytes (base-1024): 1536 -> "1.5 KB". */
+    formatBytes(bytes) {
+        if (bytes == null || isNaN(bytes) || bytes <= 0) return '0 B';
+        var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        var i = Math.floor(Math.log(bytes) / Math.log(1024));
+        if (i >= units.length) i = units.length - 1;
+        var val = bytes / Math.pow(1024, i);
+        return (val >= 100 || i === 0 ? val.toFixed(0) : val.toFixed(1)) + ' ' + units[i];
+    },
+
+    setDataUsageRange(days) {
+        this.dataUsageRange = days;
+        var sel = document.getElementById('dataUsageTimeSelector');
+        if (sel) {
+            sel.querySelectorAll('.time-btn').forEach(function (btn) {
+                btn.classList.toggle('active', parseInt(btn.dataset.days) === days);
+            });
+        }
+        this.fetchDataUsage();
+    },
+
+    /** Fetch usage + reflect the enabled/disabled state into the card UI.
+     *  EVERY exit path calls applyDataUsageState() so the card can never sit
+     *  blank: on a non-2xx status, a JSON-parse throw, or a rejected/stalled
+     *  fetch we fall back to painting the current (default-or-last-known) state
+     *  — the hint at minimum — instead of returning early and leaving both the
+     *  hint and content divs at their HTML display:none. */
+    async fetchDataUsage() {
+        try {
+            var res = await fetch('/api/performance/data-usage?days=' + this.dataUsageRange);
+            if (!res.ok) { this.applyDataUsageState(); return; }
+            var data = await res.json();
+            this.dataUsageData = data || { days: [], enabled: false, available: true };
+            this.applyDataUsageState();
+            this.updateDataUsageStats();
+            this.renderDataUsageChart();
+        } catch (e) {
+            console.error('[Performance] data-usage fetch error:', e);
+            try { this.applyDataUsageState(); } catch (e2) {}
+        }
+    },
+
+    /** Show the toggle position + swap hint/content based on enabled flag. */
+    applyDataUsageState() {
+        var enabled = !!this.dataUsageData.enabled;
+        var cb = document.getElementById('dataUsageEnabled');
+        if (cb) cb.checked = enabled;
+        var hint = document.getElementById('dataUsageHint');
+        var content = document.getElementById('dataUsageContent');
+        if (hint) hint.style.display = enabled ? 'none' : 'block';
+        if (content) content.style.display = enabled ? 'block' : 'none';
+
+        // Note line: "collecting…" until the first day lands, or a kernel-
+        // unsupported message if qtaguid is unreadable.
+        var note = document.getElementById('dataUsageNote');
+        if (note) {
+            if (enabled && this.dataUsageData.available === false) {
+                note.textContent = BYD.i18n.t('performance.data_usage_unavailable');
+                note.style.display = 'block';
+            } else if (enabled && (!this.dataUsageData.days || this.dataUsageData.days.length === 0)) {
+                note.textContent = BYD.i18n.t('performance.data_usage_collecting');
+                note.style.display = 'block';
+            } else {
+                note.style.display = 'none';
+            }
+        }
+    },
+
+    /** Toggle handler wired to the checkbox onchange. */
+    async toggleDataUsage(enabled) {
+        try {
+            // Optimistic UI swap; fetchDataUsage below reconciles with the server.
+            this.dataUsageData.enabled = enabled;
+            this.applyDataUsageState();
+            await fetch('/api/performance/data-usage/toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled })
+            });
+        } catch (e) {
+            console.error('[Performance] data-usage toggle error:', e);
+        } finally {
+            // Re-pull the authoritative state (also refreshes chart when enabling).
+            this.fetchDataUsage();
+        }
+    },
+
+    updateDataUsageStats() {
+        var d = this.dataUsageData || {};
+        this.updateElement('duTotal', this.formatBytes(d.total));
+        this.updateElement('duWifi', this.formatBytes(d.totalWifi));
+        this.updateElement('duMobile', this.formatBytes(d.totalMobile));
+        this.updateElement('duApp', this.formatBytes(d.totalApp));
+        this.updateElement('duSystem', this.formatBytes(d.totalSystem));
+    },
+
+    /**
+     * Stacked daily bar chart: WiFi (brand-secondary) stacked on Mobile
+     * (chart-warning). One bar per day over the selected range; missing days
+     * render as gaps (zero-height). Uses the same canvas/DPR setup as the SOC
+     * chart via createChart.
+     */
+    renderDataUsageChart() {
+        // The Data tab starts hidden (display:none), so the canvas is 0×0 when
+        // initCharts() first runs — the chart object cached at boot has width=0
+        // and drawing into it paints nothing (the "data comes but no chart" bug).
+        // Mirror renderVoltageChart/renderThermalChart: if the canvas isn't laid
+        // out yet, defer via the IntersectionObserver; once visible, RECREATE the
+        // chart so it picks up the real dimensions before drawing.
+        var canvas = document.getElementById('dataUsageChart');
+        if (!canvas) return;
+        var r = canvas.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) {
+            this._scheduleVisibilityRender('dataUsageChart', 'dataUsage');
+            return;
+        }
+        this.charts.dataUsage = this.createChart('dataUsageChart', 'dataUsage');
+        var chart = this.charts.dataUsage;
+        if (!chart || !chart.ctx) return;
+        var ctx = chart.ctx, width = chart.width, height = chart.height;
+        var padding = { top: 15, right: 15, bottom: 30, left: 55 };
+        var chartWidth = width - padding.left - padding.right;
+        var chartHeight = height - padding.top - padding.bottom;
+
+        ctx.clearRect(0, 0, width, height);
+
+        var days = (this.dataUsageData && this.dataUsageData.days) || [];
+        if (!days.length) {
+            ctx.fillStyle = this.colors.text;
+            ctx.font = '13px Inter, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(BYD.i18n.t('performance.data_usage_no_data'), width / 2, height / 2);
+            return;
+        }
+
+        // Peak daily total for the Y scale (min 1 MB so tiny values still show).
+        var maxTotal = 1024 * 1024;
+        days.forEach(function (d) { if (d.total > maxTotal) maxTotal = d.total; });
+
+        var wifiColor = (getComputedStyle(document.documentElement)
+            .getPropertyValue('--brand-secondary') || '#0EA5E9').trim();
+        var mobileColor = (getComputedStyle(document.documentElement)
+            .getPropertyValue('--chart-warning') || '#f59e0b').trim();
+
+        // Grid + Y labels (4 rows).
+        ctx.strokeStyle = this.colors.grid;
+        ctx.lineWidth = 1;
+        ctx.textAlign = 'right';
+        ctx.font = '10px Inter, sans-serif';
+        for (var i = 0; i <= 4; i++) {
+            var y = padding.top + (chartHeight * i / 4);
+            ctx.beginPath();
+            ctx.moveTo(padding.left, y);
+            ctx.lineTo(width - padding.right, y);
+            ctx.stroke();
+            ctx.fillStyle = this.colors.text;
+            ctx.fillText(this.formatBytes(maxTotal * (4 - i) / 4), padding.left - 8, y + 3);
+        }
+
+        // Bars.
+        var n = days.length;
+        var slot = chartWidth / n;
+        var barW = Math.max(2, Math.min(slot * 0.7, 28));
+        var self = this;
+        days.forEach(function (d, idx) {
+            var cx = padding.left + slot * idx + slot / 2;
+            var x = cx - barW / 2;
+            var wifiH = (d.wifi / maxTotal) * chartHeight;
+            var mobileH = (d.mobile / maxTotal) * chartHeight;
+            var otherH = (d.other / maxTotal) * chartHeight;
+            var yBase = padding.top + chartHeight;
+            // Mobile at the bottom, WiFi stacked above, other on top.
+            ctx.fillStyle = mobileColor;
+            ctx.fillRect(x, yBase - mobileH, barW, mobileH);
+            ctx.fillStyle = wifiColor;
+            ctx.fillRect(x, yBase - mobileH - wifiH, barW, wifiH);
+            if (otherH > 0) {
+                ctx.fillStyle = self.colors.text;
+                ctx.fillRect(x, yBase - mobileH - wifiH - otherH, barW, otherH);
+            }
+        });
+
+        // X labels: first, middle, last day (avoid clutter over 30 bars).
+        ctx.fillStyle = this.colors.text;
+        ctx.textAlign = 'center';
+        ctx.font = '10px Inter, sans-serif';
+        var idxs = n <= 3 ? days.map(function (_, i) { return i; }) : [0, Math.floor(n / 2), n - 1];
+        idxs.forEach(function (idx) {
+            var cx = padding.left + slot * idx + slot / 2;
+            var label = (days[idx].date || '').slice(5); // MM-DD
+            ctx.fillText(label, cx, height - 10);
+        });
+
+        // Hover tooltip: highlight the hovered day's bar slot + show a box with
+        // that day's WiFi / Mobile / Total. Gated on this chart being hovered.
+        if (this.tooltip && this.tooltip.visible && this.tooltip.chartId === 'dataUsage'
+                && this.tooltip.dataIndex >= 0 && this.tooltip.dataIndex < n) {
+            var hd = days[this.tooltip.dataIndex];
+            var hcx = padding.left + slot * this.tooltip.dataIndex + slot / 2;
+            // Faint highlight over the hovered slot.
+            ctx.fillStyle = 'rgba(255,255,255,0.06)';
+            ctx.fillRect(hcx - slot / 2, padding.top, slot, chartHeight);
+            var lines = [
+                (hd.date || ''),
+                'Total: ' + this.formatBytes(hd.total),
+                'WiFi: ' + this.formatBytes(hd.wifi),
+                'Mobile: ' + this.formatBytes(hd.mobile)
+            ];
+            if (hd.other > 0) lines.push('Other: ' + this.formatBytes(hd.other));
+            ctx.font = '11px Inter, sans-serif';
+            var boxW = 0;
+            lines.forEach(function (l) { boxW = Math.max(boxW, ctx.measureText(l).width); });
+            boxW += 16;
+            var lineH = 15, boxH = lines.length * lineH + 10;
+            // Keep the box inside the canvas horizontally.
+            var bx = Math.min(Math.max(hcx + 8, padding.left), width - padding.right - boxW);
+            var by = padding.top + 6;
+            ctx.fillStyle = (this.colors.tooltipBg || 'rgba(20,20,30,0.95)');
+            ctx.strokeStyle = (this.colors.tooltipBorder || 'rgba(255,255,255,0.1)');
+            ctx.lineWidth = 1;
+            if (ctx.fillRect) { ctx.fillRect(bx, by, boxW, boxH); ctx.strokeRect(bx, by, boxW, boxH); }
+            ctx.textAlign = 'left';
+            ctx.fillStyle = (this.colors.tooltipText || '#FFFFFF');
+            lines.forEach(function (l, i) {
+                ctx.fillText(l, bx + 8, by + 16 + i * lineH);
+            });
+        }
+    },
+
     // ==================== SOC CHART METHODS ====================
-    
+
     /**
      * Set SOC time range and refresh data
      */
@@ -1249,11 +1556,40 @@ BYD.performance = {
                 
                 this.updateSocStats();
                 this.renderSocChart();
+                this.socFetchFailures = 0;
             } else {
                 console.error('[Performance] SOC fetch failed:', res.status);
+                this.noteSocFetchFailure();
             }
         } catch (e) {
             console.error('[Performance] SOC fetch error:', e);
+            this.noteSocFetchFailure();
+        }
+    },
+
+    /**
+     * A failed poll leaves the previous chart frame on screen, which is indistinguishable from a
+     * frozen graph. Rather than blank a still-useful chart on one transport blip, mark the readouts
+     * stale only after several consecutive failures, and let a success clear it.
+     */
+    socFetchFailures: 0,
+    SOC_STALE_AFTER_FAILURES: 3,
+    noteSocFetchFailure() {
+        this.socFetchFailures = (this.socFetchFailures || 0) + 1;
+        if (this.socFetchFailures === this.SOC_STALE_AFTER_FAILURES) {
+            // Suffix the current readout rather than wiping it: the last known value is still the
+            // best information available, it just should not look live.
+            //
+            // BOTH readouts, because the page carries two SOC layouts — the stats card writes
+            // #socCurrent (updateSocStats) and the EV dashboard writes #evSocValue. Marking only
+            // the first left the cue invisible on whichever layout was showing the other, which
+            // defeats the point of the marker.
+            ['socCurrent', 'evSocValue'].forEach(function (id) {
+                const el = document.getElementById(id);
+                if (el && el.textContent && el.textContent.indexOf('\u2022') === -1) {
+                    el.textContent = el.textContent + ' \u2022 stale';
+                }
+            });
         }
     },
     
@@ -1394,7 +1730,13 @@ BYD.performance = {
         // Time range
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart;
+        // Defence-in-depth: every x is (t - timeStart) / timeRange, so a non-ascending series
+        // (possible only if a clock correction slipped past the backend's upper time bound and
+        // monotonicity guard) would divide by <= 0 and produce Infinity/NaN coordinates — a blank
+        // or garbage line that reads as a frozen graph. Fall back to 1 so the chart degenerates to
+        // a readable flat/left-anchored line instead of vanishing.
+        const rawRange = timeEnd - timeStart;
+        const timeRange = rawRange > 0 ? rawRange : 1;
         
         // Draw grid
         ctx.strokeStyle = this.colors.grid;
@@ -1866,7 +2208,10 @@ BYD.performance = {
 
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart || 1;
+        // `> 0 ? :` not `|| 1` — matches the SOC render and also guards a NEGATIVE range,
+        // which a non-monotonic series would produce (|| 1 only catches exactly 0).
+        const rawTimeRange = timeEnd - timeStart;
+        const timeRange = rawTimeRange > 0 ? rawTimeRange : 1;
 
         let minV = Infinity, maxV = -Infinity;
         history.forEach(p => { if (p.voltage < minV) minV = p.voltage; if (p.voltage > maxV) maxV = p.voltage; });
@@ -1958,7 +2303,10 @@ BYD.performance = {
 
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart || 1;
+        // `> 0 ? :` not `|| 1` — matches the SOC render and also guards a NEGATIVE range,
+        // which a non-monotonic series would produce (|| 1 only catches exactly 0).
+        const rawTimeRange = timeEnd - timeStart;
+        const timeRange = rawTimeRange > 0 ? rawTimeRange : 1;
 
         // Auto-scale Y
         let minT = Infinity, maxT = -Infinity;
@@ -2490,7 +2838,8 @@ BYD.performance = {
         // Best-effort: capitalize first letter. Manifest titles aren't cached
         // here; the modal has the full list when the user opens it.
         if (!id) return '';
-        return id.charAt(0).toUpperCase() + id.slice(1);
+        var fallback = id.charAt(0).toUpperCase() + id.slice(1);
+        return BYD.i18n.modelName(id, fallback);
     },
 
     // ==================== SOH Capacity Modal ====================
@@ -2575,7 +2924,8 @@ BYD.performance = {
             opt.value = m.id || '';
             // Manifest's canonical user-facing string is "name"; older
             // copies used "title". Fall back to id when neither is set.
-            opt.textContent = m.name || m.title || m.id || '';
+            var canonicalName = m.name || m.title || m.id || '';
+            opt.textContent = BYD.i18n.modelName(m.id, canonicalName);
             modelSel.appendChild(opt);
             // Gross nameplate for every drivetrain. PHEV remainKwh is corrected
             // to the gross frame at the HAL read boundary (the BYD HAL reports

@@ -168,7 +168,14 @@ object UnifiedConfigManager {
     // Cleared by a successful load or forceReload().
     @Volatile
     private var corruptionDetected = false
-    
+
+    // One-shot log latch for the tripAnalytics.enabled default migration.
+    // applyDefaults is idempotent and re-runs on every reparse in the app UID
+    // (persistMigrationUnderLock is daemon-only), so without this the migration
+    // line would repeat on every config reload in that process.
+    @Volatile
+    private var tripEnabledMigrationLogged = false
+
     // Change listeners
     private val listeners = CopyOnWriteArrayList<ConfigChangeListener>()
     
@@ -243,6 +250,8 @@ object UnifiedConfigManager {
         unified.put("telemetryOverlay", JSONObject())
         unified.put("tripAnalytics", JSONObject())
         unified.put("oemDashcam", JSONObject())
+        unified.put("keymap", JSONObject())
+        unified.put("automation", JSONObject())
         unified.put("version", 1)
         unified.put("lastModified", System.currentTimeMillis())
         
@@ -431,6 +440,18 @@ object UnifiedConfigManager {
         val blindspot = config.optJSONObject("blindspot") ?: JSONObject().also {
             config.put("blindspot", it)
         }
+        // Camera-view section: an on-demand camera view (front/rear/left/right/all-4)
+        // shown on the SAME native SurfaceControl lane the blind-spot feature uses,
+        // arbitrated at render time with blind-spot priority. No default keys force
+        // behavior (enabled defaults false, so a config without this section is
+        // byte-identical to the shipping path); just guarantee the section exists so
+        // per-key merges never miss the whole object. Keys (all optional):
+        //   enabled(bool), mode(int 0=all/1=front/2=right/3=rear/4=left),
+        //   target("head_unit"|"cluster"), geometry{sizePct,corner | x,y,w,h},
+        //   geometryCluster{...}, autoHideSec(int; 0=until explicitly hidden).
+        config.optJSONObject("camview") ?: JSONObject().also {
+            config.put("camview", it)
+        }
         // Power / battery-safety section. Holds the HV-SoC surveillance cutoff
         // read by SocCutoffMonitor.cutoffPercent() (key power.lowSocCutoffPercent).
         val power = config.optJSONObject("power") ?: JSONObject().also {
@@ -445,6 +466,15 @@ object UnifiedConfigManager {
         // navMap below.
         config.optJSONObject("telegram") ?: JSONObject().also {
             config.put("telegram", it)
+        }
+
+        // Key-mapping section: {enabled, allowAdvanced, bindings:[...]}. Bindings
+        // are user-authored (keycode + pressType + action), so there are no
+        // default keys to seed — just guarantee the section object exists so a
+        // partial/restored config is never missing it (same rationale as
+        // telegram above). enabled/allowAdvanced default false at read time.
+        config.optJSONObject("keymap") ?: JSONObject().also {
+            config.put("keymap", it)
         }
 
         // Surveillance defaults
@@ -466,12 +496,41 @@ object UnifiedConfigManager {
         // no AI. Branched at SurveillanceEngineGpu.enable(). Default smart so
         // behaviour matches the prior single-mode build.
         if (!surveillance.has("accOffMode")) surveillance.put("accOffMode", "smart")
+        // Arm mode: WHEN surveillance arms after the car powers off.
+        //   "lock"  — arm when the doors lock, disarm when they unlock (avoids
+        //             recording the owner). Because most trims here can't read
+        //             lock state reliably (cloud rarely fires lock events, OTA
+        //             exposes only the LF door, the legacy device path returns
+        //             INVALID on every field firmware), lock mode ALSO force-arms
+        //             at DOOR_LOCK_ARM_TIMEOUT_MS (60s) when lock state stayed
+        //             unreadable — otherwise it would never arm on those trims.
+        //   "power" — arm immediately on ACC-off, disarm on ACC-on. No lock gate.
+        //             Deterministic; works on every trim.
+        // Branched in CameraDaemon's ACC-off dispatch + door-lock gate. Both modes
+        // still honor the safe-zone and schedule suppression gates. Default "lock"
+        // to preserve the owner-privacy behaviour of the prior single-mode build.
+        if (!surveillance.has("armMode")) surveillance.put("armMode", "lock")
         // Keep ONLY the USB/data rail powered after ACC OFF (e.g. to charge a phone
         // while parked). DEFAULT TRUE so out-of-box behaviour is unchanged; user
         // opt-out (Surveillance → General) lets just that rail sleep on the next
         // ACC-OFF cycle to save the 12 V battery. Does NOT affect the cameras — the
         // camera/AVM/ISP power keep-alives are unconditional in AccSentryDaemon.
         if (!surveillance.has("keepUsbPowerOnAccOff")) surveillance.put("keepUsbPowerOnAccOff", true)
+        // Operating mode: WHICH lifecycle phases OverDrive is active for.
+        //   "onAndOff" — full current behaviour: after the vehicle powers off the
+        //                daemon keeps the head unit awake (MCU/USB/AP wake, keep-alive
+        //                loop, voltage/SoC monitors) AND runs post-OFF surveillance /
+        //                sentry. This is the DEFAULT so out-of-box behaviour and every
+        //                existing/absent config is byte-identical to the prior build.
+        //   "onOnly"   — everything that runs AFTER vehicle-OFF is disabled: no
+        //                keep-awake, no post-OFF surveillance/recording, revival alarms
+        //                stood down — the head unit is allowed to sleep normally when the
+        //                car is off. Everything that runs WHILE the vehicle is ON
+        //                (ACC-on dashcam, trips, charging analytics, live telemetry)
+        //                keeps working. Gated at each post-OFF choke point via
+        //                isVehicleOnOnlyMode(). Read fresh (mtime-gated) so a change
+        //                applies on the next ACC cycle without a daemon restart.
+        if (!surveillance.has("operatingMode")) surveillance.put("operatingMode", "onAndOff")
         if (!surveillance.has("deterrentAction")) surveillance.put("deterrentAction", "silent")
         if (!surveillance.has("deterrentCooldownSeconds")) surveillance.put("deterrentCooldownSeconds", 15)
         if (!surveillance.has("screenDeterrentEnabled")) surveillance.put("screenDeterrentEnabled", false)
@@ -547,6 +606,24 @@ object UnifiedConfigManager {
         // oemDashcam.fps (30) → recording.fps chain. Seeding a single value
         // here would drop OEM parked fps from its 30 default to 15. Absence =
         // byte-identical per pipeline; presence = an explicit user choice.
+        // ---- Parked-idle low-power throttle (default OFF = byte-identical) ----
+        // When ARMED surveillance sits idle (no active motion), drop the shared
+        // camera HAL to surveillanceIdleFps to cut capture-rail + compose/encode
+        // power, then ramp back to the surveillance fps on first-motion. Detection
+        // parity is preserved by holding the AI motion cadence CONSTANT at today's
+        // rate (survFps/3 Hz) via a wall-clock readback gate — independent of the
+        // HAL rate — so the frame-counted native pipeline sees identical cadence.
+        // Master gate defaults FALSE: absent ⇒ nothing changes vs today.
+        if (!camera.has("surveillanceIdleThrottle")) camera.put("surveillanceIdleThrottle", false)
+        if (!camera.has("surveillanceIdleFps"))      camera.put("surveillanceIdleFps", 5)
+        // Quiet tier (issue #174): once the idle throttle is active AND no motion
+        // has occurred for surveillanceQuietTierMinutes, step the AI motion cadence
+        // down to surveillanceQuietTierFps Hz (relaxing the idle-HAL parity floor to
+        // match) so a long parked-idle tail stops paying ~10 Hz readbacks. First
+        // motion restores full cadence. ON by default WHEN the throttle is on
+        // (5 min / 3 Hz); minutes=0 disables the tier. Absent ⇒ these defaults.
+        if (!camera.has("surveillanceQuietTierMinutes")) camera.put("surveillanceQuietTierMinutes", 5)
+        if (!camera.has("surveillanceQuietTierFps"))     camera.put("surveillanceQuietTierFps", 3)
         if (!camera.has("probedCameraId"))    camera.put("probedCameraId", -1)
         if (!camera.has("probedSurfaceMode")) camera.put("probedSurfaceMode", -1)
         if (!camera.has("roleMappings"))      camera.put("roleMappings", JSONObject())
@@ -612,19 +689,64 @@ object UnifiedConfigManager {
         // "side" (side camera only), or "rear" (rear camera only). The single-camera
         // modes show one full-FOV feed instead of the merged panorama.
         if (!blindspot.has("mergeMode")) blindspot.put("mergeMode", "both")
+        // On-screen card rotation. Either a fixed quarter turn (int 0/90/180/270) or
+        // the string "auto". Applied by the SurfaceControl layer, and only honoured
+        // for the single-camera merge modes (side/rear) — the merged panorama always
+        // renders upright. 0 = shipping. In "auto" the daemon orients to direction of
+        // travel: it holds "rotationBase" moving forward and flips 180° in reverse.
+        if (!blindspot.has("rotation")) blindspot.put("rotation", 0)
+        // Base quarter turn used as the forward-gear orientation when rotation="auto".
+        if (!blindspot.has("rotationBase")) blindspot.put("rotationBase", 0)
+        // PER-SIDE card rotation. The left camera (view 7, left turn) and the right
+        // camera (view 8, right turn) are physically mirror-imaged, so each needs its
+        // own on-screen rotation — one global angle that reads upright on the left cam
+        // reads wrong on the right. rotationLeft/rotationRight are the fixed per-side
+        // quarter turns (int 0/90/180/270 or the string "auto"); when rotation="auto",
+        // rotationBaseLeft/rotationBaseRight are that side's forward-gear base (reverse
+        // flips 180°). Defaults mirror the legacy global keys so an existing config is
+        // unchanged; resolveBsRotation falls back to the global keys when these are
+        // absent, so this is purely additive.
+        if (!blindspot.has("rotationLeft")) blindspot.put("rotationLeft", blindspot.opt("rotation"))
+        if (!blindspot.has("rotationRight")) blindspot.put("rotationRight", blindspot.opt("rotation"))
+        if (!blindspot.has("rotationBaseLeft")) blindspot.put("rotationBaseLeft", blindspot.optInt("rotationBase", 0))
+        if (!blindspot.has("rotationBaseRight")) blindspot.put("rotationBaseRight", blindspot.optInt("rotationBase", 0))
+        // Fisheye / lens dewarp for the SINGLE-CAMERA views (side/rear) only. 0..100,
+        // same two-parameter division-model dewarp as recording.rectifyStrength but a
+        // SEPARATE knob so the blind-spot single-cam feed can be straightened
+        // independently of the recording pipeline. 0 = off (default); ignored for the
+        // merged 'both' view (libod already handles that projection).
+        if (!blindspot.has("rectifyStrength")) blindspot.put("rectifyStrength", 0)
 
         // Telemetry Overlay defaults.
         //
-        // Schema:
-        //   enabled            (legacy) — pano fallback when panoEnabled absent
-        //   panoEnabled        explicit pano gate; if absent, falls back to enabled
+        // Master-enable schema (which flows burn in the overlay AT ALL):
+        //   enabled            (legacy) — pano/ACC-on fallback when panoEnabled absent
+        //   panoEnabled        explicit pano/ACC-on gate; if absent, falls back to enabled
+        //   surveillanceEnabled explicit ACC-off surveillance gate; default false
+        //                      (parked burn-in is a deliberate opt-in — it keeps
+        //                      the BYD-HAL poll alive while parked, a 12V draw)
         //   oemDashcamEnabled  explicit OEM Dashcam gate; default false (the OEM
         //                      front sensor doesn't need a stamp by default —
         //                      separate opt-in keeps pano clean while OEM is on)
         //
-        // Resolver lives at isTelemetryOverlayEnabledFor(flow). Don't read
-        // panoEnabled / oemDashcamEnabled directly from callers — the legacy
-        // fallback is part of the contract.
+        // Per-flow FIELD selection (which fields each enabled flow draws) lives
+        // under a nested `fields` object keyed by flow:
+        //   fields.accOn / fields.surveillance / fields.oemDashcam = ["speed",...]
+        // Each flow owns its OWN list — never shared. A MISSING list resolves to
+        // the legacy eight-field default (see TelemetryFields.legacyDefault),
+        // which is exactly what the overlay drew before this feature — so an app
+        // update never changes what an existing overlay shows. New optional
+        // fields (batteryPercent, voltage12v, lowBeam, highBeam, location)
+        // default OFF because they aren't in the legacy default.
+        //
+        // We deliberately DON'T seed the per-flow lists here: absence === legacy
+        // default at read time, so seeding would only risk drift from the
+        // canonical default that TelemetryFields owns. The web UI writes an
+        // explicit list the first time the user edits a flow.
+        //
+        // Master resolver: isTelemetryOverlayEnabledFor(flow). Field resolver:
+        // getTelemetryOverlayFields(flow). Don't read the keys directly from
+        // callers — the legacy fallbacks are part of the contract.
         val telemetryOverlay = config.optJSONObject("telemetryOverlay") ?: JSONObject().also {
             config.put("telemetryOverlay", it)
         }
@@ -662,6 +784,15 @@ object UnifiedConfigManager {
         if (!oemDashcam.has("recordingQuality")) oemDashcam.put("recordingQuality", "STANDARD")
         if (!oemDashcam.has("codec")) oemDashcam.put("codec", "H264")
         if (!oemDashcam.has("fps")) oemDashcam.put("fps", 30)
+        // ---- OEM parked-idle low-power throttle (default OFF = byte-identical) ----
+        // When parked + smart surveillance + vehicle OFF, the OEM dashcam is kept
+        // warm but only records event clips (triggered by the pano detector). While
+        // idle we throttle the ENCODE draw-stride to ~idleFps (the camera HAL rate
+        // stays >=15 since live setCameraFps is HAL-rejectable and KEY_FRAME_RATE is
+        // immutable — so we can snap to a clean full-fps event clip). Master gate
+        // defaults FALSE; the drive/continuous fps floor is never touched.
+        if (!oemDashcam.has("idleThrottleWhenParked")) oemDashcam.put("idleThrottleWhenParked", false)
+        if (!oemDashcam.has("idleFps")) oemDashcam.put("idleFps", 5)
         if (!oemDashcam.has("priorityWhenContended")) {
             // "pano" | "oemDashcam" — whichever pipeline holds the AVMCamera
             // when concurrentAvmSupported=0. Default pano because pano feeds
@@ -678,7 +809,38 @@ object UnifiedConfigManager {
         val tripAnalytics = config.optJSONObject("tripAnalytics") ?: JSONObject().also {
             config.put("tripAnalytics", it)
         }
-        if (!tripAnalytics.has("enabled")) tripAnalytics.put("enabled", false)
+        // Default ON — see TripConfig.DEFAULT_ENABLED. With this false the whole
+        // trip subsystem is never constructed (TripAnalyticsManager.initComponents
+        // is skipped), so the Trips page can only show "No trips recorded yet"
+        // while the one enable switch sits on the Storage tab.
+        if (!tripAnalytics.has("enabled")) tripAnalytics.put("enabled", true)
+        // ONE-SHOT UPGRADE. Flipping the seed default above only helps FRESH
+        // installs: every existing unit already has `enabled: false` persisted
+        // from when false was the default, and load() honours a persisted value.
+        // Those users would keep an inert trips page forever. Flip the stored
+        // false exactly once, marked by enabledDefaultMigrated.
+        //
+        // HONEST LIMITATION: the marker only protects opt-outs made from NOW ON.
+        // A config written before this build has no marker, so a `false` that the
+        // user deliberately chose is indistinguishable from the old default and
+        // IS overridden on this one upgrade. Trips capture GPS + 5Hz telemetry, so
+        // that is a real (one-time) privacy change — release-note it rather than
+        // claiming the design prevents it. After the flip, the marker makes every
+        // subsequent opt-out permanent.
+        if (!tripAnalytics.has("enabledDefaultMigrated")) {
+            tripAnalytics.put("enabledDefaultMigrated", true)
+            if (!tripAnalytics.optBoolean("enabled", true)) {
+                tripAnalytics.put("enabled", true)
+                // Log once per process. applyDefaults is idempotent and re-runs on
+                // every reparse in the APP uid (persistMigrationUnderLock is
+                // daemon-only, so the app never writes the marker back), which
+                // would otherwise re-log this line on each reload.
+                if (!tripEnabledMigrationLogged) {
+                    tripEnabledMigrationLogged = true
+                    Log.i(TAG, "tripAnalytics.enabled false→true (one-shot default migration)")
+                }
+            }
+        }
 
         // Floating status pill segment visibility. Independent of whether the
         // underlying feature (recording / trip analytics) is enabled — these
@@ -689,6 +851,7 @@ object UnifiedConfigManager {
         }
         if (!statusOverlay.has("cameraVisible")) statusOverlay.put("cameraVisible", true)
         if (!statusOverlay.has("tripVisible")) statusOverlay.put("tripVisible", true)
+        if (!statusOverlay.has("replayVisible")) statusOverlay.put("replayVisible", true)
         
         // BYD Cloud defaults
         val bydCloud = config.optJSONObject("bydCloud") ?: JSONObject().also {
@@ -720,14 +883,43 @@ object UnifiedConfigManager {
         // no map projected.
         if (!navMap.has("clusterMapActive")) navMap.put("clusterMapActive", false)
 
+        // Projection (native ProjectionFragment — cast an app onto the driver cluster).
+        // autoStartOnAcc casts autoStartPackage onto the cluster on ACC-on, read by the
+        // daemon in AccMonitor.notifyAccEdge exactly like navMap.autoProjectCluster does for
+        // the map. Mutually exclusive with navMap.autoProjectCluster (single cluster takeover
+        // surface); each toggle clears the sibling, and AccMonitor tiebreaks map-wins. The
+        // package lives here (daemon-readable, uid 2000) rather than the fragment's app-UID
+        // SharedPreferences (box geometry) because the daemon needs it at power-up. Off by default.
+        val projection = config.optJSONObject("projection") ?: JSONObject().also {
+            config.put("projection", it)
+        }
+        if (!projection.has("autoStartOnAcc")) projection.put("autoStartOnAcc", false)
+        if (!projection.has("autoStartPackage")) projection.put("autoStartPackage", "")
+
         // Vehicle appearance defaults — selected 3D model and body paint color.
         // Stored unified so AVN and remote (phone-over-tunnel) clients show the
         // same vehicle. modelId must match an entry in models/manifest.json; the
         // bundled default 'seal' is always available offline.
-        val vehicle = config.optJSONObject("vehicle") ?: JSONObject().also {
+        val storedVehicle = config.optJSONObject("vehicle")
+        val hadPersistedModel = storedVehicle?.has("modelId") == true
+        val vehicle = storedVehicle ?: JSONObject().also {
             config.put("vehicle", it)
         }
+        // Keep Seal as the offline 3D-renderer fallback, but do not present it
+        // to camera/SOH logic as a selected physical model on fresh installs.
+        // Existing configs predate provenance, so preserve their prior model
+        // behavior with the legacy source.
         if (!vehicle.has("modelId")) vehicle.put("modelId", "seal")
+        if (!vehicle.has("modelSource")) {
+            vehicle.put(
+                "modelSource",
+                if (hadPersistedModel) {
+                    VehicleModelSelection.SOURCE_LEGACY
+                } else {
+                    VehicleModelSelection.SOURCE_UNSET
+                }
+            )
+        }
         if (!vehicle.has("color")) vehicle.put("color", "#E8E8EC")  // Aurora White
 
         // Geocoding (place-name tagging) defaults — opt-in, fully offline by
@@ -832,6 +1024,17 @@ object UnifiedConfigManager {
                     // top of geocoding, or missing new sections).
                     val migrationNeeded = run {
                         if (!config.has("cloudflared")) return@run true
+                        // Trips default-ON one-shot: existing installs carry a
+                        // persisted `enabled:false` that applyDefaults must be
+                        // given the chance to flip exactly once. Without this
+                        // term the whole migration block is skipped on configs
+                        // that are otherwise up to date, and trips stay dead.
+                        val trips = config.optJSONObject("tripAnalytics")
+                        if (trips == null || !trips.has("enabledDefaultMigrated")) return@run true
+                        // Pre-provenance configs have modelId but no modelSource;
+                        // applyDefaults must run once to classify them as legacy.
+                        val vehicle = config.optJSONObject("vehicle") ?: return@run true
+                        if (!vehicle.has("modelSource")) return@run true
                         val geo = config.optJSONObject("geocoding") ?: return@run true
                         geo.has("enabled") || geo.has("allowOnline")
                             || geo.has("customNominatimBase")
@@ -1109,7 +1312,8 @@ object UnifiedConfigManager {
      * Save entire config to file.
      */
     @JvmStatic
-    fun saveConfig(config: JSONObject): Boolean {
+    @JvmOverloads
+    fun saveConfig(config: JSONObject, force: Boolean = false): Boolean {
         // Corruption guard: if the last load found a non-empty-but-unparseable
         // file on disk and we couldn't recover from .bak, `config` here was
         // built from createDefaultConfig() (loadConfig returned defaults, then
@@ -1118,10 +1322,24 @@ object UnifiedConfigManager {
         // factory defaults. Refuse, and let a later clean load (e.g. once the
         // daemon rewrites a valid file) clear the latch. This is the fix for
         // the v23.x→v24.1 "all settings lost after upgrade" report.
-        if (corruptionDetected) {
+        //
+        // EXCEPTION — force=true: a whole-config RESTORE (ConfigBackupService.
+        // applyBundle) passes an already-validated, COMPLETE user config, not a
+        // defaults-merge. The latch's rationale (don't overwrite recoverable
+        // settings with defaults) does NOT apply — and blocking here defeats the
+        // entire point of the restore feature, which exists precisely to recover
+        // FROM config corruption (a corrupt on-disk file leaves the latch set,
+        // and .bak recovery having failed is exactly when the user reaches for a
+        // backup). So force writes past the latch and, on success, clears it —
+        // the bytes we just wrote ARE the new valid on-disk truth.
+        if (corruptionDetected && !force) {
             Log.e(TAG, "saveConfig blocked: corruption latch set; refusing to " +
                 "overwrite live config with defaults until a clean load clears it")
             return false
+        }
+        if (corruptionDetected && force) {
+            Log.w(TAG, "saveConfig(force): writing a validated whole-config restore " +
+                "past the corruption latch (restore is authoritative user data, not defaults)")
         }
         config.put("lastModified", System.currentTimeMillis())
         // Bump the monotonic write sequence so recovery / load-time promotion can
@@ -1131,6 +1349,14 @@ object UnifiedConfigManager {
         config.put(SEQ_KEY, nextConfigSeq(config))
         val success = saveConfigInternal(config)
         if (success) {
+            // A forced restore just wrote a complete, valid config over a
+            // (previously) corrupt file — the on-disk truth is now clean, so
+            // release the latch. Without this, subsequent normal saveConfig()
+            // calls in the same process would still be blocked until a reload.
+            if (force && corruptionDetected) {
+                corruptionDetected = false
+                Log.i(TAG, "saveConfig(force): restore succeeded — corruption latch cleared")
+            }
             cachedConfig = config
             // Track the file's actual mtime, NOT wall-clock — the cache
             // freshness check at loadConfig() compares fs mtime against
@@ -1410,6 +1636,59 @@ object UnifiedConfigManager {
     fun getBlindSpotActiveFps(): Int =
         getBlindSpot().optInt("activeFps", 15).coerceIn(1, 30)
 
+    /** Master gate for the parked-idle surveillance camera throttle. Default
+     *  FALSE ⇒ every deployed unit is byte-identical until explicit opt-in.
+     *
+     *  When enabled (camera.surveillanceIdleThrottle = true): while ARMED sentry
+     *  sits idle (no motion) the shared camera HAL drops to the idle fps, cutting
+     *  the capture-rail + compose/encode load that otherwise pins ~half a
+     *  little-core 24/7 while parked. Detection parity is preserved by design —
+     *  see desiredCameraState()/reconcileCameraProfileLocked(): the idle HAL floor
+     *  is clamped to the motion cadence and the AI readback is pinned to a
+     *  wall-clock interval, so motion sampling is identical whether the HAL is
+     *  idle or full-rate. Kept opt-in because it changes parked sentry behavior on
+     *  a safety-relevant feature. */
+    @JvmStatic
+    fun isSurveillanceIdleThrottle(): Boolean =
+        loadConfig().optJSONObject("camera")?.optBoolean("surveillanceIdleThrottle", false) ?: false
+
+    /** Shared camera HAL fps while ARMED surveillance sits idle (no active
+     *  motion). Ramps back to the surveillance fps on first-motion. Default 5. */
+    @JvmStatic
+    fun getSurveillanceIdleFps(): Int =
+        loadConfig().optJSONObject("camera")?.optInt("surveillanceIdleFps", 5)?.coerceIn(1, 15) ?: 5
+
+    /** Quiet-tier step-down (issue #174): after this many minutes of SUSTAINED
+     *  no-motion while the idle throttle is active, drop the AI motion-readback
+     *  cadence (and relax the idle-HAL parity floor) to getSurveillanceQuietTierFps()
+     *  so a parked car overnight stops paying ~10 Hz PBO readbacks all night. The
+     *  first motion event restores the full cadence via the existing motion-edge
+     *  ramp. Only takes effect when surveillanceIdleThrottle is on. Default 5 min;
+     *  0 disables the quiet tier (keeps the pre-#174 constant cadence). */
+    @JvmStatic
+    fun getSurveillanceQuietTierMinutes(): Int =
+        loadConfig().optJSONObject("camera")?.optInt("surveillanceQuietTierMinutes", 5)?.coerceIn(0, 240) ?: 5
+
+    /** AI motion-readback cadence (Hz) once the quiet tier is entered (issue #174).
+     *  Must stay ≤ getSurveillanceIdleFps() so the HAL always delivers at least as
+     *  fast as the AI lane samples (the lane can only DROP delivered frames, never
+     *  manufacture them). Default 3. */
+    @JvmStatic
+    fun getSurveillanceQuietTierFps(): Int =
+        loadConfig().optJSONObject("camera")?.optInt("surveillanceQuietTierFps", 3)?.coerceIn(1, 15) ?: 3
+
+    /** Master gate for the OEM dashcam parked-idle encode throttle. Default FALSE. */
+    @JvmStatic
+    fun isOemIdleThrottleWhenParked(): Boolean =
+        getOemDashcam().optBoolean("idleThrottleWhenParked", false)
+
+    /** OEM dashcam effective encode fps while parked-idle keep-warm. The camera
+     *  HAL rate is unchanged (>=15); only the encoder draw-stride is throttled.
+     *  Default 5. */
+    @JvmStatic
+    fun getOemIdleFps(): Int =
+        getOemDashcam().optInt("idleFps", 5).coerceIn(1, 15)
+
     /** Blind-spot display target: "head_unit" (default) or "cluster". */
     @JvmStatic
     fun getBlindSpotTarget(): String =
@@ -1424,6 +1703,151 @@ object UnifiedConfigManager {
     fun setBlindSpotTarget(target: String): Boolean =
         updateValues("blindspot", mapOf(
             "target" to (if (target == "cluster") "cluster" else "head_unit")))
+
+    // ── Camera-view (on-demand native camera view, shares the BS lane) ──────────
+    /** The camview section {enabled, mode, target, geometry, geometryCluster, autoHideSec}. */
+    @JvmStatic
+    fun getCamView(): JSONObject {
+        return loadConfig().optJSONObject("camview") ?: JSONObject()
+    }
+
+    /** True when an on-demand camera view is currently requested/shown. */
+    @JvmStatic
+    fun isCamViewEnabled(): Boolean = getCamView().optBoolean("enabled", false)
+
+    /** Requested camera view mode: 0=all-4 mosaic, 1=front, 2=right, 3=rear, 4=left.
+     *  Clamped to that range; anything else falls back to 0 (mosaic). */
+    @JvmStatic
+    fun getCamViewMode(): Int = getCamView().optInt("mode", 0).let { if (it in 0..4) it else 0 }
+
+    /** Camera-view display target: "head_unit" (default) or "cluster". */
+    @JvmStatic
+    fun getCamViewTarget(): String = getCamView().optString("target", "head_unit")
+
+    @JvmStatic
+    fun isCamViewCluster(): Boolean = "cluster" == getCamViewTarget()
+
+    /** Auto-hide timeout in seconds (0 = stay until explicitly hidden). */
+    @JvmStatic
+    fun getCamViewAutoHideSec(): Int = getCamView().optInt("autoHideSec", 0).coerceIn(0, 600)
+
+    /** Persist camview keys with a shallow single-key merge (never clobbers the
+     *  per-target geometry/geometryCluster siblings). */
+    @JvmStatic
+    fun setCamViewValues(values: Map<String, Any>): Boolean = updateValues("camview", values)
+
+    /** Physical-key mapping section: {enabled, allowAdvanced, bindings:[
+     *  {keycode:int, pressType:"single|double|long", action:{kind, variables}}]}.
+     *  Manual replay is stored per binding as
+     *  {kind:"manualClip", beforeSeconds:0..60, afterSeconds:0..60}; the two
+     *  values must total 1..60 seconds.
+     *  Consumed by KeepAliveAccessibilityService.onKeyEvent → KeyMapDispatcher
+     *  (app UID) which fires the mapped action through the daemon; callers needing
+     *  cross-UID freshness (the a11y service in the app process reading a
+     *  web/daemon write) should forceReload() first. mtime-gated loadConfig
+     *  otherwise. */
+    @JvmStatic
+    fun getKeymap(): JSONObject {
+        return loadConfig().optJSONObject("keymap") ?: JSONObject()
+    }
+
+    /** Master switch — key interception is a no-op (all keys pass through)
+     *  unless this is true. Defaults false so a fresh install never swallows
+     *  hardware buttons until the user opts in. */
+    @JvmStatic
+    fun isKeymapEnabled(): Boolean = getKeymap().optBoolean("enabled", false)
+
+    /** Gate for the advanced escape hatch (raw-CAN / shell bindings). Curated
+     *  actions run regardless; advanced payloads are refused at dispatch unless
+     *  this is true. Defaults false. */
+    @JvmStatic
+    fun isKeymapAdvancedAllowed(): Boolean = getKeymap().optBoolean("allowAdvanced", false)
+
+    /** Single-vs-double disambiguation window in ms (see KeyMapDispatcher). A hardware
+     *  double-tap on a steering-wheel/dash button is slower than a touchscreen one, and
+     *  varies by user and button feel, so this is user-tunable. Clamped to a sane
+     *  250..1500ms band: below 250 a real double can't land in time; above 1500 a single
+     *  tap on a key that also has a double mapped would feel unbearably laggy. Defaults
+     *  450ms (a comfortable hardware double-tap measured from the first press). */
+    @JvmStatic
+    fun getKeymapDoubleTapWindowMs(): Long =
+        getKeymap().optLong("doubleTapWindowMs", 450L).coerceIn(250L, 1500L)
+
+    /** The automation config section: {allowShell}. Distinct from the automations
+     *  LIST (which Automations.java persists in its own file) — this holds
+     *  automation-wide settings toggles. */
+    @JvmStatic
+    fun getAutomation(): JSONObject = loadConfig().optJSONObject("automation") ?: JSONObject()
+
+    /** Gate for the automation ShellAction — DISTINCT from [isKeymapAdvancedAllowed].
+     *  Automations fire autonomously on vehicle events (not a deliberate button
+     *  press), so arming shell there is a separate, stricter opt-in: enabling the
+     *  key-mapping advanced hatch must NOT silently also allow unattended shell in
+     *  automations. Lives in the automation section (its toggle is on the
+     *  Automations page). Re-checked at fire time in ShellAction.trigger; callers
+     *  in the daemon should forceReload() for cross-UID freshness. Defaults false. */
+    @JvmStatic
+    fun isAutomationShellAllowed(): Boolean = getAutomation().optBoolean("allowShell", false)
+
+    /** Persist the automation-shell gate. Single-key merge on the automation
+     *  section (updateValues), off the main looper. */
+    @JvmStatic
+    fun setAutomationShellAllowed(allow: Boolean): Boolean =
+        updateValues("automation", mapOf("allowShell" to allow))
+
+    /** Whether the user has explicitly turned WiFi OFF via an automation / key-mapping
+     *  radio action. The WiFi keep-alive watchdog (AccSentryDaemon.ensureWifiEnabled,
+     *  SentryDaemon.enableWifi, ServiceLauncher.ensureWifiEnabled) checks this BEFORE
+     *  running `svc wifi enable`, so a deliberate "WiFi off" rule is not immediately
+     *  auto-re-enabled. Defaults FALSE — with no such rule the keep-alive behaves
+     *  normally (keeps the head unit connected for streaming / cloud). Fail-open on any
+     *  read error (returns false → keep-alive resumes) so a transient config glitch can
+     *  never strand WiFi off. Lives in a dedicated "radio" section. */
+    @JvmStatic
+    fun isWifiKeepAliveSuppressed(): Boolean =
+        try { (loadConfig().optJSONObject("radio")?.optBoolean("wifiUserOff", false)) ?: false }
+        catch (t: Throwable) { false }
+
+    /** Persist the WiFi-off suppression flag. Set true when a radio action turns WiFi
+     *  off (so keep-alive stands down), cleared to false when WiFi is turned back on.
+     *  Single-key merge on the "radio" section, off the main looper (updateValues
+     *  routes an app-process write to the daemon). */
+    @JvmStatic
+    fun setWifiKeepAliveSuppressed(suppressed: Boolean): Boolean =
+        updateValues("radio", mapOf("wifiUserOff" to suppressed))
+
+    /** The dataUsage config section: {enabled}. Tracks per-day WiFi/mobile bytes
+     *  consumed by Overdrive (app UID + UID-2000 daemons/tunnels) for the
+     *  performance page's Data graph. */
+    @JvmStatic
+    fun getDataUsage(): JSONObject = loadConfig().optJSONObject("dataUsage") ?: JSONObject()
+
+    /** Master switch for data-usage tracking. Defaults FALSE (opt-in): the
+     *  sampler thread is only armed on the enable edge, so a disabled feature
+     *  reads no /proc/net stats, writes no H2 rows, and schedules no wakeups —
+     *  true zero-overhead-when-off, mirroring the keymap FileObserver contract.
+     *  Daemon callers should forceReload() first for cross-UID freshness (the
+     *  web toggle is written by the app UID, read by the UID-2000 sampler). */
+    @JvmStatic
+    fun isDataUsageEnabled(): Boolean = getDataUsage().optBoolean("enabled", false)
+
+    /** Persist the data-usage master switch. Single-key merge on the dataUsage
+     *  section (updateValues routes an app-process write to the daemon), off the
+     *  main looper. */
+    @JvmStatic
+    fun setDataUsageEnabled(enabled: Boolean): Boolean =
+        updateValues("dataUsage", mapOf("enabled" to enabled))
+
+    /** The list of key bindings. Empty array when unset. Never null. */
+    @JvmStatic
+    fun getKeymapBindings(): org.json.JSONArray =
+        getKeymap().optJSONArray("bindings") ?: org.json.JSONArray()
+
+    /** Replace the whole keymap section (enabled/allowAdvanced/bindings). Callers
+     *  MUST invoke this off the main looper — updateSection round-trips to the
+     *  daemon over localhost. */
+    @JvmStatic
+    fun setKeymap(keymap: JSONObject): Boolean = updateSection("keymap", keymap)
 
     /**
      * Recording-side dewarp strength (Fitzgibbon division model).
@@ -1560,20 +1984,63 @@ object UnifiedConfigManager {
 
     /**
      * Resolve whether the telemetry overlay should burn-in for a given
-     * recording flow ("pano" or "oemDashcam"). The legacy `enabled` key acts
-     * as the pano fallback so pre-split installs keep their toggle. OEM
-     * dashcam defaults to off — separate opt-in.
+     * recording flow: "pano" (ACC-on trips), "surveillance" (ACC-off sentry),
+     * or "oemDashcam". The legacy `enabled` key acts as the pano fallback so
+     * pre-split installs keep their toggle. Surveillance and OEM dashcam
+     * default to off — separate opt-ins (parked burn-in keeps the BYD poll
+     * alive, and the OEM front sensor doesn't need a stamp by default).
      */
     @JvmStatic
     fun isTelemetryOverlayEnabledFor(flow: String): Boolean {
         val tel = getTelemetryOverlay()
         return when (flow) {
             "oemDashcam" -> tel.optBoolean("oemDashcamEnabled", false)
+            "surveillance" -> tel.optBoolean("surveillanceEnabled", false)
             else /* "pano" */ -> {
                 if (tel.has("panoEnabled")) tel.optBoolean("panoEnabled", false)
                 else tel.optBoolean("enabled", false)
             }
         }
+    }
+
+    /**
+     * Canonical config key under `telemetryOverlay.fields` for a flow. Unknown
+     * flows map to the pano/ACC-on list.
+     */
+    private fun fieldsKeyForFlow(flow: String): String = when (flow) {
+        "oemDashcam" -> "oemDashcam"
+        "surveillance" -> "surveillance"
+        else -> "accOn"
+    }
+
+    /**
+     * The per-flow field selection as a JSON array of stable field keys, or
+     * {@code null} if the flow has no explicit selection. A null return MUST be
+     * treated by the caller as "use the legacy default" (TelemetryFields does
+     * this) — do NOT substitute an empty list, which means "user deselected
+     * everything". Each flow's list is independent and never shared.
+     */
+    @JvmStatic
+    fun getTelemetryOverlayFields(flow: String): org.json.JSONArray? {
+        val tel = getTelemetryOverlay()
+        val fields = tel.optJSONObject("fields") ?: return null
+        return fields.optJSONArray(fieldsKeyForFlow(flow))
+    }
+
+    /**
+     * Persist the per-flow field selection (array of stable field keys). Merges
+     * into the nested `fields` object so the other flows' lists are preserved —
+     * updateSection only shallow-merges the top-level `telemetryOverlay`, so we
+     * read-modify-write the `fields` sub-object here.
+     */
+    @JvmStatic
+    fun setTelemetryOverlayFields(flow: String, fieldKeys: org.json.JSONArray): Boolean {
+        val tel = getTelemetryOverlay()
+        val fields = tel.optJSONObject("fields") ?: JSONObject()
+        fields.put(fieldsKeyForFlow(flow), fieldKeys)
+        val delta = JSONObject()
+        delta.put("fields", fields)
+        return setTelemetryOverlay(delta)
     }
 
     // ==================== OEM DASHCAM ====================
@@ -1798,12 +2265,15 @@ object UnifiedConfigManager {
     
     /**
      * Get trip analytics config section.
-     * Defaults to enabled=false if section doesn't exist.
+     * Defaults to enabled=true (matching TripConfig.DEFAULT_ENABLED and the
+     * applyDefaults seed) when the section is absent — the old `false` here
+     * disagreed with every other default and would silently disable trips for
+     * any future caller that trusted it.
      */
     @JvmStatic
     fun getTripAnalytics(): JSONObject {
         return loadConfig().optJSONObject("tripAnalytics") ?: JSONObject().apply {
-            put("enabled", false)
+            put("enabled", true)
         }
     }
     
@@ -1921,13 +2391,145 @@ object UnifiedConfigManager {
             // Backfill driveSide on configs written before this field existed
             // so call sites can read it unconditionally without a default.
             if (!stored.has("driveSide")) stored.put("driveSide", "rhd")
+            if (!stored.has("modelSource")) {
+                stored.put(
+                    "modelSource",
+                    VehicleModelSelection.normalizeSource(
+                        null, stored.optString("modelId", "")
+                    )
+                )
+            }
             return stored
         }
         return JSONObject().apply {
             put("modelId", "seal")
+            put("modelSource", VehicleModelSelection.SOURCE_UNSET)
             put("color", "#E8E8EC")
             put("driveSide", "rhd")
         }
+    }
+
+    // ==================== TYRE PRESSURE THRESHOLDS ====================
+    //
+    // User-configurable over/under pressure limits, per axle. Before this
+    // section the limits were hardcoded in THREE places that did not even
+    // agree with each other (BydDataCollector kPa constants for
+    // notifications, vehicle-control.js PSI literals for the corner
+    // callouts, and the launcher widget's bar band), so a user running
+    // non-stock tyre placard pressures got wrong alerts with no way to fix it.
+    //
+    // Canonical unit is kPa (integer) — the unit the BYD TPMS HAL reports, so
+    // no rounding drift is introduced on the comparison path. The UI converts
+    // for display.
+    //
+    // `low` is the under-pressure WARN floor and `high` the over-pressure WARN
+    // ceiling; `criticalLow` is the shared deflated/CRITICAL threshold.
+    const val TYRE_LOW_DEFAULT_KPA = 234        // ~34 PSI
+    const val TYRE_HIGH_DEFAULT_KPA = 310       // ~45 PSI
+    const val TYRE_CRITICAL_LOW_DEFAULT_KPA = 152 // ~22 PSI (deflated)
+    // Clamp bounds. Wide enough for anything from a low-pressure spare to a
+    // commercial-load rear axle, tight enough that a fat-fingered or unit-
+    // confused entry (e.g. "35" meaning PSI) can't disable alerting entirely.
+    const val TYRE_KPA_MIN = 80
+    const val TYRE_KPA_MAX = 600
+
+    /**
+     * Tyre pressure alarm thresholds in kPa.
+     *
+     * Schema (all ints, kPa):
+     *   { "frontLow": 234, "frontHigh": 310,
+     *     "rearLow": 234,  "rearHigh": 310,
+     *     "criticalLow": 152 }
+     *
+     * Missing keys are backfilled with the shipped defaults so every call site
+     * can read unconditionally. Values are NOT clamped here — see
+     * [getTyreThresholds] for the clamped, invariant-checked accessor that
+     * consumers should use.
+     */
+    @JvmStatic
+    fun getTyres(): JSONObject {
+        // Build a FRESH object rather than back-filling the one on the config.
+        // loadConfig() hands back the live cachedConfig, and optJSONObject
+        // returns the nested reference inside it — so put()ing defaults there
+        // mutates process-wide shared state. That is reached concurrently by the
+        // TPMS poll loop, the HTTP worker pool, and the launcher/vehicle-control
+        // endpoints, and org.json.JSONObject is HashMap-backed and not
+        // thread-safe (torn map / ConcurrentModificationException on a racing
+        // reader). It is also the NORMAL case, not an edge one: a POST persists
+        // only the keys it changed, so the stored section is routinely sparse.
+        val stored = loadConfig().optJSONObject("tyres")
+        val out = JSONObject()
+        out.put("frontLow", optIntOr(stored, "frontLow", TYRE_LOW_DEFAULT_KPA))
+        out.put("frontHigh", optIntOr(stored, "frontHigh", TYRE_HIGH_DEFAULT_KPA))
+        out.put("rearLow", optIntOr(stored, "rearLow", TYRE_LOW_DEFAULT_KPA))
+        out.put("rearHigh", optIntOr(stored, "rearHigh", TYRE_HIGH_DEFAULT_KPA))
+        out.put("criticalLow", optIntOr(stored, "criticalLow", TYRE_CRITICAL_LOW_DEFAULT_KPA))
+        return out
+    }
+
+    /** Read-only int lookup that tolerates a null section. */
+    private fun optIntOr(section: JSONObject?, key: String, default: Int): Int =
+        if (section == null) default else section.optInt(key, default)
+
+    /**
+     * Clamped, self-consistent tyre thresholds. Use this — not [getTyres] — on
+     * any comparison path.
+     *
+     * Guarantees, so a hand-edited or partially-written config can never
+     * produce an un-alertable or permanently-alerting vehicle:
+     *  - every value inside [TYRE_KPA_MIN]..[TYRE_KPA_MAX]
+     *  - per axle, `high` > `low` (a crossed pair falls back to the defaults
+     *    for that axle rather than silently inverting the comparison)
+     *  - `criticalLow` <= the lower of the two axle lows (a criticalLow above
+     *    a low would make the WARN band unreachable)
+     */
+    @JvmStatic
+    fun getTyreThresholds(): JSONObject {
+        val t = getTyres()
+        fun clamp(key: String, default: Int): Int =
+            t.optInt(key, default).coerceIn(TYRE_KPA_MIN, TYRE_KPA_MAX)
+
+        var frontLow = clamp("frontLow", TYRE_LOW_DEFAULT_KPA)
+        var frontHigh = clamp("frontHigh", TYRE_HIGH_DEFAULT_KPA)
+        var rearLow = clamp("rearLow", TYRE_LOW_DEFAULT_KPA)
+        var rearHigh = clamp("rearHigh", TYRE_HIGH_DEFAULT_KPA)
+        if (frontHigh <= frontLow) {
+            frontLow = TYRE_LOW_DEFAULT_KPA
+            frontHigh = TYRE_HIGH_DEFAULT_KPA
+        }
+        if (rearHigh <= rearLow) {
+            rearLow = TYRE_LOW_DEFAULT_KPA
+            rearHigh = TYRE_HIGH_DEFAULT_KPA
+        }
+        val criticalLow = clamp("criticalLow", TYRE_CRITICAL_LOW_DEFAULT_KPA)
+            .coerceAtMost(minOf(frontLow, rearLow))
+
+        return JSONObject().apply {
+            put("frontLow", frontLow)
+            put("frontHigh", frontHigh)
+            put("rearLow", rearLow)
+            put("rearHigh", rearHigh)
+            put("criticalLow", criticalLow)
+        }
+    }
+
+    /** Update the tyre threshold section (merges; siblings preserved). */
+    @JvmStatic
+    fun setTyres(tyres: JSONObject): Boolean {
+        return updateSection("tyres", tyres)
+    }
+
+    /**
+     * Physical vehicle model selected by the user or a future verified
+     * detector. Returns null when modelId is only the renderer fallback.
+     */
+    @JvmStatic
+    fun getSelectedVehicleModelId(): String? {
+        val vehicle = getVehicle()
+        return VehicleModelSelection.resolvedModelId(
+            vehicle.optString("modelId", ""),
+            vehicle.optString("modelSource", "")
+        )
     }
 
     /**
@@ -2304,7 +2906,39 @@ object UnifiedConfigManager {
     fun setSurveillanceEnabled(enabled: Boolean): Boolean {
         return updateValues("surveillance", mapOf("surveillanceEnabled" to enabled))
     }
-    
+
+    /**
+     * Surveillance arm mode: "lock" (arm on door-lock, disarm on unlock, with a
+     * 60s fallback when lock state is unreadable) or "power" (arm immediately on
+     * ACC-off, disarm on ACC-on). Any unrecognized value falls back to "lock".
+     * Read by CameraDaemon's ACC-off dispatch and door-lock gate.
+     */
+    @JvmStatic
+    fun getSurveillanceArmMode(): String {
+        val mode = getSurveillance().optString("armMode", "lock")
+        return if (mode == "power") "power" else "lock"
+    }
+
+    /**
+     * True iff the user chose the "onOnly" operating mode — i.e. ALL behaviour that
+     * runs after the vehicle is turned OFF must be disabled (keep-awake, post-OFF
+     * surveillance, revival alarms) so the head unit can sleep. Read by every post-OFF
+     * choke point across the daemons and the app process.
+     *
+     * Reads the SAME mtime-gated [loadConfig] cache that the other surveillance
+     * accessors (isSurveillanceEnabled / getSurveillanceArmMode) and the daemon-side
+     * isKeepUsbPowerOnAccOff() use, so a Settings toggle applies on the next config
+     * re-read / ACC cycle without a daemon restart.
+     *
+     * FAIL-OPEN to false (full "onAndOff" behaviour) on any error, absence, or a
+     * non-string value — a transient read glitch must NEVER silently disable
+     * keep-awake or surveillance for an on-and-off user.
+     */
+    @JvmStatic
+    fun isVehicleOnOnlyMode(): Boolean =
+        try { getSurveillance().optString("operatingMode", "onAndOff") == "onOnly" }
+        catch (t: Throwable) { false }
+
     // ==================== LISTENERS ====================
     
     @JvmStatic

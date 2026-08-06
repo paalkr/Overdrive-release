@@ -14,6 +14,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -339,10 +340,20 @@ public class HttpServer {
             // Read POST body if present
             // SOTA: Loop read for large payloads (e.g., base64 image uploads)
             // BufferedReader.read() may return fewer chars than requested in a single call
-            // Hard cap at 16 MB — the largest legitimate payload is a base64-
-            // encoded 8 MB asset (~10.7 MB). Above this we 413 instead of
-            // letting an attacker allocate arbitrary heap on the GUI process.
-            final int MAX_BODY_BYTES = 16 * 1024 * 1024;
+            // Default hard cap 16 MB — the largest legitimate generic payload is a
+            // base64-encoded 8 MB asset (~10.7 MB). Above this we 413 instead of
+            // letting an attacker allocate arbitrary heap on the daemon process.
+            //
+            // EXCEPTION: the audio-library upload accepts short video clips (48 MB max,
+            // see AudioApiHandler.MAX_AUDIO_BYTES) as a base64 JSON body (~64 MB) — raise
+            // the cap to 72 MB for JUST that one endpoint so a legitimate clip isn't
+            // pre-rejected here, while every other endpoint keeps the tight 16 MB cap.
+            // The body is still buffered then decoded (peak ~200 MB transient for a
+            // 48 MB clip), which is safe on this head unit; a materially larger limit
+            // would require a stream-to-disk upload rewrite rather than this bump.
+            final boolean isAudioUpload = requestLine.startsWith("POST /api/audio/library")
+                    && !requestLine.startsWith("POST /api/audio/library/"); // the /play,/stop subpaths stay tight
+            final int MAX_BODY_BYTES = isAudioUpload ? (72 * 1024 * 1024) : (16 * 1024 * 1024);
             String body = null;
             if (contentLength > MAX_BODY_BYTES) {
                 HttpResponse.sendError(out, 413, "Payload too large");
@@ -519,6 +530,10 @@ public class HttpServer {
                 if (!serveStaticFile(out, "local/charging.html")) {
                     HttpResponse.sendError(out, 404, "charging.html not found");
                 }
+            } else if (path.equals("/automations.html") || path.equals("/automations")) {
+                if (!serveStaticFile(out, "local/automations.html")) {
+                    HttpResponse.sendError(out, 404, "automations.html not found");
+                }
             } else if (path.equals("/vehicle-control.html") || path.equals("/vehicle-control")) {
                 if (!serveStaticFile(out, "local/vehicle-control.html")) {
                     HttpResponse.sendError(out, 404, "vehicle-control.html not found");
@@ -538,6 +553,10 @@ public class HttpServer {
             } else if (path.equals("/notifications.html") || path.equals("/notifications")) {
                 if (!serveStaticFile(out, "local/notifications.html")) {
                     HttpResponse.sendError(out, 404, "notifications.html not found");
+                }
+            } else if (path.equals("/key-mapping.html") || path.equals("/key-mapping")) {
+                if (!serveStaticFile(out, "local/key-mapping.html")) {
+                    HttpResponse.sendError(out, 404, "key-mapping.html not found");
                 }
             } else if (path.equals("/about.html") || path.equals("/about")) {
                 if (!serveStaticFile(out, "local/about.html")) {
@@ -588,45 +607,6 @@ public class HttpServer {
                 if (!serveStaticFile(out, filePath)) {
                     HttpResponse.sendError(out, 404, "Not Found: " + path);
                 }
-            }
-            // Core camera APIs (kept inline for simplicity)
-            else if (path.startsWith("/snapshot/")) {
-                int camId = Integer.parseInt(path.substring(10));
-                sendSnapshot(out, camId);
-            } else if (path.equals("/status")) {
-                sendStatus(out);
-            } else if (path.startsWith("/api/start/")) {
-                int camId = Integer.parseInt(path.substring(11));
-                CameraDaemon.startCamera(camId, true, false);
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"start\",\"camera\":" + camId + "}");
-            } else if (path.startsWith("/api/view/")) {
-                int camId = Integer.parseInt(path.substring(10));
-                CameraDaemon.startCamera(camId, true, true);
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"view\",\"camera\":" + camId + "}");
-            } else if (path.startsWith("/api/stop/")) {
-                int camId = Integer.parseInt(path.substring(10));
-                CameraDaemon.stopCamera(camId);
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stop\",\"camera\":" + camId + "}");
-            } else if (path.equals("/api/stopall")) {
-                CameraDaemon.stopAllCameras();
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stopall\"}");
-            } else if (path.equals("/api/recording/mode")) {
-                // Get/Set recording mode
-                if (method.equals("GET")) {
-                    String currentMode = CameraDaemon.getRecordingMode();
-                    HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + currentMode + "\"}");
-                } else if (method.equals("POST")) {
-                    JSONObject json = new JSONObject(body);
-                    String mode = json.optString("mode", "");
-                    if (!mode.isEmpty()) {
-                        CameraDaemon.setRecordingMode(mode);
-                        HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + mode + "\"}");
-                    } else {
-                        HttpResponse.sendJson(out, "{\"status\":\"error\",\"message\":\"No mode specified\"}");
-                    }
-                } else {
-                    HttpResponse.sendError(out, 405, "Method Not Allowed");
-                }
             } else if (path.startsWith("/h264/")) {
                 // Deprecated HTTP streaming
                 JSONObject response = new JSONObject();
@@ -647,11 +627,117 @@ public class HttpServer {
     }
 
     /**
+     * Path prefixes an automation {@code ApiAction} is permitted to reach through the auth-free
+     * {@link #automationApiRequest} bypass. This is a hard security boundary: automationApiRequest
+     * skips {@link AuthMiddleware} entirely, so this allowlist — NOT the curated catalog in
+     * Actions.java — is what keeps an ApiAction (existing or a carelessly-added future one) from
+     * reaching sensitive surfaces like /api/debug/* (car-property / light / autoservice writes),
+     * /api/backup/ (device key material), /api/update/ (APK install), /api/telegram/ (bot token),
+     * /api/oem-dashcam/ (shells to pm), /api/logs or /api/keymap. Keep it as tight as the curated
+     * automation actions genuinely need.
+     */
+    private static final String[] AUTOMATION_ALLOWED_PREFIXES = {
+        "/api/vehicle/",       // vehicle controls: setting, window, climate, seat
+        "/api/surveillance/",  // surveillance enable / disable
+        "/api/recording/mode", // recording mode
+        "/api/apps/launch",    // open-app action: launch a user-selected app (NOT /api/apps/list)
+        "/api/camview/",       // camera-view show/hide (native lane, shares blind-spot pipeline)
+    };
+
+    /** Whether an automation-originated request path is inside the allowlist above. */
+    private static boolean isAutomationAllowed(String path) {
+        if (path == null) return false;
+        int q = path.indexOf('?');
+        String clean = q >= 0 ? path.substring(0, q) : path;
+        for (String prefix : AUTOMATION_ALLOWED_PREFIXES) {
+            if (clean.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Used for automations to have an API action without going through authentication.
+     * The request is served in-process (no socket, so this is unreachable from the network) and
+     * is gated by {@link #AUTOMATION_ALLOWED_PREFIXES} so the auth bypass can only ever hit the
+     * curated automation control surface, never the sensitive /api/debug|backup|update|... paths.
+     *
+     * @return The HTTP response as a String, or null if denied by the allowlist or on error
+     */
+    public String automationApiRequest(String method, String path, String body) {
+        if (!isAutomationAllowed(path)) {
+            CameraDaemon.log("AUTH: automation API request denied (not in allowlist): " + method + " " + path);
+            return null;
+        }
+        OutputStream out = new ByteArrayOutputStream();
+        try {
+            if (!routeToHandlers(method, path, body, null, null, out)) return null;
+        } catch (Exception e) {
+            return null;
+        }
+        return out.toString();
+    }
+
+    /**
      * Routes requests to modular API handlers.
      * @return true if handled by a handler
      */
     private boolean routeToHandlers(String method, String path, String body, String rangeHeader,
                                      String ifNoneMatchHeader, OutputStream out) throws Exception {
+        // Core camera APIs (kept inline for simplicity)
+        if (path.startsWith("/snapshot/")) {
+            int camId = Integer.parseInt(path.substring(10));
+            sendSnapshot(out, camId);
+            return true;
+        } else if (path.equals("/status")) {
+            sendStatus(out);
+            return true;
+        } else if (path.startsWith("/api/start/")) {
+            int camId = Integer.parseInt(path.substring(11));
+            CameraDaemon.startCamera(camId, true, false);
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"start\",\"camera\":" + camId + "}");
+            return true;
+        } else if (path.startsWith("/api/view/")) {
+            int camId = Integer.parseInt(path.substring(10));
+            CameraDaemon.startCamera(camId, true, true);
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"view\",\"camera\":" + camId + "}");
+            return true;
+        } else if (path.startsWith("/api/stop/")) {
+            int camId = Integer.parseInt(path.substring(10));
+            CameraDaemon.stopCamera(camId);
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stop\",\"camera\":" + camId + "}");
+            return true;
+        } else if (path.equals("/api/stopall")) {
+            CameraDaemon.stopAllCameras();
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stopall\"}");
+            return true;
+        } else if (path.equals("/api/recording/mode")) {
+            // Get/Set recording mode
+            if (method.equals("GET")) {
+                String currentMode = CameraDaemon.getRecordingMode();
+                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + currentMode + "\"}");
+            } else if (method.equals("POST")) {
+                JSONObject json = new JSONObject(body);
+                String mode = json.optString("mode", "");
+                if (!mode.isEmpty()) {
+                    CameraDaemon.setRecordingMode(mode);
+                    HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + mode + "\"}");
+                } else {
+                    HttpResponse.sendJson(out, "{\"status\":\"error\",\"message\":\"No mode specified\"}");
+                }
+            } else {
+                HttpResponse.sendError(out, 405, "Method Not Allowed");
+            }
+            return true;
+        }
+
+        // Launcher aggregation API — stable public /api/launcher/v1/* face over
+        // existing internal handlers (summary/traffic/apps/vehicle/appearance).
+        // Additive, read-mostly; dispatched here like the other modular handlers.
+        // See LauncherApiHandler + docs/LAUNCHER_SPEC.md §2.
+        if (path.startsWith("/api/launcher/")) {
+            return LauncherApiHandler.handle(method, path, body, out);
+        }
+
         // Recordings API (with Range header support for video seeking) + thumbnails + event timelines
         if (path.startsWith("/api/recordings") || path.startsWith("/video/") ||
             path.startsWith("/thumb/") || path.startsWith("/api/events/")) {
@@ -678,7 +764,7 @@ public class HttpServer {
 
         // Blind-spot dedicated-pipeline API (separate from /api/stream so it
         // never shares the live-view stream's view/quality state).
-        if (path.startsWith("/api/bs/")) {
+        if (path.startsWith("/api/bs/") || path.startsWith("/api/camview/")) {
             return StreamingApiHandler.handleBlindSpot(method, path, body, out);
         }
 
@@ -700,6 +786,20 @@ public class HttpServer {
         // MQTT API
         if (path.startsWith("/api/mqtt/")) {
             return MqttApiHandler.handle(method, path, body, out);
+        }
+
+        // Automations API — plus the reusable Action Groups CRUD, which
+        // AutomationApiHandler.handle() also implements but lives under the SEPARATE
+        // /api/action-groups prefix (hyphen), so it must be routed here explicitly.
+        // Without this line those requests fell through to 404 → "failed to save" in the
+        // group editor.
+        if (path.startsWith("/api/automations") || path.startsWith("/api/action-groups")) {
+            return AutomationApiHandler.handle(method, path, body, out);
+        }
+
+        // Community Automations API (browse / publish / import shared automations)
+        if (path.startsWith("/api/community/")) {
+            return com.overdrive.app.community.CommunityApiHandler.handle(method, path, body, out);
         }
 
         // RoadSense API (delete-local / delete-cloud data actions)
@@ -771,14 +871,44 @@ public class HttpServer {
             }
         }
 
-        // Audio Test API (AVAS speaker test)
+        // Audio/video library raw stream — Range-aware so a streaming MediaPlayer
+        // (Play Video's VideoView / the audio service) can seek to an MP4's moov atom.
+        // Routed here (ahead of the generic /api/audio/ handler) because that handler's
+        // signature has no rangeHeader; without 206 support, non-faststart MP4s never
+        // prepare() and "Play Video" did nothing.
+        if (path.startsWith("/api/audio/library/raw") && method.equals("GET")) {
+            return AudioApiHandler.handleRawRanged(path, rangeHeader, out);
+        }
+
+        // Audio API (library playback + AVAS speaker)
         if (path.startsWith("/api/audio/")) {
-            return AudioTestApiHandler.handle(method, path, body, out);
+            return AudioApiHandler.handle(method, path, body, out);
         }
 
         // Vehicle Control API
         if (path.startsWith("/api/vehicle")) {
             return VehicleControlApiHandler.handle(method, path, body, out);
+        }
+
+        // Tyre pressure thresholds (user-configurable per-axle warn/critical
+        // limits). Its own prefix rather than under /api/vehicle/ because it is
+        // pure configuration — no BYD SDK actuation — and is read by the
+        // notification path as well as the Vehicle Control UI.
+        if (path.startsWith("/api/tyres/")) {
+            return TyreLimitsApiHandler.handle(method, path, body, out);
+        }
+
+        // Key-mapping actuation — physical-key bindings fired by the app-process
+        // accessibility service POST here so BYD SDK writes run in the daemon UID.
+        if (path.startsWith("/api/keymap")) {
+            return KeymapApiHandler.handle(method, path, body, out);
+        }
+
+        // Installed-app enumeration + launch — shared by the key-mapping app picker
+        // and the automation "open app" action (POST /api/apps/launch is allowlisted
+        // for automation ApiActions in AUTOMATION_ALLOWED_PREFIXES).
+        if (path.startsWith("/api/apps/")) {
+            return AppsApiHandler.handle(method, path, body, out);
         }
 
         // Autoservice AIDL debug sweep — read-only reach probes for the BYD
@@ -805,6 +935,14 @@ public class HttpServer {
         // See LightDebugApiHandler / HazardLightProbe.
         if (path.startsWith("/api/debug/light/")) {
             return LightDebugApiHandler.handle(method, path, body, out);
+        }
+
+        // Radar blind-spot ALERT register probe — read-only. The `blindSpot` automation
+        // signal has never been confirmed on a car, and its whole read path logs at DEBUG
+        // (stripped by R8 in release), so the values have to come back as JSON.
+        // See AdasDebugApiHandler / AdasBlindSpotProbe.
+        if (path.startsWith("/api/debug/adas/")) {
+            return AdasDebugApiHandler.handle(method, path, body, out);
         }
 
         // THROWAWAY de-risk spike for the native SurfaceControl blind-spot path:
@@ -1157,7 +1295,19 @@ public class HttpServer {
         } catch (Exception e) {
             // Recording status not available
         }
-        
+
+        // Instant-replay lifecycle (for the status overlay's clip segment).
+        // Poll catch-up channel for the daemon's REPLAY_STATE broadcast:
+        // {configured, state: idle|recording|saved|failed, stateAgeMs}.
+        // Cheap by contract (see ManualClipService.statusJson) and absent on
+        // failure so older clients see no shape change.
+        try {
+            status.put("replay",
+                    com.overdrive.app.recording.ManualClipService.getInstance().statusJson());
+        } catch (Exception e) {
+            // Replay status not available
+        }
+
         // Trip analytics status (for status overlay)
         try {
             JSONObject tripStatus = new JSONObject();
@@ -1481,7 +1631,13 @@ public class HttpServer {
                 CameraDaemon.log("WS: Reusing existing stream encoder (no restart)");
             }
             
-            if (savedViewMode > 0) {
+            // Apply the saved view mode — EXCEPT view 6 (OEM Dashcam), which must wait
+            // until the OEM re-route below actually succeeds. Setting uViewMode=6 while
+            // uOemActive is still 0 makes the shader fall through its OEM early-return
+            // into the AVM mosaic branch — the "DVR view shows the 4-pano mosaic" bug
+            // described in the block below. For view 6 we leave the scaler on its
+            // previous view until the bind lands, then set it in the routed branch.
+            if (savedViewMode > 0 && savedViewMode != 6) {
                 pipeline.setStreamViewMode(savedViewMode);
                 CameraDaemon.log("WS: View mode " + savedViewMode);
             }
@@ -1491,18 +1647,25 @@ public class HttpServer {
             // attachExternalStreamCallback. But after an idle-shutdown +
             // reconnect (mobile browser is most common: backgrounding the
             // tab kills the WS, idle timer disables streaming, scaler is
-            // freshly built on this WS open), the new scaler has NO OEM
-            // binding even though setStreamViewMode(6) above set the
-            // shader's uViewMode to 6. The shader then falls through to
-            // the legacy 4-pano mosaic branch (uViewMode==6 && uOemActive==0
-            // doesn't match the OEM-sample early-return; uApaMode>1.5
-            // catches it via the else-if chain). Symptom: mobile browser
-            // opens DVR view → sees 4-pano mosaic instead of OEM dashcam.
+            // freshly built on this WS open), the new scaler has NO OEM binding.
+            // HISTORICALLY the block above set uViewMode=6 unconditionally, so with
+            // uOemActive==0 the shader fell through its OEM early-return into the
+            // legacy 4-pano mosaic branch (uApaMode>1.5 catches it via the else-if
+            // chain) — symptom: DVR view showed the 4-pano mosaic instead of the OEM
+            // dashcam. The view-6 set is now DEFERRED into the `rerouted` branch
+            // below, so the scaler only enters the OEM branch once the bind actually
+            // landed; until then it keeps showing the previous (valid) view.
             // Re-route here so the WS source switches back to the OEM
             // encoder if the user's saved view is 6.
             if (savedViewMode == 6) {
                 boolean rerouted = CameraDaemon.routeStreamToOemDashcam();
                 CameraDaemon.log("WS: View 6 OEM re-route " + (rerouted ? "ok" : "skipped (OEM not ready)"));
+                if (rerouted) {
+                    // Bind landed (uOemActive will flip 1 on the next published matrix)
+                    // — NOW it's safe to switch the shader to the OEM branch.
+                    pipeline.setStreamViewMode(6);
+                    CameraDaemon.log("WS: View mode 6 (OEM Dashcam)");
+                }
                 // OEM not ready (cold-boot first-WS-open race) — kick the
                 // lifecycle so it warms up; the next WS reconnect /
                 // /api/stream/view/6 poll will catch the route.

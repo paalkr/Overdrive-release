@@ -33,7 +33,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=17">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
@@ -59,7 +59,7 @@
     <script src="https://cdn.jsdelivr.net/npm/jmuxer@2.0.4/dist/jmuxer.min.js"></script>
     <link rel="stylesheet" href="../shared/leaflet.css" />
     <script src="../shared/leaflet.js"></script>
-    <script src="../shared/SotaPlayer.js"></script>
+    <script src="../shared/SotaPlayer.js?v=13"></script>
     <script src="../shared/Decoder.js"></script>
     <script src="../shared/YUVCanvas.js"></script>
     <script src="../shared/Player.js"></script>
@@ -102,6 +102,30 @@
                         <span class="status-badge inactive" id="survStatusBadge" data-i18n="status.off">OFF</span>
                     </div>
                     <div class="card-body">
+                        <!-- Operating mode: ON+OFF (keep working while parked) vs ON only (sleep after car off) -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.operating_mode">Operating Mode</div>
+                                <div class="setting-desc" data-i18n="surveillance.operating_mode_desc">Whether Overdrive keeps running after the car is turned off. On Only fully shuts Overdrive down when you park; while-driving features (dashcam, trips, charging) are unaffected.</div>
+                            </div>
+                            <div class="setting-control">
+                                <div class="btn-group" id="operatingModeBtns">
+                                    <button class="btn-toggle" data-value="onAndOff" onclick="SurvSettings.setOperatingMode('onAndOff')" data-i18n="surveillance.operating_mode_on_off">On &amp; Off</button>
+                                    <button class="btn-toggle" data-value="onOnly" onclick="SurvSettings.setOperatingMode('onOnly')" data-i18n="surveillance.operating_mode_on_only">On Only</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="setting-hint" id="operatingModeHint" data-i18n="surveillance.operating_mode_hint_on_off">Overdrive keeps watching while parked — surveillance and background monitoring stay active. Uses a little battery overnight.</div>
+
+                        <!-- Shown only in "On Only" mode: the settings below govern
+                             post-vehicle-OFF surveillance, which is disabled when the head
+                             unit is set to sleep after the car is off. Visibility driven by
+                             SurvSettings.applyOperatingModeUI(). -->
+                        <div class="info-box-note" id="postOffDisabledNotice" style="display:none;margin-top:12px;">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                            <div class="info-note" data-i18n="surveillance.operating_mode_postoff_disabled_note">These settings control surveillance after the car is off. In On Only mode Overdrive shuts down when parked, so they don't apply. Switch to On &amp; Off to use them.</div>
+                        </div>
+
                         <div class="setting-row">
                             <div class="setting-info">
                                 <div class="setting-name" data-i18n="surveillance.enable">Enable Surveillance</div>
@@ -114,6 +138,21 @@
                                 </label>
                             </div>
                         </div>
+
+                        <!-- Arm mode: Lock (arm on door-lock) vs Power (arm on power-off) -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.arm_mode">Arm Mode</div>
+                                <div class="setting-desc" data-i18n="surveillance.arm_mode_desc">When surveillance arms after the car powers off. Both modes honor safe locations and schedules.</div>
+                            </div>
+                            <div class="setting-control">
+                                <div class="btn-group" id="armModeBtns">
+                                    <button class="btn-toggle" data-value="lock" onclick="SurvSettings.setArmMode('lock')" data-i18n="surveillance.arm_lock">On Lock</button>
+                                    <button class="btn-toggle" data-value="power" onclick="SurvSettings.setArmMode('power')" data-i18n="surveillance.arm_power">On Power-Off</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="setting-hint" id="armModeHint" data-i18n="surveillance.arm_hint_lock">Arms when you lock the doors and disarms when you unlock (so it won't record you). If your car can't report lock status, it arms 60s after power-off as a fallback.</div>
 
                         <!-- ACC-OFF mode: Smart (motion + AI events) vs Continuous (plain rolling) -->
                         <div class="setting-row">
@@ -156,6 +195,27 @@
                         <div class="info-box-warning" id="survUsbPowerStorageNotice" style="display:none;margin-top:12px;">
                             <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
                             <div class="info-note" data-i18n="surveillance.usb_off_storage_notice">USB power is off, so the SD card is unpowered while parked. Surveillance records to Internal storage until USB power is turned back on.</div>
+                        </div>
+
+                        <!-- Low-power-while-parked toggle. Default OFF (byte-identical
+                             to today until opted in). When ON, drops the camera to a low
+                             idle frame rate while parked+armed with nothing happening, and
+                             ramps back to full rate the instant motion is detected — so
+                             detection is unchanged, only the idle capture rate drops.
+                             Drives BOTH the surveillance camera (camera.surveillanceIdleThrottle)
+                             and the OEM dashcam (oemDashcam.idleThrottleWhenParked) together.
+                             Persisted immediately (no Apply) via toggleLowPowerMode(). -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.low_power_mode">Low-power mode while parked</div>
+                                <div class="setting-desc" data-i18n="surveillance.low_power_mode_desc">Saves battery while parked by running the camera at a low frame rate (about 5 fps) when nothing is happening, then instantly ramping back to full quality the moment motion is detected. Motion and object detection are unaffected — the same events are caught — but the recorded footage during quiet periods is choppier to save power. Takes effect while the car is parked and surveillance is armed.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="survLowPowerMode" onchange="SurvSettings.toggleLowPowerMode()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
                         </div>
 
                         <!-- HV-battery SoC cutoff for parked surveillance. At/below this %,
@@ -237,10 +297,10 @@
                                     <span style="font-size:13px; font-weight:500; color:var(--text-primary);" data-i18n="surveillance.zone_radius">Zone Radius</span>
                                     <span style="font-size:13px; font-weight:600; color:var(--brand-primary);" id="safeLocRadiusValue">150m</span>
                                 </div>
-                                <input type="range" class="slider" id="safeLocRadiusSlider" min="50" max="500" step="10" value="150"
+                                <input type="range" class="slider" id="safeLocRadiusSlider" min="15" max="500" step="5" value="150"
                                     oninput="SafeLocations.updateEditCircleRadius(this.value)">
                                 <div style="display:flex; justify-content:space-between;">
-                                    <span style="font-size:10px; color:var(--text-muted);">50m</span>
+                                    <span style="font-size:10px; color:var(--text-muted);">15m</span>
                                     <span style="font-size:10px; color:var(--text-muted);">500m</span>
                                 </div>
                             </div>
@@ -362,6 +422,21 @@
                         </div>
                         <div class="setting-hint" id="shadowFilterHint" data-i18n="surveillance.shadow_hint.2">Normal works well for most outdoor parking. Use Aggressive if parked under trees with heavy shadow movement.</div>
 
+                        <!-- Motion salience: record on strong motion even when AI is unsure -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.motion_salience">Record on strong motion</div>
+                                <div class="setting-desc" data-i18n="surveillance.motion_salience_desc">Trigger on large, close, moving objects even when the AI can't identify them</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="v2MotionSalience" onchange="SurvSettings.updateMotionSalience()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-hint" id="motionSalienceHint" data-i18n="surveillance.motion_salience_hint">Catches events the AI misses — someone walking right up to the car in poor light, or a large vehicle pulling in close, where object recognition returns nothing. Only fires when the movement is big, close, and travels steadily across the scene for about a second, so wind-blown branches, shadows, rain and headlight sweeps are still ignored. Expect some extra recordings with no identified person or vehicle: these are kept even with "Discard non-actor recordings" on, because a clip the AI couldn't classify is the last one worth deleting automatically.</div>
+
                         <!-- Aggressively discard non-actor recordings -->
                         <div class="setting-row">
                             <div class="setting-info">
@@ -376,6 +451,21 @@
                             </div>
                         </div>
                         <div class="setting-hint" id="discardEmptyMotionHint" data-i18n="surveillance.discard_empty_motion_hint">Good if you get false alerts from shadows or tree-branch movement — these clips are deleted automatically when nothing real was tracked. Caution: in low light or unclear conditions it can occasionally discard a real threat the AI failed to identify. Leave off if you'd rather keep every recording.</div>
+
+                        <!-- Also discard at night (sub-toggle of the above) -->
+                        <div class="setting-row" id="discardEmptyMotionNightRow" style="padding-left:16px;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.discard_empty_motion_night">Also discard at night</div>
+                                <div class="setting-desc" data-i18n="surveillance.discard_empty_motion_night_desc">Extend the filter to dark scenes using motion shape instead of brightness</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="v2DiscardEmptyMotionNight" onchange="SurvSettings.updateDiscardEmptyMotionAtNight()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-hint" id="discardEmptyMotionNightHint" data-i18n="surveillance.discard_empty_motion_night_hint">By default the filter only runs in daylight, because in the dark the AI can miss a real person entirely. With this on, night clips are discarded only when the motion looks like wind-blown foliage or a lighting change (headlights, reflections) and never translated across the scene like a person would. Higher chance of dropping a real night-time event than the daytime filter — leave off if in doubt.</div>
 
                         <!-- Camera Controls -->
                         <div class="setting-row" style="border-bottom:none;">
@@ -1016,6 +1106,43 @@
                     </div>
                 </div>
 
+                <!-- Surveillance telemetry overlay. Separate master toggle AND
+                     separate field selection from the ACC-on recording overlay;
+                     both live in the same `telemetry-overlay` API. -->
+                <div class="card" data-tab="recording">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                            </svg>
+                            <span data-i18n="recording.telemetry_overlay_title">Telemetry Overlay</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <!-- No divider: the picker below is a sub-control of this
+                             toggle, and :last-child now binds to the picker. -->
+                        <div class="setting-row" style="border-bottom:none;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.telemetry_show_label">Show on Sentry Recordings</div>
+                                <div class="setting-desc" data-i18n="surveillance.telemetry_show_desc">Burn vehicle data into ACC-off surveillance event clips. Separate from the ACC-on recording overlay.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="survTelemetryOverlayEnabled" onchange="SurvSettings.toggleSurvTelemetryOverlay()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-row telemetry-fields" id="telemetryFieldsSurveillance" style="display:none;">
+                            <div class="setting-info" style="width:100%;">
+                                <div class="setting-name" data-i18n="recording.telemetry_fields_label">Fields to burn in</div>
+                                <div class="setting-desc" data-i18n="surveillance.telemetry_fields_desc">Choose what the overlay draws on surveillance clips.</div>
+                                <div class="telemetry-fields-grid" id="telemetryFieldsSurveillanceGrid"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Fisheye Correction (Fitzgibbon division-model rectifier).
                      SHARED with the recording page — same unified-config key
                      (recording.rectifyStrength). Editing on either page
@@ -1359,9 +1486,9 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/surveillance.js?v=survqualsplit1"></script>
+    <script src="../shared/surveillance.js?v=survfix1"></script>
     <script src="../shared/safe-locations.js"></script>
     <script src="../shared/roi-schedule.js"></script>
     <script>

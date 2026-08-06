@@ -58,6 +58,7 @@
     <string name="cd_recording_status">Recording status</string>
     <string name="cd_trip_tracking_status">Trip tracking status</string>
     <string name="cd_mic_status">Microphone capture status</string>
+    <string name="cd_replay_status">Instant replay status</string>
     <string name="cd_video_thumbnail">Video thumbnail</string>
     <string name="cd_play">Play</string>
     <string name="cd_back">Back</string>
@@ -86,6 +87,7 @@
     <string name="overlay_rec_inactive_label">REC</string>
     <string name="overlay_trip_inactive_label">TRIP</string>
     <string name="overlay_mic_inactive_label">MIC</string>
+    <string name="overlay_replay_label" translatable="false">CLIP</string>
     <!-- Quick-action chips revealed by tapping the REC pill: switch
          recording mode without opening the app. Short labels read fine
          cross-locale (matches existing REC/MIC/TRIP precedent), so
@@ -248,6 +250,12 @@
     <string name="onboarding_authorize_retry_title">Still not connected</string>
     <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
     <string name="onboarding_authorize_retry_button">Try again</string>
+
+    <!-- Step: choose operating mode (Vehicle ON+OFF vs ON only) -->
+    <string name="onboarding_mode_title">When should Overdrive run?</string>
+    <string name="onboarding_mode_body">Choose how Overdrive behaves after you turn the car off.\n\n<b>On &amp; Off</b> keeps watching while parked — surveillance and background monitoring stay active, so the car draws a little power overnight.\n\n<b>On Only</b> fully shuts Overdrive down once you leave. Dashcam, trips and charging still work while you\'re driving, and everything starts back up automatically when you switch the car on. You can change this any time in Settings.</string>
+    <string name="onboarding_mode_on_off_button">On &amp; Off</string>
+    <string name="onboarding_mode_on_only_button">On Only</string>
 
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Camera · step %1$d of %2$d</string>
@@ -473,6 +481,12 @@
     <string name="recording_lib_building_index_title">Building library index</string>
     <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
     <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <!-- Shown when the daemon reports its recordings index is down (the H2
+         store closed underneath it). The clips are still on disk, so this must
+         NOT read as "no recordings" — the library re-polls and recovers on its
+         own once the daemon re-opens the index. -->
+    <string name="recording_lib_index_down_title">Recordings index unavailable</string>
+    <string name="recording_lib_index_down_body">Your recordings are safe on disk, but the library index is down. Retrying automatically…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
@@ -480,6 +494,7 @@
     <string name="recording_lib_type_event">EVENT</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
+    <string name="recording_lib_type_replay">REPLAY</string>
     <!-- Per-clip storage tag — where the clip actually landed. Surfaces the
          silent SD→internal fallback (SD bridged behind the USB power rail). -->
     <string name="recording_lib_storage_sd">SD</string>
@@ -703,6 +718,8 @@
     <string name="dashboard_starting_cloudflared">Starting Cloudflared tunnel…</string>
     <string name="dashboard_starting_tailscale">Starting Tailscale tunnel…</string>
     <string name="dashboard_waiting_url">Waiting for tunnel URL…</string>
+    <string name="dashboard_tunnel_failed">Tunnel error</string>
+    <string name="dashboard_tunnel_stopping">Stopping tunnel…</string>
     <string name="dashboard_daemons_running">%1$d/%2$d Running</string>
     <string name="tunnel_label_cloudflared">Cloudflared</string>
     <string name="tunnel_label_zrok">Zrok</string>
@@ -853,11 +870,16 @@
     <string name="rail_live">Live</string>
     <string name="rail_recordings">Recordings</string>
     <string name="rail_vehicle">Vehicle</string>
+    <string name="rail_projection">Projection</string>
     <string name="rail_trips">Trips</string>
     <string name="rail_charging">Charging</string>
+    <string name="rail_automations">Automations</string>
+    <string name="rail_key_mapping">Key Mapping</string>
     <string name="rail_integrations">Integrations</string>
     <string name="rail_diagnostics">Diagnostics</string>
     <string name="rail_settings">Settings</string>
+    <string name="rail_expand">Show navigation labels</string>
+    <string name="rail_collapse">Hide navigation labels</string>
 
     <!-- Settings sub-rail -->
     <string name="settings_section_appearance">Appearance</string>
@@ -867,11 +889,15 @@
     <string name="settings_section_privacy">Privacy &amp; data</string>
     <string name="settings_section_overlay">Status overlay</string>
     <string name="settings_section_security">Security</string>
-    <string name="settings_overlay_subtitle">Choose which segments of the floating status pill stay visible.</string>
+    <string name="settings_overlay_subtitle">Choose which floating status indicators stay visible.</string>
     <string name="settings_overlay_camera_title">Camera indicator</string>
     <string name="settings_overlay_camera_subtitle">Show the REC / PROX badge while recording is active.</string>
     <string name="settings_overlay_trip_title">Trip indicator</string>
     <string name="settings_overlay_trip_subtitle">Show the TRIP badge while trip detection is running.</string>
+    <string name="settings_overlay_replay_title">Instant replay indicator</string>
+    <string name="settings_overlay_replay_subtitle">Show the CLIP badge: green while a replay records, blue for 5s once saved, red when it fails. Appears only when a replay binding or automation exists.</string>
+    <string name="settings_overlay_roadsense_title">RoadSense overlay</string>
+    <string name="settings_overlay_roadsense_subtitle">Show the floating RoadSense pill and hazard card while RoadSense is enabled.</string>
     <!-- Was "About & updates" — Check for Updates row was removed from
          the About page, so the menu / rail label is now just "About". -->
     <string name="settings_section_about">About</string>
@@ -959,12 +985,18 @@
     <!-- Recordings page (header + segmented control + page actions) -->
     <string name="recordings_title">Recordings</string>
     <string name="recordings_segment_dashcam">Dashcam</string>
+    <string name="recordings_segment_replays">Replays</string>
     <string name="recordings_segment_surveillance">Surveillance</string>
     <string name="recordings_action_settings">Settings</string>
     <!-- Hero subtitle: "%1$d today · %2$d total · %3$s" where %3$s is a pre-formatted size like "42 GB". -->
     <string name="recordings_summary_format">%1$d today · %2$d total · %3$s</string>
+    <!-- Header text when the daemon's recordings index is down. The counters
+         would all be zero and are NOT authoritative, so say so rather than
+         rendering "0 today · 0 total · 0 B" as fact. -->
+    <string name="recordings_summary_index_down">Counts unavailable — recordings index is down</string>
     <!-- Per-segment label with running count, e.g. "Dashcam · 118". -->
     <string name="recordings_segment_dashcam_count">Dashcam · %d</string>
+    <string name="recordings_segment_replays_count">Replays · %d</string>
     <string name="recordings_segment_surveillance_count">Surveillance · %d</string>
     <!-- Layout-time placeholder for the counts subtitle before the scan completes. -->
     <string name="recordings_summary_pending">—</string>
@@ -1064,6 +1096,7 @@
     <string name="vehicle_dialog_capacity_suffix">kWh</string>
     <string name="vehicle_dialog_capacity_helper">15 to 120 kWh. Leave to use the model default.</string>
     <string name="vehicle_dialog_model_label">Model</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
     <string name="vehicle_dialog_save">Save</string>
     <string name="vehicle_dialog_reset">Reset to auto-detect</string>
     <string name="vehicle_dialog_invalid_capacity">Capacity must be 15 - 120 kWh</string>
@@ -1079,6 +1112,8 @@
     <string name="dashboard_tunnel_offline">Offline</string>
     <string name="dashboard_tunnel_online">Online</string>
     <string name="dashboard_tunnel_connecting">Connecting…</string>
+    <string name="dashboard_tunnel_tile_failed">Error</string>
+    <string name="dashboard_tunnel_tile_stopping">Stopping…</string>
 
     <!-- Quick actions (now rendered as same-size tiles, not chips) -->
     <string name="dashboard_action_live">Live</string>
@@ -1144,6 +1179,35 @@
     <string name="settings_privacy_storage_count_format">%1$d clip</string>
     <string name="settings_privacy_storage_count_format_plural">%1$d clips</string>
     <string name="settings_privacy_reset_subtitle">Choose categories: recordings, events, daemon configs, cached telemetry…</string>
+
+    <!-- Diagnostics — log verbosity.
+         Lives on the Privacy pane because logs are on-device data, and this is
+         the control that decides how much of it gets written. Verbose is a
+         deliberate opt-in: at Debug the ADB layer traces every shell command,
+         which fills the rotation window fast and evicts older history.
+
+         Segment labels are single words on purpose — this is a four-way choice
+         on a head-unit screen, so the buttons carry the name and the paragraph
+         below carries the meaning, rather than cramming both into the control. -->
+    <string name="settings_privacy_overline_diagnostics">DIAGNOSTICS</string>
+    <string name="settings_privacy_log_level_label">Log detail</string>
+    <string name="settings_privacy_log_level_debug">Debug</string>
+    <string name="settings_privacy_log_level_info">Info</string>
+    <string name="settings_privacy_log_level_warn">Warnings</string>
+    <string name="settings_privacy_log_level_error">Errors</string>
+
+    <!-- One description per level; swapped as the selection changes, so the pane
+         explains the choice the user is actually looking at. -->
+    <string name="settings_privacy_log_level_debug_desc">Traces every ADB command and daemon check. Use this while diagnosing a fault — it fills the log files quickly, so older entries are discarded sooner.</string>
+    <string name="settings_privacy_log_level_info_desc">Normal operation. Records what the app and its daemons are doing, without the per-command detail.</string>
+    <string name="settings_privacy_log_level_warn_desc">Only problems and failures are recorded.</string>
+    <string name="settings_privacy_log_level_error_desc">Only failures are recorded. Everything leading up to one is discarded.</string>
+
+    <!-- Advisory shown at BOTH extremes. Verbose costs history; near-silent costs
+         the ability to diagnose anything later — the quiet end is the easier one
+         to set and forget, so it warns too. -->
+    <string name="settings_privacy_log_level_note_verbose">Verbose logging is on — older log history is discarded sooner.</string>
+    <string name="settings_privacy_log_level_note_quiet">Most logging is suppressed — a later fault will be harder to diagnose.</string>
 
     <!-- Settings → Security pane copy + PIN unlock screen.
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
@@ -1498,5 +1562,47 @@
     <string name="toast_cloudflared_token_cannot_be_empty">If you set the paid version the token cannot be empty</string>
     <string name="toast_cloudflared_token_invalid">Invalid token: use only letters, numbers and . _ - = characters</string>
     <string name="toast_cloudflared_saved_settings">Cloudflared settings saved</string>
+
+    <!-- Projection screen (cast an app to the driver cluster + live mirror) -->
+    <string name="projection_hero_title">Projection</string>
+    <string name="projection_hero_subtitle">Cast an app to the driver cluster and mirror it here.</string>
+    <string name="projection_pick_app">Choose an app to project</string>
+    <string name="projection_cast">Cast to cluster</string>
+    <string name="projection_stop">Stop</string>
+    <string name="projection_cast_failed">Couldn\'t cast that app to the cluster.</string>
+    <string name="projection_status_idle">Not projecting.</string>
+    <string name="projection_status_live">Live mirror — tap and swipe to control.</string>
+    <string name="projection_status_preview">Preview mode (reduced frame rate on this vehicle).</string>
+    <string name="projection_status_none">Nothing is projected yet — choose an app and cast.</string>
+    <string name="projection_status_unsupported">Live mirror isn\'t supported on this vehicle. The app is still projected on the cluster.</string>
+    <string name="projection_status_service_down">Mirror service isn\'t ready — restart the app (or the camera daemon) and try again.</string>
+    <string name="projection_note_single_app">One app can be projected on the cluster at a time.</string>
+    <string name="projection_adjust_bounds">Resize</string>
+    <string name="projection_done_adjusting">Done</string>
+    <string name="projection_bounds_hint_idle">Mirror preview</string>
+    <string name="projection_status_adjust">Drag the frame to move · drag a handle to resize the preview.</string>
+    <!-- Cluster window layout: presets + aspect lock. The box positions the cast app ON the
+         driver cluster; the head-unit view is a live mirror of the whole cluster. -->
+    <string name="projection_window_title">Cluster window</string>
+    <string name="projection_window_desc">Position the cast app on the driver cluster. Presets snap it to common layouts; Resize window lets you drag it freely.</string>
+    <string name="projection_preset_full">Full</string>
+    <string name="projection_preset_left">Left half</string>
+    <string name="projection_preset_right">Right half</string>
+    <string name="projection_preset_center">Center</string>
+    <string name="projection_lock_aspect">Keep cluster aspect</string>
+    <!-- Scaling mode picker -->
+    <string name="projection_scale_title">Mirror scaling</string>
+    <string name="projection_scale_desc">How the cluster mirror fills the preview on this screen.</string>
+    <string name="projection_scale_fit">Fit</string>
+    <string name="projection_scale_fill">Stretch</string>
+    <string name="projection_scale_zoom">Zoom</string>
+    <!-- Auto-start on ACC-on -->
+    <string name="projection_autostart_title">Auto-start on power-on</string>
+    <string name="projection_autostart_desc">Cast the last-used app to the cluster automatically each time the car powers on. (The mirror opens when you visit this screen.)</string>
+    <string name="projection_autostart_need_app">Cast an app first, then turn this on.</string>
+    <string name="projection_autostart_conflict_title">RoadSense is using the cluster</string>
+    <string name="projection_autostart_conflict_body">RoadSense is set to auto-project the map to the driver cluster when the car powers on. The cluster can only show one thing at a time. Turn that off and auto-start this app instead?</string>
+    <string name="projection_autostart_conflict_confirm">Use this app</string>
+    <string name="projection_app_uninstalled">That app is no longer installed.</string>
 
 </resources>

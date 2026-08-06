@@ -35,6 +35,12 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
     private static final int BACKOFF_BASE_SECONDS = 5;
     private static final int BACKOFF_CAP_SECONDS = 300;
+    // Base for the "broker resolved but connect failed" (downstream/transient)
+    // ramp. Starts at the original fast 15s retry for a transient blip, then
+    // doubles toward BACKOFF_CAP_SECONDS so a persistently unreachable :8883
+    // backs off instead of spinning a broker-lookup + fresh TLS handshake every
+    // 15s forever (the parked-night data leak).
+    private static final int PROGRESS_BACKOFF_BASE_SECONDS = 15;
     private static final long SESSION_REFRESH_MS = 25 * 60 * 1000; // 25 min (before 30 min expiry)
     private static final long REAUTH_COOLDOWN_MS = 60 * 1000; // matches pyBYD _MQTT_REAUTH_COOLDOWN_S
 
@@ -85,13 +91,27 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
     }
 
     public void stop() {
+        // Idempotency guard (mirrors start()'s `if (running) return`). Without
+        // this, a double-stop — e.g. two teardown paths racing — would run the
+        // shutdown sequence twice. It also makes the teardown safe to call from
+        // anywhere without re-entrancy bookkeeping.
+        if (!running) return;
         running = false;
         if (scheduler != null) {
             scheduler.shutdownNow();
             scheduler = null;
         }
         disconnectQuietly();
-        dataProvider.reset();
+        // NOTE: do NOT call dataProvider.reset() here. The subscriber is owned
+        // by BydCloudDataProvider; reset() -> stopSubscriber() is what calls
+        // THIS method. Calling reset() back from here created reentrant
+        // recursion (reset -> stopSubscriber -> stop -> reset -> ...) with no
+        // base case — stopSubscriber() only nulls its `subscriber` field AFTER
+        // stop() returns, so the nested stopSubscriber() saw the same non-null
+        // field and recursed until StackOverflowError, aborting the whole
+        // teardown (poller left running, singleton wedged, no HTTP response).
+        // The subscriber only tears down its OWN resources; the provider clears
+        // its snapshot/flags after stopSubscriber() returns.
     }
 
     public boolean isConnected() {
@@ -100,8 +120,41 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
     // ── Connection ──────────────────────────────────────────────────────
 
+    /**
+     * Guard: the captured {@link BydCloudClient} holds an IMMUTABLE config
+     * snapshot taken at construction and never re-reads config — so once the
+     * user clears credentials, this subscriber's client would keep logging in
+     * with the STALE snapshot. {@code stop()}/{@code shutdownNow()} cannot
+     * cancel a task already blocked inside OkHttp/Paho socket I/O (blocking
+     * sockets ignore Thread.interrupt), so a login/connect can still land after
+     * clear. This re-reads the live config (forceReload to defeat the ext4
+     * same-second mtime staleness — mirrors ScreenDeterrent.shouldStop()) and
+     * returns false the instant the account is cleared/unverified, which is the
+     * decisive stop for the stale-credential retry regardless of the race.
+     */
+    private boolean credentialsStillValid() {
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            return BydCloudConfig.fromUnifiedConfig().isVerified();
+        } catch (Throwable t) {
+            // On any read failure, fail SAFE: assume still valid so a transient
+            // config-read hiccup doesn't tear down a healthy live connection.
+            // The `running` flag remains the primary teardown signal.
+            return true;
+        }
+    }
+
     private void connectAndSubscribe() {
         if (!running || !connecting.compareAndSet(false, true)) return;
+        // Belt-and-suspenders: never (re)connect with a cleared/unverified
+        // account, even if this task was already queued/in-flight when the user
+        // cleared credentials. `running` covers the normal stop; this covers the
+        // stale-snapshot-in-flight race the interrupt can't win.
+        if (!credentialsStillValid()) {
+            logger.info("Cloud credentials cleared — aborting connect (no stale-cred login)");
+            connecting.set(false);
+            return;
+        }
 
         // Tracks how far we got so we can reset the backoff counter on
         // partial progress (e.g. broker resolved but TLS handshake failed —
@@ -211,14 +264,24 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
             // Backoff strategy: if we made any forward progress (broker
             // resolved) the failure is downstream — TLS race, broker hiccup —
-            // and we should retry quickly instead of ramping into a 5-minute
-            // window. If we never resolved the broker, escalate normally.
-            // Transient service errors (1005/1008/1009) get a fixed short
-            // delay because they're an upstream BYD condition that's unlikely
-            // to clear faster on exponential ramp.
+            // and we should retry quickly at first instead of ramping straight
+            // into a 5-minute window. But it must NOT retry at a fixed 15s
+            // FOREVER: a persistently unreachable :8883 (metered/restrictive
+            // network, or BYD broker trouble) then re-does a broker-lookup HTTPS
+            // POST + a fresh TLS handshake every 15s, 24/7 while parked —
+            // ~40-70 MB/day of pure reconnect churn (each attempt builds a new
+            // MqttClient, so no TLS session reuse). Instead: count the failures
+            // and grow the delay from ~15s toward the cap so a transient blip
+            // still clears fast (first retries ≈15s) while a stuck :8883 decays
+            // to the 5-minute ceiling. Transient service errors (1005/1008/1009)
+            // share this gentle ramp for the same reason.
             if (brokerResolved || isTransientService) {
-                consecutiveFailures = 1; // reset, but keep at first-attempt
-                scheduleReconnect(15);   // 15-second fixed retry
+                consecutiveFailures++;
+                // 15s, 30s, 60s, 120s, 240s, capped at BACKOFF_CAP_SECONDS.
+                long delay = Math.min(
+                        PROGRESS_BACKOFF_BASE_SECONDS * (1L << Math.min(consecutiveFailures - 1, 10)),
+                        BACKOFF_CAP_SECONDS);
+                scheduleReconnect(delay);
             } else {
                 consecutiveFailures++;
                 scheduleReconnect(0); // 0 = compute from consecutiveFailures
@@ -251,6 +314,10 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
     private void refreshSession() {
         if (!running) return;
+        if (!credentialsStillValid()) {
+            logger.info("Cloud credentials cleared — skipping session refresh");
+            return;
+        }
         try {
             logger.info("Refreshing BYD cloud session...");
             disconnectQuietly();
@@ -312,6 +379,10 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
         try {
             s.execute(() -> {
                 if (!running) return;
+                if (!credentialsStillValid()) {
+                    logger.info("Cloud credentials cleared — skipping re-auth");
+                    return;
+                }
                 try {
                     disconnectQuietly();
                     client.login();

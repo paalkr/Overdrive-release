@@ -23,14 +23,18 @@ var VC = {
     // State
     vehicleState: {
         locked: null,
+        lockScope: 'unknown',
+        lockSource: null,
         trunkOpen: false,
         doors: { lf: 1, rf: 1, lr: 1, rr: 1, trunk: -1, hood: -1 },
         windows: { lf: 0, rf: 0, lr: 0, rr: 0, sunroof: 0, sunshade: 0 },
-        lights: { dayTimeLight: false },
+        lights: { dayTimeLight: false, ambientColour: 1, ambientOptions: [] },
         adas: { speedLimitWarning: false },
+        setting: { childPresenceDetection: false },
         soc: 0,
         rangeKm: 0,
         cloudConfigured: false,
+        cloudState: 'checking',
         acOn: false,
         acTemp: 22,
         acFan: 3,
@@ -39,6 +43,8 @@ var VC = {
     },
 
     pollInterval: null,
+    cloudStatusInterval: null,
+    cloudLockInterval: null,
     _toastTimer: null,
     stateGlows: {},  // persistent glow lights keyed by position name
     _3dViewActive: false,
@@ -75,6 +81,20 @@ var VC = {
 
     init: function() {
         var self = this;
+        // Model ids are global, but their badges can be market-specific
+        // (for example, Seagull is sold as Dolphin Mini in Brazil). Refresh
+        // the already-built picker when the user changes the web locale.
+        if (BYD.i18n && typeof BYD.i18n.onChange === 'function') {
+            BYD.i18n.onChange(function() {
+                self.refreshModelPickerNames();
+                // These labels are live state, not static translated copy.
+                // Re-render after hydration so the i18n pass can never reset
+                // them to the HTML's initial "Checking" / "Unknown" text.
+                self.updateHUD();
+                self.updateCloudIndicator();
+                self.updateCloudControlAvailability();
+            });
+        }
         // Default: Aurora White (converted to linear so it matches the rest
         // of the colour pipeline; see applyColor() for the rationale).
         this.baseColor = new THREE.Color(0xE8E8EC).convertSRGBToLinear();
@@ -82,12 +102,13 @@ var VC = {
         this.initColorPicker();
         this.bindControls();
         this.startStateSync();
-        this.checkCloudStatus();
+        this.startCloudStatusSync();
         this.requestCloudLockRefresh();
         this.startCloudLockSync();
         this.animate();
         this.init3dButton();
         this.initCloudModal();
+        this.initVisibilitySync();
 
         // Vehicle appearance (model + color) is stored unified server-side so AVN
         // and phone-over-tunnel access show the same car. Fetch manifest + persisted
@@ -199,13 +220,13 @@ var VC = {
 
         this.scene = new THREE.Scene();
 
-        // Pull camera further back on narrow screens so the car renders
-        // smaller — leaves headroom on the canvas for the four tyre
-        // callouts (and future engine/coolant/oil overlays) without them
-        // colliding with the rendered body. Wider FOV on mobile too, so
-        // the same body fits in less screen height.
+        // Compact screens keep a wider lens so the car leaves room for
+        // overlays. Wide in-car displays use a calmer showroom perspective.
         var isMobile = window.innerWidth < 768;
-        var fov = isMobile ? 50 : 50;
+        var isCompact = isMobile && !window.AndroidBridge;
+        // A slightly narrower showroom lens on wide in-car displays makes
+        // three-quarter views easier to read and reduces near-side distortion.
+        var fov = isCompact ? 50 : 45;
         // Size the renderer to the CANVAS box, not the full window — the
         // sidebar (260px on desktop) eats the left edge, and rendering at
         // window-width pushes the car's visual centre off to the left of
@@ -218,15 +239,31 @@ var VC = {
         this.camera = new THREE.PerspectiveCamera(
             fov, renderW / renderH, 0.1, 1000
         );
-        this.camera.position.set(isMobile ? 5.0 : 4, isMobile ? 3.0 : 2.5, isMobile ? 6.5 : 5);
+        if (window.AndroidBridge) {
+            this.camera.position.set(4.6, 2.8, 6.0);
+        } else {
+            this.camera.position.set(isCompact ? 5.0 : 4, isCompact ? 3.0 : 2.5, isCompact ? 6.5 : 5);
+        }
 
         this.renderer = new THREE.WebGLRenderer({
             canvas: canvasEl,
             antialias: true,
-            alpha: true
+            alpha: true,
+            powerPreference: 'high-performance'
         });
+        // The AVN stretches the native WebView to the physical display after
+        // page layout. Rendering at its reported devicePixelRatio wastes GPU
+        // fill-rate without adding visible detail; phones retain high DPI.
+        this.renderer.setPixelRatio(window.AndroidBridge
+            ? 1
+            : Math.min(window.devicePixelRatio, 2));
         this.renderer.setSize(renderW, renderH, false);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 3));
+        if (window.AndroidBridge && window.console) {
+            console.log('[VC perf] canvas css=' + renderW + 'x' + renderH
+                + ' buffer=' + canvasEl.width + 'x' + canvasEl.height
+                + ' dpr=' + window.devicePixelRatio
+                + ' cameraAspect=' + this.camera.aspect.toFixed(4));
+        }
         // Read the clear colour from the active theme so the 3D viewport
         // matches the surrounding chrome under both light and dark themes.
         // Was previously hardcoded #0F0F12 which left the car silhouette
@@ -257,6 +294,7 @@ var VC = {
         this.addGroundGrid();
 
         window.addEventListener('resize', function() { self.onResize(); });
+        this._watchCanvasSize();
 
         // React to theme changes so the renderer's clear colour stays in
         // sync with the rest of the UI. The Android shell sets data-theme
@@ -300,6 +338,53 @@ var VC = {
             }
         } catch (e) { /* fall through */ }
         return 0x0F0F12;
+    },
+
+    /**
+     * The native shell hides the web sidebar after onPageFinished, after this
+     * page has already initialised Three.js. That expands the canvas without a
+     * window resize, so the old backing buffer was stretched across the new
+     * box. Observe the real content box and keep renderer + camera in sync.
+     * A short poll covers WebViews older than ResizeObserver.
+     */
+    _watchCanvasSize: function() {
+        var self = this;
+        var canvas = this.renderer && this.renderer.domElement;
+        if (!canvas) return;
+
+        var sync = function() {
+            if (!self.renderer || !self.camera) return;
+            var rect = canvas.getBoundingClientRect();
+            var w = Math.round(rect.width);
+            var h = Math.round(rect.height);
+            if (w < 1 || h < 1) return;
+            if (w !== self._canvasCssW || h !== self._canvasCssH) {
+                self._canvasCssW = w;
+                self._canvasCssH = h;
+                self.onResize();
+                if (window.AndroidBridge && window.console) {
+                    console.log('[VC perf] resized css=' + w + 'x' + h
+                        + ' buffer=' + canvas.width + 'x' + canvas.height
+                        + ' cameraAspect=' + self.camera.aspect.toFixed(4));
+                }
+            }
+        };
+
+        this._canvasCssW = Math.round(canvas.getBoundingClientRect().width);
+        this._canvasCssH = Math.round(canvas.getBoundingClientRect().height);
+
+        if (window.ResizeObserver) {
+            this._canvasResizeObserver = new ResizeObserver(sync);
+            this._canvasResizeObserver.observe(canvas);
+        }
+
+        var checksLeft = 30;
+        var poll = function() {
+            sync();
+            checksLeft--;
+            if (checksLeft > 0) setTimeout(poll, 100);
+        };
+        setTimeout(poll, 0);
     },
 
     addLighting: function() {
@@ -382,6 +467,7 @@ var VC = {
         var self = this;
         modelId = modelId || this.activeModelId || 'seal';
         this.activeModelId = modelId;
+        this._modelLoadStartedAt = Date.now();
         var gen = ++this._loadGen;
 
         // Sanity check — if Three.js failed to load (e.g. local extraction failed),
@@ -474,7 +560,59 @@ var VC = {
         });
         if (this.scene) this.scene.remove(this.carModel);
         this.carModel = null;
+        this._modelSourceScale = null;
         this.bodyPaintMeshes = [];
+    },
+
+    /**
+     * Prepare any manifest model for the shared Vehicle stage.
+     *
+     * `displayScale` is optional per-asset calibration metadata. The renderer
+     * does not special-case vehicle ids: a source mesh with a distorted axis
+     * can declare [x,y,z], while every other model falls back to [1,1,1].
+     * A final uniform fit keeps different vehicles similarly readable.
+     */
+    _fitLoadedCarModel: function() {
+        if (!this.carModel || typeof THREE === 'undefined') return;
+
+        var entry = this.ModelStore.findEntry(this.manifest, this.activeModelId);
+        var correction = [1, 1, 1];
+        if (entry && entry.displayScale && entry.displayScale.length === 3) {
+            for (var i = 0; i < 3; i++) {
+                var value = parseFloat(entry.displayScale[i]);
+                if (isFinite(value) && value > 0) correction[i] = value;
+            }
+        }
+
+        var source = this._modelSourceScale || new THREE.Vector3(1, 1, 1);
+        this.carModel.scale.set(
+            source.x * correction[0],
+            source.y * correction[1],
+            source.z * correction[2]
+        );
+        this.carModel.position.set(0, 0, 0);
+
+        var box = new THREE.Box3().setFromObject(this.carModel);
+        var size = box.getSize(new THREE.Vector3());
+        var longestFootprint = Math.max(size.x, size.z);
+        var rect = this.renderer && this.renderer.domElement
+            ? this.renderer.domElement.getBoundingClientRect()
+            : { width: window.innerWidth };
+        var compactViewport = rect.width < 768 && !window.AndroidBridge;
+        var targetLength = compactViewport ? 4.65 : 5.25;
+
+        if (longestFootprint > 0.0001) {
+            this.carModel.scale.multiplyScalar(targetLength / longestFootprint);
+        }
+
+        // Centre only after applying both correction and fit. Scaling an
+        // already-centred group can reintroduce an offset when its source
+        // origin is asymmetric.
+        this.carModel.position.set(0, 0, 0);
+        box.setFromObject(this.carModel);
+        var center = box.getCenter(new THREE.Vector3());
+        this.carModel.position.sub(center);
+        this.carModel.position.y += 0.1;
     },
 
     _loadModelFromPath: function(modelPath, gen) {
@@ -483,11 +621,14 @@ var VC = {
 
         // Draco decoder — the GLB uses Draco mesh compression.
         // Local path: assets/web/shared/vendor/draco/ (extracted to /data/local/tmp/web/shared/vendor/draco/).
-        // We force the JS decoder (no WASM) for Chrome 58 compatibility and to avoid the
-        // wasm MIME quirks on some BYD WebViews.
+        // WebAssembly is materially faster on the head unit and the local
+        // server serves .wasm as application/wasm. Keep JS as a fallback for
+        // WebViews without WebAssembly.
         var dracoLoader = new THREE.DRACOLoader();
         dracoLoader.setDecoderPath('../shared/vendor/draco/');
-        dracoLoader.setDecoderConfig({ type: 'js' });
+        dracoLoader.setDecoderConfig({
+            type: typeof WebAssembly === 'object' ? 'wasm' : 'js'
+        });
         loader.setDRACOLoader(dracoLoader);
 
         loader.load(
@@ -542,18 +683,11 @@ var VC = {
                     }
                 });
 
-                var box = new THREE.Box3().setFromObject(self.carModel);
-                var center = box.getCenter(new THREE.Vector3());
-                self.carModel.position.sub(center);
-                self.carModel.position.y += 0.1;
-
-                // Slight bump on the Android WebView (BYD head unit) since
-                // its effective canvas is smaller than mobile browsers.
-                // Kept conservative (1.10) so the four tyre callouts and
-                // the planned engine/coolant/oil overlays have room around
-                // the rendered car without overlapping the body.
-                if (window.AndroidBridge) {
-                    self.carModel.scale.multiplyScalar(1.10);
+                self._modelSourceScale = self.carModel.scale.clone();
+                self._fitLoadedCarModel();
+                if (window.AndroidBridge && window.console) {
+                    console.log('[VC perf] model=' + self.activeModelId
+                        + ' readyMs=' + (Date.now() - self._modelLoadStartedAt));
                 }
 
                 self.scene.add(self.carModel);
@@ -615,11 +749,8 @@ var VC = {
     },
 
     onResize: function() {
-        // Match the FOV used at init() — we don't shrink the FOV on mobile
-        // anymore (the car was rendering too big and clipping into the
-        // tyre callouts). 50° is a comfortable garage-floor look at all
-        // screen widths.
-        this.camera.fov = 50;
+        // Match the responsive lens used at initialisation.
+        this.camera.fov = window.innerWidth < 768 && !window.AndroidBridge ? 50 : 45;
         // Re-measure the canvas's CSS box, not the window — the sidebar
         // takes 260px on desktop. Without this, the car visually shifts
         // off-centre toward the right edge of the visible area.
@@ -635,9 +766,20 @@ var VC = {
         this._tyreLastW = 0; this._tyreLastH = 0;
     },
 
-    animate: function() {
+    animate: function(frameTime) {
         var self = this;
-        requestAnimationFrame(function() { self.animate(); });
+        requestAnimationFrame(function(nextFrameTime) { self.animate(nextFrameTime); });
+        // 30fps is smooth for this fixed automotive display. Together with
+        // the 1x backing buffer it removes most continuous AVN GPU load;
+        // standalone phone/browser clients retain their native refresh rate.
+        if (window.AndroidBridge) {
+            var now = typeof frameTime === 'number'
+                ? frameTime
+                : (window.performance && performance.now ? performance.now() : Date.now());
+            if (this._lastRenderFrame
+                    && now - this._lastRenderFrame < 32) return;
+            this._lastRenderFrame = now;
+        }
         if (this.controls) this.controls.update();
         // Update canvas texture each frame when 3D view is active
         if (this._3dViewActive && this._videoTexture) {
@@ -1131,7 +1273,9 @@ var VC = {
 
         _download: function(id, entry, url, onDone, onProgress) {
             var self = this;
-            if (onProgress) onProgress(BYD.i18n.t('vehicle.downloading_model', {name: entry.name, pct: 0}));
+            if (onProgress) onProgress(BYD.i18n.t('vehicle.downloading_model', {
+                name: BYD.i18n.modelName(entry.id, entry.name), pct: 0
+            }));
 
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '/api/models/download?id=' + encodeURIComponent(id), true);
@@ -1180,7 +1324,9 @@ var VC = {
                     }
                     if (onProgress) {
                         var pct = typeof s.percent === 'number' ? s.percent : 0;
-                        onProgress(BYD.i18n.t('vehicle.downloading_model', {name: entry.name, pct: pct}));
+                        onProgress(BYD.i18n.t('vehicle.downloading_model', {
+                            name: BYD.i18n.modelName(entry.id, entry.name), pct: pct
+                        }));
                     }
                     setTimeout(tick, 250);
                 };
@@ -1204,7 +1350,7 @@ var VC = {
             var m = this.manifest.models[i];
             var opt = document.createElement('option');
             opt.value = m.id;
-            opt.textContent = m.name;
+            opt.textContent = BYD.i18n.modelName(m.id, m.name);
             sel.appendChild(opt);
         }
 
@@ -1224,6 +1370,18 @@ var VC = {
             self._lastStaleRetryMs = now;
             self._kickManifestRefresh();
         });
+    },
+
+    /** Re-label the existing options without rebuilding listeners/selection. */
+    refreshModelPickerNames: function() {
+        var sel = document.getElementById('modelPicker');
+        if (!sel || !this.manifest || !this.manifest.models) return;
+        for (var i = 0; i < this.manifest.models.length; i++) {
+            var m = this.manifest.models[i];
+            if (sel.options[i]) {
+                sel.options[i].textContent = BYD.i18n.modelName(m.id, m.name);
+            }
+        }
     },
 
     setModel: function(id) {
@@ -1271,6 +1429,50 @@ var VC = {
             this.fetchChargingSchedule();
             this.fetchChargeCap();
         }
+        if (panelId === 'panelSound') {
+            this.fetchEngineSoundState();
+        }
+    },
+
+    /**
+     * Query exterior-speaker availability + engine-sound simulator state and
+     * reflect it in the Sound panel. Hides the engine-sound row when the
+     * vehicle doesn't support the simulator, and shows an "unavailable" hint
+     * when the 'auto' service is unreachable (car asleep / non-BYD build).
+     */
+    fetchEngineSoundState: function() {
+        var self = this;
+        fetch('/api/audio/engine-sound').then(function(resp) {
+            return resp.json();
+        }).then(function(data) {
+            var hint = document.getElementById('avasUnavailableHint');
+            var engineRow = document.getElementById('engineSoundRow');
+            if (!data || data.avasAvailable === false) {
+                if (hint) hint.style.display = '';
+                if (engineRow) engineRow.style.display = 'none';
+                return;
+            }
+            if (hint) hint.style.display = 'none';
+            if (engineRow) engineRow.style.display = data.supported ? '' : 'none';
+            self.vehicleState.engineSoundOn = data.on === true;
+            if (typeof data.preset === 'number' && data.preset >= 1) {
+                self.vehicleState.enginePreset = data.preset;
+            }
+            self.updateEngineSoundUI();
+        }).catch(function() {
+            var hint = document.getElementById('avasUnavailableHint');
+            if (hint) hint.style.display = '';
+        });
+    },
+
+    updateEngineSoundUI: function() {
+        var preset = document.getElementById('enginePreset');
+        if (preset) preset.textContent = String(this.vehicleState.enginePreset || 1);
+        var toggle = document.getElementById('btnEngineToggle');
+        if (toggle) {
+            if (this.vehicleState.engineSoundOn) toggle.classList.add('active');
+            else toggle.classList.remove('active');
+        }
     },
 
     /** Update tab dot indicators based on vehicle state */
@@ -1281,7 +1483,10 @@ var VC = {
         // Security tab — has-active if locked (null = unknown, don't show)
         var secTab = tabs[0];
         if (secTab) {
-            if (this.vehicleState.locked === true) secTab.classList.add('has-active');
+            if (this.vehicleState.locked === true
+                    && this.vehicleState.lockScope === 'vehicle') {
+                secTab.classList.add('has-active');
+            }
             else secTab.classList.remove('has-active');
         }
 
@@ -1379,6 +1584,7 @@ var VC = {
         // optimistically; the server message resolves cloud-required prompt
         // automatically when not connected (per memory: tap-to-discover).
         this.bindBtn('btnBatteryHeat', function() {
+            if (!self.requireCloud()) return;
             var current = !!(self.vehicleState && self.vehicleState.batteryHeat);
             var next = !current;
             self.setPending('btnBatteryHeat', true);
@@ -1456,6 +1662,27 @@ var VC = {
                     BYD.i18n.t('vehicle.drl_failed'));
             });
         });
+        var ambientSlider = document.getElementById('ambientColourSlider');
+        if (ambientSlider) {
+            var ambientDebounce = null;
+            ambientSlider.addEventListener('input', function() {
+                var v = parseInt(ambientSlider.value, 10);
+                self.vehicleState.lights.ambientColour = v;
+                self.updateLightsUI();
+                // Debounce the write so dragging the slider doesn't fire a POST per pixel.
+                if (ambientDebounce) clearTimeout(ambientDebounce);
+                ambientDebounce = setTimeout(function() {
+                    self.apiPost('/api/vehicle/lights', { target: 'ambientColour', value: v }).then(function(result) {
+                        if (result.success) {
+                            self.updateLightsUI();
+                        }
+                        self.toastFromResult(result,
+                            BYD.i18n.t('vehicle.ambient_set'),
+                            BYD.i18n.t('vehicle.ambient_failed'));
+                    });
+                }, 350);
+            });
+        }
 
         // === ADAS CONTROLS ===
         this.bindBtn('btnSLW', function() {
@@ -1468,6 +1695,18 @@ var VC = {
                 self.toastFromResult(result,
                     BYD.i18n.t(enable ? 'vehicle.slw_enabled' : 'vehicle.slw_disabled'),
                     BYD.i18n.t('vehicle.slw_failed'));
+            });
+        });
+        this.bindBtn('btnCPD', function() {
+            var enable = !(self.vehicleState.setting && self.vehicleState.setting.childPresenceDetection);
+            self.apiPost('/api/vehicle/setting', { target: 'childPresenceDetection', value: enable ? 1 : 2 }).then(function(result) {
+                if (result.success) {
+                    self.vehicleState.setting.childPresenceDetection = enable;
+                    self.updateAdasUI();
+                }
+                self.toastFromResult(result,
+                    BYD.i18n.t(enable ? 'vehicle.cpd_enabled' : 'vehicle.cpd_disabled'),
+                    BYD.i18n.t('vehicle.cpd_failed'));
             });
         });
 
@@ -1603,7 +1842,7 @@ var VC = {
         // doesn't honor the value (the documented Seal HAL behavior) the GET
         // returns supported=false and we hide the section.
         if (!this.vehicleState.chargeCap) {
-            this.vehicleState.chargeCap = { percent: 80, enabled: null, supported: null };
+            this.vehicleState.chargeCap = { percent: 70, enabled: null, supported: null };
         }
         this.bindBtn('btnChargeCapToggle', function() {
             var s = self.vehicleState.chargeCap;
@@ -1628,8 +1867,17 @@ var VC = {
                 if (capDebounce) clearTimeout(capDebounce);
                 capDebounce = setTimeout(function() {
                     self.apiPost('/api/vehicle/charge-cap', { percent: v }).then(function(result) {
-                        if (result.success && typeof result.supported === 'boolean') {
-                            self.vehicleState.chargeCap.supported = result.supported;
+                        if (result.success) {
+                            // The server echoes the EFFECTIVE cap — the SOC-target
+                            // path caps at 70, so a requested 90 may come back 70.
+                            // Reflect the truth in the slider/readout.
+                            if (typeof result.percent === 'number'
+                                    && result.percent >= 15 && result.percent <= 100) {
+                                self.vehicleState.chargeCap.percent = result.percent;
+                            }
+                            if (typeof result.supported === 'boolean') {
+                                self.vehicleState.chargeCap.supported = result.supported;
+                            }
                             self.updateChargeCapUI();
                         }
                         self.toastFromResult(result, null, null);
@@ -1690,6 +1938,51 @@ var VC = {
             self.updateClimateUI();
             self.triggerSonarVFX(0, 0.5, 0, new THREE.Color(0x52525B));
             self.apiPost('/api/vehicle/climate', { action: 'set_fan', fan: f });
+        });
+
+        // === EXTERIOR SPEAKER (AVAS) CONTROLS ===
+        // Tone tiles carry data-avas-pattern; POST the index to /api/audio/avas-tone.
+        var toneBtns = document.querySelectorAll('#panelSound [data-avas-pattern]');
+        for (var ti = 0; ti < toneBtns.length; ti++) {
+            (function(btn) {
+                var pattern = parseInt(btn.getAttribute('data-avas-pattern'), 10);
+                self.bindBtn(btn.id, function() {
+                    self.triggerSonarVFX(0, 0.6, 0, new THREE.Color(0xFBBF24));
+                    self.apiPost('/api/audio/avas-tone', { pattern: pattern }).then(function(r) {
+                        self.toastFromResult(r, BYD.i18n.t('vehicle.avas_playing'), BYD.i18n.t('vehicle.avas_failed'));
+                    });
+                });
+            })(toneBtns[ti]);
+        }
+        this.bindBtn('btnAvasStop', function() {
+            self.apiPost('/api/audio/avas-tone', { stop: true }).then(function(r) {
+                self.toastFromResult(r, BYD.i18n.t('vehicle.avas_stopped'), BYD.i18n.t('vehicle.avas_failed'));
+            });
+        });
+        this.bindBtn('btnEngineToggle', function() {
+            var next = !self.vehicleState.engineSoundOn;
+            self.apiPost('/api/audio/engine-sound', { on: next, preset: self.vehicleState.enginePreset || 1 }).then(function(r) {
+                if (r.success) { self.vehicleState.engineSoundOn = next; self.updateEngineSoundUI(); }
+                self.toastFromResult(r, BYD.i18n.t('vehicle.engine_sound'), BYD.i18n.t('vehicle.avas_failed'));
+            });
+        });
+        this.bindBtn('btnEngineNext', function() {
+            var p = (self.vehicleState.enginePreset || 1) + 1;
+            self.apiPost('/api/audio/engine-sound', { preset: p }).then(function(r) {
+                if (r.success && typeof r.preset === 'number' && r.preset >= 1) {
+                    self.vehicleState.enginePreset = r.preset;
+                    self.updateEngineSoundUI();
+                }
+            });
+        });
+        this.bindBtn('btnEnginePrev', function() {
+            var p = Math.max(1, (self.vehicleState.enginePreset || 1) - 1);
+            self.apiPost('/api/audio/engine-sound', { preset: p }).then(function(r) {
+                if (r.success && typeof r.preset === 'number' && r.preset >= 1) {
+                    self.vehicleState.enginePreset = r.preset;
+                    self.updateEngineSoundUI();
+                }
+            });
         });
 
         // Seat heating — cycles 0→1→2→0
@@ -1756,17 +2049,129 @@ var VC = {
             })(si);
         }
 
-        // Seat memory positions — driver-side recall (BYD SDK supports up to 2 stored positions).
+        // Seat memory positions — driver-side (BYD SDK supports up to 2 stored slots).
+        // TAP = recall the stored slot (move seat to it); LONG-PRESS = save the
+        // seat's current position into that slot (mirrors the physical door memory
+        // buttons). Two distinct SDK feature ids back these — see BydDataCollector
+        // setSeatMemoryPosition (WAKE/recall) vs setSeatMemorySave (SET/store).
         for (var smi = 1; smi <= 2; smi++) {
             (function(pos) {
-                self.bindBtn('btnSeatMemory' + pos, function() {
-                    // Blue sonar at driver seat — recall is driver-only.
-                    var sp = seatPositions[1];
-                    self.triggerSonarVFX(sp.x, sp.y, sp.z, new THREE.Color(0x00BFFF));
-                    self.toast(BYD.i18n.t('vehicle.seat_memory_position', {pos: pos}), 'success');
-                    self.apiPost('/api/vehicle/seat', { action: 'position', position: pos });
-                });
+                self.bindTileTapHold('btnSeatMemory' + pos,
+                    function() {
+                        // TAP → recall. Blue sonar at the driver seat.
+                        var sp = seatPositions[1];
+                        self.triggerSonarVFX(sp.x, sp.y, sp.z, new THREE.Color(0x00BFFF));
+                        self.toast(BYD.i18n.t('vehicle.seat_memory_position', {pos: pos}), 'success');
+                        self.apiPost('/api/vehicle/seat', { action: 'position', position: pos });
+                    },
+                    function() {
+                        // LONG-PRESS → save current position. Green sonar to signal
+                        // "stored" (distinct from the blue recall pulse).
+                        var sp = seatPositions[1];
+                        self.triggerSonarVFX(sp.x, sp.y, sp.z, new THREE.Color(0x00D4AA));
+                        self.toast(BYD.i18n.t('vehicle.seat_memory_saved', {pos: pos}), 'success');
+                        self.apiPost('/api/vehicle/seat', { action: 'save', position: pos });
+                    });
             })(smi);
+        }
+    },
+
+    /**
+     * Bind a tile that distinguishes a short TAP from a LONG-PRESS (tap-and-hold).
+     * Used by the seat-memory tiles: tap recalls, hold saves. SOTA-grade for the
+     * Android 7.1 head-unit WebView:
+     *   - Uses pointer events when available, falling back to touch+mouse; a single
+     *     shared guard (bound flag) prevents double-binding across event families.
+     *   - A hold timer (holdMs, default 650) fires onHold and marks the gesture
+     *     "consumed" so the trailing tap/click does NOT also fire onTap.
+     *   - Any move beyond a small slop, or leaving the tile, CANCELS the pending
+     *     hold (so a scroll/drag never saves by accident).
+     *   - A `.arming` class drives a fill animation during the hold for feedback;
+     *     `.armed` flashes once on save. Both are cleared on release.
+     *   - A 500ms post-fire dedupe (same as bindBtn) absorbs the synthetic click
+     *     the platform emits after touchend.
+     */
+    bindTileTapHold: function(id, onTap, onHold, holdMs) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        holdMs = holdMs || 650;
+        var self = this;
+        var timer = null;
+        var startX = 0, startY = 0;
+        var held = false;          // hold already fired for this gesture
+        var active = false;        // a press is in progress
+        var lastFire = 0;          // shared tap/hold dedupe window
+        var SLOP = 12;             // px of movement that cancels the hold
+
+        function fire(fn) {
+            var now = Date.now();
+            if (now - lastFire < 500) return;
+            lastFire = now;
+            try { fn.call(el); }
+            catch (err) { console.error('[VC] tap/hold handler error for #' + id + ':', err); }
+        }
+        function clearArm() {
+            el.classList.remove('arming');
+            if (timer) { clearTimeout(timer); timer = null; }
+        }
+        function begin(x, y) {
+            // Idempotent against overlapping/secondary pointers (multi-touch): a
+            // second begin() before end() would orphan the first hold timer, which
+            // then fires a spurious onHold (save) after release. Ignore any press
+            // that arrives while one is already active.
+            if (active) return;
+            active = true; held = false;
+            startX = x; startY = y;
+            // reflow so the fill animation restarts each press
+            el.classList.remove('arming');
+            void el.offsetWidth;
+            el.style.setProperty('--vc-hold-ms', holdMs + 'ms');
+            el.classList.add('arming');
+            timer = setTimeout(function() {
+                held = true;
+                clearArm();
+                el.classList.add('armed');
+                setTimeout(function() { el.classList.remove('armed'); }, 400);
+                fire(onHold);
+            }, holdMs);
+        }
+        function move(x, y) {
+            if (!active) return;
+            if (Math.abs(x - startX) > SLOP || Math.abs(y - startY) > SLOP) {
+                active = false; clearArm();
+            }
+        }
+        function end(commitTap) {
+            if (!active && !held) { clearArm(); return; }
+            var wasHeld = held;
+            active = false; held = false;
+            clearArm();
+            if (!wasHeld && commitTap) fire(onTap);
+        }
+
+        if (window.PointerEvent) {
+            el.addEventListener('pointerdown', function(e) { begin(e.clientX, e.clientY); });
+            el.addEventListener('pointermove', function(e) { move(e.clientX, e.clientY); });
+            el.addEventListener('pointerup',    function(e) { end(true); });
+            el.addEventListener('pointercancel',function(e) { active = false; held = false; clearArm(); });
+            el.addEventListener('pointerleave', function(e) { if (active) { active = false; clearArm(); } });
+        } else {
+            el.addEventListener('touchstart', function(e) {
+                var t = e.touches[0]; begin(t ? t.clientX : 0, t ? t.clientY : 0);
+            }, { passive: true });
+            el.addEventListener('touchmove', function(e) {
+                var t = e.touches[0]; if (t) move(t.clientX, t.clientY);
+            }, { passive: true });
+            el.addEventListener('touchend', function(e) {
+                e.preventDefault();  // suppress the synthetic click after touchend
+                end(true);
+            }, { passive: false });
+            el.addEventListener('touchcancel', function() { active = false; held = false; clearArm(); });
+            // Mouse fallback for desktop/PWA testing.
+            el.addEventListener('mousedown', function(e) { begin(e.clientX, e.clientY); });
+            el.addEventListener('mousemove', function(e) { move(e.clientX, e.clientY); });
+            el.addEventListener('mouseup',   function() { end(true); });
+            el.addEventListener('mouseleave',function() { if (active) { active = false; clearArm(); } });
         }
     },
 
@@ -1807,8 +2212,33 @@ var VC = {
 
     startStateSync: function() {
         var self = this;
+        if (this.pollInterval) clearInterval(this.pollInterval);
         this.fetchState();
         this.pollInterval = setInterval(function() { self.fetchState(); }, 3000);
+    },
+
+    /**
+     * Stop/restart the three pollers with page visibility. A hidden WebView kept
+     * hitting /api/vehicle/state every 3s, and each of those spawns a server-side
+     * refresh thread on the head unit.
+     */
+    initVisibilitySync: function() {
+        var self = this;
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                self.stopSyncPollers();
+            } else {
+                self.startStateSync();
+                self.startCloudStatusSync();
+                self.startCloudLockSync();
+            }
+        });
+    },
+
+    stopSyncPollers: function() {
+        if (this.pollInterval) { clearInterval(this.pollInterval); this.pollInterval = null; }
+        if (this.cloudStatusInterval) { clearInterval(this.cloudStatusInterval); this.cloudStatusInterval = null; }
+        if (this.cloudLockInterval) { clearInterval(this.cloudLockInterval); this.cloudLockInterval = null; }
     },
 
     fetchState: function() {
@@ -1819,6 +2249,7 @@ var VC = {
             if (!data.success) return;
 
             var wasLocked = self.vehicleState.locked;
+            var wasLockScope = self.vehicleState.lockScope;
 
             // Doors (lock status: 1=locked, 2=unlocked)
             if (data.doors) {
@@ -1829,15 +2260,27 @@ var VC = {
                     trunk: d.trunk || -1, hood: d.hood || -1
                 };
                 var overall = (d.overall !== undefined && d.overall !== null) ? d.overall : -1;
+                var reportedScope = d.scope
+                    || (d.source === 'ota' ? 'driver_door' : 'vehicle');
                 if (overall === 1) {
                     self.vehicleState.locked = true;
+                    self.vehicleState.lockScope = reportedScope;
+                    self.vehicleState.lockSource = d.source || null;
                 } else if (overall === 2) {
                     self.vehicleState.locked = false;
+                    self.vehicleState.lockScope = reportedScope;
+                    self.vehicleState.lockSource = d.source || null;
                 } else {
-                    // Unknown from CAN bus — keep last known state if we had one
+                    // Unknown from all vehicle sources — keep the last known
+                    // state if we had one.
                     // Only set to null if we never received a valid state
-                    if (wasLocked === null) self.vehicleState.locked = null;
-                    // else keep wasLocked (persist last known)
+                    if (wasLocked === null) {
+                        self.vehicleState.locked = null;
+                        self.vehicleState.lockScope = 'unknown';
+                        self.vehicleState.lockSource = null;
+                    } else {
+                        self.vehicleState.lockScope = wasLockScope;
+                    }
                 }
             }
 
@@ -1878,6 +2321,7 @@ var VC = {
 
             if (data.lights) self.vehicleState.lights = data.lights;
             if (data.adas) self.vehicleState.adas = data.adas;
+            if (data.setting) self.vehicleState.setting = data.setting;
 
             if (data.seats && data.seats.heat) self.vehicleState.seatHeat = data.seats.heat;
             if (data.seats && data.seats.cool) self.vehicleState.seatCool = data.seats.cool;
@@ -1911,14 +2355,38 @@ var VC = {
         });
     },
 
+    startCloudStatusSync: function() {
+        var self = this;
+        this.updateCloudIndicator();
+        this.updateCloudControlAvailability();
+        this.checkCloudStatus();
+        if (this.cloudStatusInterval) clearInterval(this.cloudStatusInterval);
+        // Keep the badge and capability markers current if credentials are
+        // connected or removed from Settings while this page remains open.
+        this.cloudStatusInterval = setInterval(function() {
+            self.checkCloudStatus();
+        }, 30 * 1000);
+    },
+
     checkCloudStatus: function() {
         var self = this;
         fetch('/api/vehicle/cloud-status').then(function(resp) {
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
             return resp.json();
         }).then(function(data) {
-            self.vehicleState.cloudConfigured = data.configured && data.verified;
+            self.vehicleState.cloudConfigured = !!(data.configured && data.verified);
+            self.vehicleState.cloudState = self.vehicleState.cloudConfigured
+                ? 'connected'
+                : 'not_configured';
             self.updateCloudIndicator();
+            self.updateCloudControlAvailability();
         }).catch(function(e) {
+            // A failed probe means "status unknown", not "account gone". Clearing
+            // cloudConfigured here would lock out every cloud control for 30s on
+            // one dropped response, with valid credentials.
+            self.vehicleState.cloudState = 'unavailable';
+            self.updateCloudIndicator();
+            self.updateCloudControlAvailability();
             console.warn('[VC] Cloud status error:', e);
         });
     },
@@ -1946,20 +2414,31 @@ var VC = {
             if (!data || !data.success || !data.status) return;
             var s = data.status;
 
-            // Prefer cloud lock state when CAN bus didn't give us a valid one.
-            // CAN bus sets self.vehicleState.locked = true/false; null = no
-            // valid reading yet. We only override null — if CAN said locked
-            // or unlocked, trust it (it's a few hundred ms fresh vs MQTT's
-            // potentially-minutes-old snapshot).
-            var canIsAuthoritative = self.vehicleState.locked === true || self.vehicleState.locked === false;
-            if (!canIsAuthoritative) {
+            // A full local vehicle reading is authoritative. The Atto's OTA
+            // path exposes only the driver door, however, so a fresh full-car
+            // cloud snapshot may replace that partial reading.
+            var localIsAuthoritative =
+                    (self.vehicleState.locked === true || self.vehicleState.locked === false)
+                    && self.vehicleState.lockScope === 'vehicle';
+            // Evaluate staleness BEFORE writing: an old snapshot must not replace a
+            // fresh partial reading and get promoted to scope 'vehicle'.
+            var isStale = s.lockState === 'unknown'
+                    || s.lastMessageAge === -1
+                    || (typeof s.lastMessageAge === 'number' && s.lastMessageAge > self.STALE_RESPONSE_AGE_S);
+            var haveLocalReading =
+                    self.vehicleState.locked === true || self.vehicleState.locked === false;
+            if (!localIsAuthoritative && !(isStale && haveLocalReading)) {
                 if (s.lockState === 'locked') {
                     self.vehicleState.locked = true;
+                    self.vehicleState.lockScope = 'vehicle';
+                    self.vehicleState.lockSource = 'cloud';
                     self.updateHUD();
                     self.updateDoorIndicators();
                     self.updateTabIndicators();
                 } else if (s.lockState === 'unlocked') {
                     self.vehicleState.locked = false;
+                    self.vehicleState.lockScope = 'vehicle';
+                    self.vehicleState.lockSource = 'cloud';
                     self.updateHUD();
                     self.updateDoorIndicators();
                     self.updateTabIndicators();
@@ -1970,10 +2449,7 @@ var VC = {
             // schedule one follow-up to pick up the result of the server's
             // background REST refresh. Skipped if this is itself a follow-up
             // call (avoids loops on persistently stale data).
-            var isStale = s.lockState === 'unknown'
-                    || s.lastMessageAge === -1
-                    || (typeof s.lastMessageAge === 'number' && s.lastMessageAge > self.STALE_RESPONSE_AGE_S);
-            if (!_isFollowup && isStale && !canIsAuthoritative) {
+            if (!_isFollowup && isStale && !localIsAuthoritative) {
                 setTimeout(function() { self.requestCloudLockRefresh(true); }, self.FOLLOWUP_DELAY_MS);
             }
         }).catch(function(e) {
@@ -1987,6 +2463,7 @@ var VC = {
     // moves, this is just a heartbeat for the cold-cache case.
     startCloudLockSync: function() {
         var self = this;
+        if (this.cloudLockInterval) clearInterval(this.cloudLockInterval);
         this.cloudLockInterval = setInterval(function() {
             self.requestCloudLockRefresh();
         }, 30 * 1000);
@@ -1999,6 +2476,18 @@ var VC = {
         var dismissBtn = document.getElementById('cloudModalDismiss');
         if (dismissBtn) {
             dismissBtn.addEventListener('click', function() { self.hideCloudModal(); });
+        }
+        var statusPill = document.getElementById('cloudStatus');
+        if (statusPill) {
+            statusPill.setAttribute('role', 'button');
+            statusPill.setAttribute('tabindex', '0');
+            var explainCloud = function() {
+                if (!self.vehicleState.cloudConfigured) self.showCloudModal();
+            };
+            statusPill.addEventListener('click', explainCloud);
+            statusPill.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' || e.key === ' ') explainCloud();
+            });
         }
         // Also dismiss on overlay click (outside the modal card)
         var overlay = document.getElementById('cloudModal');
@@ -2032,32 +2521,61 @@ var VC = {
 
     // ==================== UI UPDATES ====================
 
-    updateHUD: function() {
-        var socEl = document.getElementById('socValue');
-        if (socEl) socEl.textContent = Math.round(this.vehicleState.soc) + '%';
-
-        var socFill = document.getElementById('socFill');
-        if (socFill) socFill.style.width = Math.min(100, Math.max(0, this.vehicleState.soc)) + '%';
-
-        var rangeEl = document.getElementById('rangeValue');
-        if (rangeEl) rangeEl.textContent = BYD.units.dist(this.vehicleState.rangeKm);
-
-        this.updateLockUI(this.vehicleState.locked);
+    translatedText: function(key, fallback) {
+        var value = BYD.i18n && typeof BYD.i18n.t === 'function'
+            ? BYD.i18n.t(key)
+            : null;
+        return value && value !== key ? value : fallback;
     },
 
-    updateLockUI: function(locked) {
+    // SOC / range are owned by the app-shell sidebar card (core.js polls /status
+    // and writes evPercentValue / evBatteryFill / evRange). The in-page HUD that
+    // #socValue / #socFill / #rangeValue targeted never existed on this page, so
+    // those writes were dead; only the lock UI is ours.
+    updateHUD: function() {
+        this.updateLockUI(this.vehicleState.locked, this.vehicleState.lockScope);
+    },
+
+    updateLockUI: function(locked, scope) {
         var lockBtn = document.getElementById('btnLock');
         var unlockBtn = document.getElementById('btnUnlock');
         var lockStatus = document.getElementById('lockStatus');
+        var wholeVehicleKnown = scope === 'vehicle';
 
-        // locked can be true, false, or null (unknown)
-        if (lockBtn) { if (locked === true) lockBtn.classList.add('on'); else lockBtn.classList.remove('on'); }
-        if (unlockBtn) { if (locked === false) unlockBtn.classList.add('on'); else unlockBtn.classList.remove('on'); }
+        // Do not present a driver-door-only reading as whole-car state.
+        if (lockBtn) {
+            if (locked === true && wholeVehicleKnown) lockBtn.classList.add('on');
+            else lockBtn.classList.remove('on');
+        }
+        if (unlockBtn) {
+            if (locked === false && wholeVehicleKnown) unlockBtn.classList.add('on');
+            else unlockBtn.classList.remove('on');
+        }
         if (lockStatus) {
-            lockStatus.textContent = locked === true ? BYD.i18n.t('vehicle.locked') : (locked === false ? BYD.i18n.t('vehicle.unlocked') : BYD.i18n.t('common.unknown'));
+            var label;
+            if (locked !== true && locked !== false) {
+                label = this.translatedText('common.unknown', 'Unknown');
+            } else if (scope === 'driver_door') {
+                label = locked
+                    ? this.translatedText('vehicle.driver_door_locked', 'Driver door locked')
+                    : this.translatedText('vehicle.driver_door_unlocked', 'Driver door unlocked');
+            } else {
+                label = locked
+                    ? this.translatedText('vehicle.locked', 'Locked')
+                    : this.translatedText('vehicle.unlocked', 'Unlocked');
+            }
+            lockStatus.textContent = label;
             var dot = lockStatus.previousElementSibling;
             if (dot) {
-                dot.className = 'dot ' + (locked === true ? 'green' : (locked === false ? 'amber' : 'grey'));
+                // Colour tracks the lock state; the label carries the scope. Folding
+                // partial scope onto amber made "Driver door locked" show the
+                // unlocked colour and made the two driver-door states identical.
+                var known = (locked === true || locked === false);
+                var tone = !known ? 'grey' : (locked ? 'green' : 'amber');
+                // 'partial' only decorates a KNOWN state — on grey it would just
+                // inherit the pill's text colour and read as a fourth state.
+                dot.className = 'dot compact-status-pill__dot ' + tone +
+                    (known && !wholeVehicleKnown ? ' partial' : '');
             }
         }
     },
@@ -2229,12 +2747,40 @@ var VC = {
         var pillEl = document.getElementById('cloudStatus');
         if (!pillEl) return;
         var dot = pillEl.querySelector('.dot');
-        if (this.vehicleState.cloudConfigured) {
-            if (dot) dot.className = 'dot green';
-            if (textEl) textEl.textContent = BYD.i18n.t('vehicle.cloud_connected');
+        var state = this.vehicleState.cloudState || 'checking';
+        pillEl.setAttribute('data-cloud-state', state);
+        if (state === 'connected') {
+            if (dot) dot.className = 'dot compact-status-pill__dot green';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.cloud_connected', 'BYD account connected');
+            }
+        } else if (state === 'not_configured') {
+            if (dot) dot.className = 'dot compact-status-pill__dot grey';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.cloud_not_configured', 'BYD account not connected');
+            }
+        } else if (state === 'unavailable') {
+            if (dot) dot.className = 'dot compact-status-pill__dot red';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.cloud_unavailable', 'Cloud status unavailable');
+            }
         } else {
-            if (dot) dot.className = 'dot red';
-            if (textEl) textEl.textContent = BYD.i18n.t('vehicle.cloud_not_configured');
+            if (dot) dot.className = 'dot compact-status-pill__dot amber';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.checking', 'Checking...');
+            }
+        }
+    },
+
+    updateCloudControlAvailability: function() {
+        var state = this.vehicleState.cloudState || 'checking';
+        var controls = document.querySelectorAll('[data-requires-cloud="true"]');
+        for (var i = 0; i < controls.length; i++) {
+            controls[i].setAttribute('data-cloud-state', state);
         }
     },
 
@@ -2281,15 +2827,37 @@ var VC = {
     },
 
     updateLightsUI: function() {
+        if (!this.vehicleState.lights) return;
         var btnDRL = document.getElementById('btnDRL');
-        var on = !!(this.vehicleState.lights && this.vehicleState.lights.dayTimeLight);
+        var on = !!(this.vehicleState.lights.dayTimeLight);
         if (btnDRL) { if (on) btnDRL.classList.add('on'); else btnDRL.classList.remove('on'); }
+
+        var slider = document.getElementById('ambientColourSlider');
+        if (slider) {
+            var colour = this.vehicleState.lights.ambientColour;
+            if (typeof colour === 'number') {
+                slider.value = colour;
+                var options = this.vehicleState.lights.ambientOptions;
+                if (options && options.length) {
+                    slider.disabled = false;
+                    slider.style.background = 'linear-gradient(to right, ' + options.join(',') + ')';
+                    if (colour >= 1 && colour <= options.length) {
+                        slider.style.setProperty('--color', options[colour - 1]);
+                    }
+                } else {
+                    slider.disabled = true;
+                }
+            }
+        }
     },
 
     updateAdasUI: function() {
         var btnSLW = document.getElementById('btnSLW');
         var on = !!(this.vehicleState.adas && this.vehicleState.adas.speedLimitWarning);
         if (btnSLW) { if (on) btnSLW.classList.add('on'); else btnSLW.classList.remove('on'); }
+        var btnCPD = document.getElementById('btnCPD');
+        var cpdOn = !!(this.vehicleState.setting && this.vehicleState.setting.childPresenceDetection);
+        if (btnCPD) { if (cpdOn) btnCPD.classList.add('on'); else btnCPD.classList.remove('on'); }
     },
 
     /** Custom-mode chargeWay: always emit CSV so server doesn't fall back to "e". */
@@ -2389,7 +2957,12 @@ var VC = {
             }
             if (!self.vehicleState.chargeCap) self.vehicleState.chargeCap = {};
             var s = self.vehicleState.chargeCap;
-            if (typeof data.percent === 'number') s.percent = data.percent;
+            // Only accept a physically valid cap (15..100). A HAL sentinel that
+            // slipped past the server (e.g. 65535) is ignored so the readout
+            // shows '--' rather than "65535%".
+            if (typeof data.percent === 'number' && data.percent >= 15 && data.percent <= 100) {
+                s.percent = data.percent;
+            }
             if (typeof data.enabled === 'boolean') s.enabled = data.enabled;
             if (typeof data.supported === 'boolean') s.supported = data.supported;
             else s.supported = null;
@@ -4009,38 +4582,94 @@ var VC = {
      // BYD WebView's hot path.
     _updateTyreCalloutPositions: function() { /* no-op — CSS handles it */ },
 
-    /** Map raw BYD enums + raw PSI to a 3-tier visual-state scale:
-     *    'alert'  → red     leak (airLeakState>=1) or PSI < 22 (deflated)
-     *    'warn'   → orange  pressureState UNDER/OVER, or PSI < 34, or PSI > 45
-     *    'normal' → green   34-45 PSI, no leak, signal OK
+    // User-configured kPa limits from /api/vehicle/state (tyres.limits), kept
+    // in sync by updateTyreCallouts. Defaults mirror UnifiedConfigManager so
+    // the colouring is correct on the first paint, before any response lands,
+    // and if the server omits the block.
+    _tyreLimits: { frontLow: 234, frontHigh: 310, rearLow: 234, rearHigh: 310, criticalLow: 152 },
+
+    /** Map raw BYD enums + raw kPa to a 3-tier visual-state scale:
+     *    'alert'  → red     leak (airLeakState>=1) or kPa <= criticalLow
+     *    'warn'   → orange  pressureState UNDER/OVER, or kPa outside the
+     *                       configured [low, high] band for that axle
+     *    'normal' → teal    in-band reading with no SDK warning
      *    'muted'  → grey    no signal / no data
-     *  SDK enums are checked first so we still flag alert/warn when the
-     *  TPMS itself has detected a problem even if the raw PSI looks fine.
+     *  SDK warnings are authoritative, while the numeric limits catch a
+     *  genuinely low/high reading even when a vehicle reports state=normal.
+     *
+     *  Compares in kPa, not PSI: kPa is what the TPMS actually reports and what
+     *  the user's limits are stored in, so the corner colour can never disagree
+     *  with the notification thresholds because of rounding.
+     *
+     *  @param corner  the per-corner object from tyres[fl|fr|rl|rr]
+     *  @param isFront true for the front axle (fl/fr), which has its own band
      */
-    _tyreStateToken: function(corner) {
+    _tyreStateToken: function(corner, isFront) {
         if (!corner || corner.available === false) return 'muted';
         if (corner.signalState === 1) return 'muted';
         if (corner.airLeakState && corner.airLeakState >= 1) return 'alert';
-        if (corner.pressureState && corner.pressureState >= 1) return 'warn';
-        if (typeof corner.psi === 'number') {
-            if (corner.psi < 22) return 'alert';
-            if (corner.psi < 34 || corner.psi > 45) return 'warn';
+        // The numeric net is evaluated BEFORE the firmware enum, and the worst
+        // of the two wins — mirroring the server's `level = max(enum, kPa)` in
+        // BydDataCollector.evaluatePressureCorner. Order matters: a genuinely
+        // deflated tyre normally ALSO trips the firmware under-pressure flag, so
+        // an enum-first early return painted the most serious case orange while
+        // the server sent a CRITICAL alert for it.
+        var lim = this._tyreLimits;
+        var low = isFront ? lim.frontLow : lim.rearLow;
+        var high = isFront ? lim.frontHigh : lim.rearHigh;
+        if (typeof corner.kPa === 'number' && corner.kPa > 0) {
+            if (corner.kPa <= lim.criticalLow) return 'alert';
+            if (corner.kPa < low || corner.kPa > high) return 'warn';
         }
+        // In-band (or no reading): the enum can still assert a problem we can't
+        // see numerically, and it stays authoritative for that.
+        if (typeof corner.pressureState === 'number'
+                && corner.pressureState >= 1) return 'warn';
         return 'normal';
     },
 
-    _tyreStateLabel: function(corner) {
+    _tyreStateLabel: function(corner, isFront) {
         if (!corner || corner.available === false) return BYD.i18n.t('vehicle.tyre_no_data');
         if (corner.signalState === 1) return BYD.i18n.t('vehicle.tyre_no_signal');
         if (corner.airLeakState === 2) return BYD.i18n.t('vehicle.tyre_fast_leak');
         if (corner.airLeakState === 1) return BYD.i18n.t('vehicle.tyre_slow_leak');
         if (corner.pressureState === 1) return BYD.i18n.t('vehicle.tyre_low');
         if (corner.pressureState === 2) return BYD.i18n.t('vehicle.tyre_high');
+        // Firmware reports normal but the reading is outside the user's band —
+        // name the direction so the LOW/HIGH word matches the warn colour the
+        // token function just assigned. Without this the callout said "OK" in
+        // orange, which read as a UI bug.
+        //
+        // The low test must use the SAME boundary as _tyreStateToken: it treats
+        // kPa <= criticalLow as 'alert', and criticalLow is allowed to equal an
+        // axle low, so a strict `< low` here left a red corner captioned "OK" at
+        // exactly that value.
+        var lim = this._tyreLimits;
+        var low = isFront ? lim.frontLow : lim.rearLow;
+        var high = isFront ? lim.frontHigh : lim.rearHigh;
+        if (typeof corner.kPa === 'number' && corner.kPa > 0) {
+            if (corner.kPa < low || corner.kPa <= lim.criticalLow) {
+                return BYD.i18n.t('vehicle.tyre_low');
+            }
+            if (corner.kPa > high) return BYD.i18n.t('vehicle.tyre_high');
+        }
         return BYD.i18n.t('vehicle.tyre_ok');
     },
 
     updateTyreCallouts: function(tyres) {
         if (!tyres) return;
+        // Adopt the server's limits when present; otherwise keep the previous
+        // (or default) set rather than reverting mid-session.
+        if (tyres.limits) {
+            var L = tyres.limits, cur = this._tyreLimits;
+            this._tyreLimits = {
+                frontLow:    typeof L.frontLow    === 'number' ? L.frontLow    : cur.frontLow,
+                frontHigh:   typeof L.frontHigh   === 'number' ? L.frontHigh   : cur.frontHigh,
+                rearLow:     typeof L.rearLow     === 'number' ? L.rearLow     : cur.rearLow,
+                rearHigh:    typeof L.rearHigh    === 'number' ? L.rearHigh    : cur.rearHigh,
+                criticalLow: typeof L.criticalLow === 'number' ? L.criticalLow : cur.criticalLow
+            };
+        }
         var corners = ['fl', 'fr', 'rl', 'rr'];
         for (var i = 0; i < corners.length; i++) {
             var key = corners[i];
@@ -4048,8 +4677,10 @@ var VC = {
             var box = document.getElementById('tyre' + key.toUpperCase());
             if (!box) continue;
 
-            var state = this._tyreStateToken(data);
-            var label = this._tyreStateLabel(data);
+            // corners[] is [fl, fr, rl, rr] — the first two are the front axle.
+            var isFront = i < 2;
+            var state = this._tyreStateToken(data, isFront);
+            var label = this._tyreStateLabel(data, isFront);
             box.setAttribute('data-state', state);
 
             var psiEl  = box.querySelector('.vc-tyre-psi-val');

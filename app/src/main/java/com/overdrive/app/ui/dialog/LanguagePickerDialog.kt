@@ -51,7 +51,8 @@ object LanguagePickerDialog {
         "vi" to "Tiếng Việt",
         "hi" to "हिन्दी",
         "tr" to "Türkçe",
-        "ru" to "Русский"
+        "ru" to "Русский",
+        "ar" to "العربية"
     )
 
     @JvmOverloads
@@ -128,6 +129,11 @@ object LanguagePickerDialog {
             LocaleManager.set(tag)
             AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags(tag))
         }
+        // The activity recreate above rehydrates Fragments in the new language, but a
+        // running foreground Service (the RoadSense overlay) doesn't get a per-app
+        // locale change delivered, so re-inflate it explicitly if it's up. No-op when
+        // the overlay isn't showing.
+        com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.relocalizeIfRunning()
     }
 
     /**

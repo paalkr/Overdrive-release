@@ -36,10 +36,27 @@ BYD.stream = {
     reconnectTimer: null,
     frameCount: 0,
     lastFrameTime: 0,
+    // True only after the current connection/view has produced a frame.
+    // Socket-open alone is not enough: the BYD WebView reuses an existing
+    // WebSocket when switching cameras, so no second onopen event fires.
+    _frameStatusLive: false,
+    _pendingConnectedToast: null,
     decoderMode: null,     // 'webcodecs', 'jmuxer', or 'broadway'
     latencyCheckInterval: null,
     streamStarted: false,
     selectedQuality: 'MEDIUM',
+    activeFps: 10,  // Updated from /api/stream/quality response; default matches MEDIUM preset
+    // Last view mode the backend accepted; currentViewMode is set optimistically.
+    confirmedViewMode: -1,
+    // Bumped by stopStream. An async start/view-switch compares its captured
+    // value and abandons its remaining steps if it has been superseded.
+    _startGeneration: 0,
+    // A stream paused because the app was backgrounded should resume the
+    // same camera. Manual stops intentionally clear this state.
+    _backgroundResumeMode: null,
+    _backgroundResumeTimer: null,
+    _backgroundResumeInFlight: false,
+    _backgroundResumeRerequested: false,
     
     // WebSocket connects to /ws on same port as HTTP server (optimized endpoint)
     // Old raw stream port 8887 is deprecated - bypasses SOTA optimizations
@@ -213,6 +230,32 @@ BYD.stream = {
             return false;
         }
     },
+
+    /**
+     * Record actual frame delivery and converge every live-view status surface.
+     * This is intentionally idempotent so legacy WebSocket onmessage can call it
+     * for every packet without repainting the status DOM at camera frame rate.
+     */
+    noteFrameReceived(count) {
+        this.frameCount = Number.isFinite(count) ? count : this.frameCount + 1;
+        this.lastFrameTime = Date.now();
+        if (!this._frameStatusLive) {
+            this._frameStatusLive = true;
+            this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
+            if (this._pendingConnectedToast && BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(BYD.i18n.t(this._pendingConnectedToast), 'success');
+            }
+            this._pendingConnectedToast = null;
+        }
+    },
+
+    /**
+     * Reset frame-backed live state for a fresh connection or camera switch.
+     */
+    markStreamConnecting() {
+        this._frameStatusLive = false;
+        this.updateStreamStatus(BYD.i18n.t('stream.connecting'), false);
+    },
     
     /**
      * Initialize decoder based on device capabilities
@@ -226,12 +269,14 @@ BYD.stream = {
             console.log('[Stream] WebCodecs failed, trying fallback...');
         }
         
-        // Fallback: JMuxer for non-iOS with MSE support
+        // Fallback: JMuxer for non-iOS with MSE support. await because initJMuxer
+        // can hand back initBroadway()'s promise when it defers; an unawaited
+        // promise is truthy and would mask a Broadway failure as success.
         if (!this.isIOS && window.MediaSource) {
-            const success = this.initJMuxer();
+            const success = await this.initJMuxer();
             if (success) return true;
         }
-        
+
         // Final fallback: Broadway (CPU decoding)
         return await this.initBroadway();
     },
@@ -278,22 +323,26 @@ BYD.stream = {
             // Set up callbacks
             this.sotaPlayer.onConnected = () => {
                 console.log('[Stream] WebCodecs connected');
-                this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.connected_webcodecs'), 'success');
+                // Wait for a decoded frame before claiming the camera is live.
+                this._pendingConnectedToast = 'stream.connected_webcodecs';
+                this.markStreamConnecting();
             };
 
             this.sotaPlayer.onDisconnected = (code) => {
                 console.log('[Stream] WebCodecs disconnected:', code);
-                this.updateStreamStatus(BYD.i18n.t('stream.disconnected'), false);
+                this._pendingConnectedToast = null;
+                this.markStreamConnecting();
             };
             
             this.sotaPlayer.onFrame = (count) => {
-                this.frameCount = count;
-                this.lastFrameTime = Date.now();
+                this.noteFrameReceived(count);
             };
             
             this.sotaPlayer.onError = (e) => {
                 console.error('[Stream] WebCodecs error:', e);
+                // WebCodecs can't decode this stream on this device — hand over to
+                // JMuxer/Broadway instead of sitting on a black canvas.
+                this.fallbackFromWebCodecs();
             };
             
             this.decoderMode = 'webcodecs';
@@ -327,21 +376,31 @@ BYD.stream = {
         }
         
         if (this.jmuxer) return true;
-        
+
         if (!window.MediaSource) {
             console.warn('[Stream] MSE not supported, falling back to Broadway');
             return this.initBroadway();
         }
-        
+
+        // JMuxer ships from a CDN (live-view.html loads jsdelivr), so it is simply
+        // absent whenever the car/phone has no internet — the common case for a
+        // parked vehicle. Without this check `new JMuxer` throws ReferenceError
+        // and takes the whole decoder cascade down instead of reaching Broadway,
+        // which is bundled locally.
+        if (typeof JMuxer === 'undefined') {
+            console.warn('[Stream] JMuxer unavailable (CDN blocked/offline), using Broadway');
+            return this.initBroadway();
+        }
+
         try {
             this.jmuxer = new JMuxer({
                 node: 'hw_player',
                 mode: 'video',
                 flushingTime: 0,
-                fps: 15,
+                fps: this.activeFps || 10,
                 debug: false,
                 onReady: () => {
-                    console.log('[Stream] JMuxer ready');
+                    console.log('[Stream] JMuxer ready (fps=' + (this.activeFps || 10) + ')');
                     video.style.display = 'block';
                     video.play().catch(e => console.log('[Stream] Autoplay blocked:', e.message));
                 },
@@ -458,6 +517,56 @@ BYD.stream = {
     },
     
     /**
+     * WebCodecs reported an unrecoverable decode failure — retire it and retry
+     * with the MSE/CPU decoders. Runs at most once per page so a fallback that
+     * also fails can't ping-pong. Without this the player stayed "connected"
+     * forever on a black canvas, which is what made the camera look broken on
+     * some phones while working in the car's WebView (which never takes the
+     * WebCodecs path at all — Chrome 58 has no VideoDecoder).
+     */
+    async fallbackFromWebCodecs() {
+        if (this._webCodecsRetired) return;
+        this._webCodecsRetired = true;
+        console.warn('[Stream] Retiring WebCodecs, switching to fallback decoder');
+
+        if (this.sotaPlayer) {
+            try { this.sotaPlayer.stop(); } catch (e) {}
+            this.sotaPlayer = null;
+        }
+        const canvas = document.getElementById('sota_canvas');
+        if (canvas) { canvas.style.display = 'none'; canvas.classList.remove('active'); }
+
+        this.decoderMode = null;
+        this.hasWebCodecs = false;   // keeps initDecoder from re-picking WebCodecs
+        this.markStreamConnecting();
+
+        try {
+            // await regardless: initJMuxer returns a bare boolean normally, but
+            // returns initBroadway()'s PROMISE when it defers (no MSE / JMuxer
+            // missing). A promise is always truthy, so testing it unawaited would
+            // report success even when Broadway failed to load.
+            const ready = await ((!this.isIOS && window.MediaSource)
+                ? this.initJMuxer()
+                : this.initBroadway());
+            if (!ready) {
+                console.error('[Stream] Fallback decoder init failed');
+                return;
+            }
+            this.updateDecoderBadge(this.decoderMode === 'jmuxer' ? 'JMuxer' : 'Broadway');
+            if (this.decoderMode === 'jmuxer') {
+                const v = document.getElementById('hw_player');
+                if (v) { v.style.display = 'block'; v.classList.add('active'); }
+            } else {
+                const c = document.getElementById('sw_container');
+                if (c) c.classList.add('active');
+            }
+            this.connectWebSocket();
+        } catch (e) {
+            console.error('[Stream] Fallback switch failed:', e);
+        }
+    },
+
+    /**
      * Connect to WebSocket stream
      */
     connectWebSocket() {
@@ -467,7 +576,11 @@ BYD.stream = {
             return;
         }
         
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+        // CONNECTING too: overwriting this.ws mid-handshake orphans that socket
+        // beyond stopStream's reach and both then feed the same jmuxer.
+        if (this.ws &&
+            (this.ws.readyState === WebSocket.OPEN ||
+             this.ws.readyState === WebSocket.CONNECTING)) return;
         
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -492,8 +605,10 @@ BYD.stream = {
             this.ws.onopen = () => {
                 console.log('[Stream] Connected');
                 this.frameCount = 0;
-                this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.connected'), 'success');
+                // A connected socket can still have no camera frames. The
+                // first onmessage below promotes the UI to Live.
+                this._pendingConnectedToast = 'stream.connected';
+                this.markStreamConnecting();
             };
             
             this.ws.onmessage = (event) => {
@@ -506,14 +621,14 @@ BYD.stream = {
                     this.jmuxer.feed({ video: data });
                 }
                 
-                this.frameCount++;
-                this.lastFrameTime = Date.now();
+                this.noteFrameReceived();
             };
             
             this.ws.onclose = (event) => {
                 console.log('[Stream] Closed:', event.code);
                 this.ws = null;
-                this.updateStreamStatus(BYD.i18n.t('stream.disconnected'), false);
+                this._pendingConnectedToast = null;
+                this.markStreamConnecting();
                 
                 if (!this.reconnectTimer && this.streamStarted) {
                     this.reconnectTimer = setTimeout(() => {
@@ -581,7 +696,7 @@ BYD.stream = {
         if (overlay) overlay.style.display = 'flex';
 
         // Show connecting state immediately
-        this.updateStreamStatus(BYD.i18n.t('stream.connecting'), false);
+        this.markStreamConnecting();
 
         // Update view label
         const viewLabel = document.getElementById('viewLabel');
@@ -645,9 +760,11 @@ BYD.stream = {
             return;
         }
 
-        // Apply preset quality
+        // Apply preset quality and capture the active fps for JMuxer timing
         try {
-            await fetch('/api/stream/quality/' + this.selectedQuality, { method: 'POST' });
+            const qRes = await fetch('/api/stream/quality/' + this.selectedQuality, { method: 'POST' });
+            const qData = await qRes.json();
+            if (qData.fps) this.activeFps = qData.fps;
         } catch (e) {}
         
         await new Promise(r => setTimeout(r, 300));
@@ -682,8 +799,23 @@ BYD.stream = {
     /**
      * Stop streaming
      */
-    stopStream() {
+    stopStream(options) {
+        // Invalidate any start/view-switch still sitting in an await.
+        this._startGeneration++;
+        const preserveBackgroundResume = options && options.preserveBackgroundResume === true;
+        if (!preserveBackgroundResume) {
+            this._backgroundResumeMode = null;
+            // Don't leave a mode pauseForBackground could silently restart.
+            this.confirmedViewMode = -1;
+            if (this._backgroundResumeTimer) {
+                clearTimeout(this._backgroundResumeTimer);
+                this._backgroundResumeTimer = null;
+            }
+        }
+
         this.streamStarted = false;
+        this._frameStatusLive = false;
+        this._pendingConnectedToast = null;
         
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -716,16 +848,119 @@ BYD.stream = {
             this.broadwayPlayer = null;
         }
         
-        // Hide video elements
+        // Hide video elements by dropping the .active class, NOT via an inline
+        // display:none — inline style outranks the non-important `video.active`
+        // rule, so a later restart could never make the legacy player visible.
         const hwPlayer = document.getElementById('hw_player');
         const swContainer = document.getElementById('sw_container');
         const sotaCanvas = document.getElementById('sota_canvas');
-        if (hwPlayer) hwPlayer.style.display = 'none';
-        if (swContainer) swContainer.style.display = 'none';
-        if (sotaCanvas) sotaCanvas.style.display = 'none';
+        [hwPlayer, swContainer, sotaCanvas].forEach(function (el) {
+            if (!el) return;
+            el.classList.remove('active');
+            el.style.removeProperty('display');
+        });
         
         this.decoderMode = null;
         console.log('[Stream] Stopped');
+    },
+
+    /**
+     * Pause an active stream while preserving enough intent to restore the
+     * same camera when Android brings the WebView back to the foreground.
+     */
+    pauseForBackground() {
+        if (!this.streamStarted || this.currentViewMode < 0) return;
+        // Prefer the confirmed mode; currentViewMode may be an unconfirmed switch.
+        const mode = (typeof this.confirmedViewMode === 'number' &&
+                      this.confirmedViewMode >= 0)
+            ? this.confirmedViewMode
+            : this.currentViewMode;
+        console.log('[Stream] Backgrounded - pausing camera:', mode);
+        this.stopStream({ preserveBackgroundResume: true });
+        this._backgroundResumeMode = mode;
+
+        // Do not leave a stale "Live" badge over the blank decoder while the
+        // WebView is being restored.
+        this.updateStreamStatus(BYD.i18n.t('stream.connecting'), false);
+    },
+
+    /**
+     * Resume a lifecycle-paused stream. Android onResume and the Page
+     * Visibility API can both signal the foreground transition, so the short
+     * timer and in-flight guard ensure only one decoder/socket is created.
+     */
+    resumeAfterBackground(forceForeground) {
+        const foregroundIsAuthoritative = forceForeground === true;
+        if (foregroundIsAuthoritative && this._backgroundResumeTimer) {
+            clearTimeout(this._backgroundResumeTimer);
+            this._backgroundResumeTimer = null;
+        }
+        if (this._backgroundResumeInFlight) {
+            // Another cycle happened mid-resume; the finally block re-drives it,
+            // otherwise this request would be dropped with nothing to retry it.
+            this._backgroundResumeRerequested = true;
+            return;
+        }
+        if (this._backgroundResumeMode === null ||
+            this._backgroundResumeMode < 0 ||
+            this.streamStarted ||
+            this._backgroundResumeTimer) {
+            return;
+        }
+
+        this._backgroundResumeTimer = setTimeout(async () => {
+            this._backgroundResumeTimer = null;
+            // Re-check hidden even when onResume signalled: the activity can be
+            // paused again inside the 250ms window and JS timers keep running,
+            // which would turn a camera on off-screen.
+            if (document.hidden ||
+                this._backgroundResumeMode === null ||
+                this.streamStarted ||
+                this._backgroundResumeInFlight) {
+                return;
+            }
+
+            const mode = this._backgroundResumeMode;
+            this._backgroundResumeMode = null;
+            this._backgroundResumeInFlight = true;
+            this._backgroundResumeRerequested = false;
+            console.log('[Stream] Foregrounded - resuming camera:', mode);
+            // There are no fetch timeouts in this codebase, so a request that
+            // never settles would wedge the in-flight flag for the page's life.
+            const watchdog = setTimeout(() => {
+                if (this._backgroundResumeInFlight) {
+                    console.warn('[Stream] Resume watchdog fired - releasing');
+                    this._backgroundResumeInFlight = false;
+                    if (this._backgroundResumeMode === null) this._backgroundResumeMode = mode;
+                }
+            }, 20000);
+            try {
+                await this.selectCamera(mode);
+                // live-view.html's selectCamera override reports most failures by
+                // returning, not throwing, so keep the intent for the next resume.
+                if (!this.streamStarted && !document.hidden) {
+                    console.warn('[Stream] Resume did not start a stream - retaining intent');
+                    this._backgroundResumeMode = mode;
+                    this.updateConnectionStatus('disconnected');
+                }
+            } catch (e) {
+                console.error('[Stream] Resume failed:', e);
+                if (!document.hidden && !this.streamStarted) {
+                    this._backgroundResumeMode = mode;
+                    this.updateConnectionStatus('disconnected');
+                }
+            } finally {
+                clearTimeout(watchdog);
+                this._backgroundResumeInFlight = false;
+                if (this._backgroundResumeRerequested) {
+                    this._backgroundResumeRerequested = false;
+                    if (!document.hidden && !this.streamStarted &&
+                        this._backgroundResumeMode !== null) {
+                        this.resumeAfterBackground(true);
+                    }
+                }
+            }
+        }, 250);
     },
     
     /**
@@ -869,11 +1104,13 @@ BYD.stream = {
         
         // Status polling is handled by core.js - no duplicate polling here
         
-        // Page Visibility API
+        // Pause expensive decoding in the background and restore the same
+        // selection when the page becomes visible again.
         document.addEventListener("visibilitychange", () => {
-            if (document.hidden && this.streamStarted) {
-                console.log("[Stream] Backgrounded - pausing");
-                this.stopStream();
+            if (document.hidden) {
+                this.pauseForBackground();
+            } else {
+                this.resumeAfterBackground();
             }
         });
         

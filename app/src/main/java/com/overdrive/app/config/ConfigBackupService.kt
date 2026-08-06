@@ -428,13 +428,41 @@ object ConfigBackupService {
                 if (!toWrite.has(sec) && current.has(sec)) toWrite.put(sec, current.get(sec))
             }
 
+            // A bundle taken BEFORE the trips default-ON change carries
+            // tripAnalytics.enabled=false, while the per-key merge above keeps the
+            // live enabledDefaultMigrated=true. ensureDefaults would then skip
+            // both the seed and the one-shot flip (it sees both keys present), so
+            // restoring an old backup would silently turn trip recording off
+            // FOREVER with no way for the migration to re-fire. Drop the marker
+            // whenever the bundle supplied an explicit `enabled`, so the one-shot
+            // upgrade re-evaluates against the restored value exactly once.
+            try {
+                val restoredTrips = toWrite.optJSONObject("tripAnalytics")
+                val bundleTrips = incoming.optJSONObject("tripAnalytics")
+                if (restoredTrips != null && bundleTrips != null && bundleTrips.has("enabled")) {
+                    restoredTrips.remove("enabledDefaultMigrated")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "trips migration-marker reset failed: ${e.message}")
+            }
+
             // Backfill any key the current app expects but neither the live
             // config nor the bundle carried, so we never PERSIST an incomplete
             // config (saveConfig doesn't run applyDefaults; loadConfig only
             // re-defaults on the geocoding-migration path). Idempotent.
             UnifiedConfigManager.ensureDefaults(toWrite)
 
-            val saved = UnifiedConfigManager.saveConfig(toWrite)
+            // force=true: bypass the corruption latch. `toWrite` is a COMPLETE,
+            // already-validated user config (validateBundle passed + merged onto a
+            // fresh forceReload base + ensureDefaults), NOT a defaults-merge — so
+            // the latch's "don't clobber recoverable settings with defaults" guard
+            // does not apply. Critically, RESTORE is the recovery path FOR config
+            // corruption: if the live file is corrupt and both .bak copies are
+            // unusable, the latch is set and the forceReload above can't clear it,
+            // so a plain saveConfig would return false and block the very action
+            // meant to fix the corruption ("Could not write settings"). Forcing
+            // writes the good bytes and clears the latch on success.
+            val saved = UnifiedConfigManager.saveConfig(toWrite, /* force = */ true)
             // Refresh the in-memory cache to the bytes we just wrote WHILE STILL
             // HOLDING the lock. Doing the final forceReload outside the lock left
             // a window where a peer daemon's section write could land between our

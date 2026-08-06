@@ -113,6 +113,10 @@ public class RecordingModeManager {
         // wants it.
         pipeline.setKeepAlivePredicate(() -> {
             if (bsKeepWarmActive()) return true;
+            // Camera-view (show-camera overlay) is an independent keep-warm reason, same as
+            // blind-spot: while it is active the camera/rails stay up regardless of recording
+            // mode or gear so the overlay actually renders frames.
+            if (camViewKeepWarmActive()) return true;
             if (!modeActive) return false;
             Mode m = currentMode;
             return m == Mode.CONTINUOUS || m == Mode.DRIVE_MODE || m == Mode.PROXIMITY_GUARD;
@@ -798,9 +802,28 @@ public class RecordingModeManager {
             onGearChanged(hwGear);
         }
         if (accChanged) {
+            // If queryAccStateFromHardware() above handed this exact edge to
+            // CameraDaemon's full ACC chain, that chain calls our
+            // onAccStateChanged() itself — calling it again here would run the
+            // ACC transition twice. For ACC-OFF that is not merely redundant:
+            // the chain arms surveillance (pipeline running) and a duplicate
+            // local acc-off teardown landing afterwards would stop the pipeline
+            // it just armed. Consume the one-shot flag and skip only the
+            // matching edge; anything else falls through to normal handling.
+            Boolean handedOff = probeEdgeHandedOffToDaemon;
+            probeEdgeHandedOffToDaemon = null;
+            if (handedOff != null && handedOff.booleanValue() == !hwAcc) {
+                logger.info("Re-sync (" + reason + "): ACC edge handed to CameraDaemon "
+                    + "ACC chain (it drives our onAccStateChanged) — skipping duplicate "
+                    + "local dispatch");
+                return;
+            }
             onAccStateChanged(hwAcc);
             return;
         }
+        // No ACC edge on this tick — drop any stale handoff marker so it can
+        // never suppress a genuine future edge.
+        probeEdgeHandedOffToDaemon = null;
 
         // ACC state unchanged but mode might have failed to start at construction.
         // Retry activation if conditions are met and modeActive is false. Use
@@ -2453,6 +2476,24 @@ public class RecordingModeManager {
     }
 
     /**
+     * Camera-view keep-warm: the head-unit/cluster "show camera view" overlay
+     * (StreamingApiHandler /api/camview) renders the stitched pano onto the same native
+     * SurfaceControl lane the blind-spot view uses. It is an INDEPENDENT camera consumer —
+     * exactly like {@link #bsKeepWarmActive()} — so it must hold the camera warm and be a
+     * recognised rung in {@link #desiredCameraState()}. Without this, cam-view was invisible
+     * to the single-authority camera ladder: the overlay chrome (the ✕ close button) opened
+     * but no frames were produced, because no rung kept the pano rail delivering at a usable
+     * fps (idle rung sits at ~1fps and the keep-alive predicate would tear the camera down
+     * when nothing else wanted it). Gated on ACC-on, mirroring BS. */
+    private boolean camViewKeepWarmActive() {
+        try {
+            return accIsOn && pipeline.isCamViewActive();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
      * Public entry point invoked when the pano pipeline was started OUTSIDE the
      * recording-mode lifecycle — specifically the blind-spot cold-start path
      * (StreamingApiHandler.ensurePanoStartedNonBlocking → pano.start()). That
@@ -2464,6 +2505,18 @@ public class RecordingModeManager {
      * pipeline isn't running.
      */
     public void onPipelineStartedExternally() {
+        reconcileCameraProfile();
+    }
+
+    /**
+     * Pushed by the surveillance engine when motion activity begins (first
+     * motion) or ends (recording stops) so the parked-idle throttle can ramp
+     * the camera fps between idle and full promptly, rather than waiting for the
+     * 30s resync tick. reconcileCameraProfile self-serializes on reconcileLock;
+     * a no-op when the throttle is off (desiredCameraState returns the same
+     * intent). Cheap and idempotent — safe to call on every motion edge.
+     */
+    public void onSurveillanceActivityChanged() {
         reconcileCameraProfile();
     }
 
@@ -2588,6 +2641,42 @@ public class RecordingModeManager {
      *     Restore a sane baseline (lane ON, recording fps) so the next consumer
      *     isn't starved; teardown of a truly idle pipeline is the other owners' job.
      */
+    /**
+     * Quiet-tier decision (issue #174): true when the parked-idle throttle is
+     * active AND surveillance has been idle (no motion, not CONTINUOUS) for at
+     * least {@code surveillanceQuietTierMinutes}. In the quiet tier the AI
+     * motion-readback cadence steps down to {@code surveillanceQuietTierFps} Hz
+     * and the idle-HAL parity floor relaxes to match, so a long parked-idle tail
+     * stops paying the full ~10 Hz readback rate.
+     *
+     * <p>Single source of truth consulted by BOTH throttle sites
+     * (desiredCameraState's parity floor and reconcileCameraProfileLocked's AI
+     * interval) so they can never disagree within a reconcile pass. Because it
+     * requires {@code !hasActiveSurveillanceMotion()}, the first motion edge
+     * makes it false in the SAME reconcile that the engine pushes — so HAL fps
+     * and AI cadence ramp back to full together, atomically.
+     *
+     * <p>{@code surveillanceQuietTierMinutes == 0} disables the tier (returns
+     * false always), preserving the pre-#174 constant cadence.
+     */
+    private boolean isQuietTierActive() {
+        int quietMin = UnifiedConfigManager.getSurveillanceQuietTierMinutes();
+        if (quietMin <= 0) return false;
+        if (!UnifiedConfigManager.isSurveillanceIdleThrottle()) return false;
+        if (!pipeline.isSurveillanceMode() || pipeline.isContinuousSurveillance()) return false;
+        if (pipeline.hasActiveSurveillanceMotion()) return false;
+        return pipeline.getSurveillanceQuietDurationMs() >= quietMin * 60_000L;
+    }
+
+    /** Quiet-tier AI motion cadence (Hz), clamped so it can never exceed the idle
+     *  HAL fps (the readback gate can only drop delivered frames, never create
+     *  them). Shared by the parity floor and the AI-interval computation. */
+    private int quietTierAiFps() {
+        return Math.min(
+                UnifiedConfigManager.getSurveillanceQuietTierFps(),
+                UnifiedConfigManager.getSurveillanceIdleFps());
+    }
+
     private CameraIntent desiredCameraState() {
         int streamFps = activeStreamFps();
         // Rung 1: recording (broadest ownership — see pipelineIsRecording()).
@@ -2596,12 +2685,26 @@ public class RecordingModeManager {
                     || currentMode == Mode.DRIVE_MODE
                     || currentMode == Mode.PROXIMITY_GUARD);
         if (recordingModeOwnsCamera() || pipelineIsRecording() || activationInFlight) {
-            boolean proximity = (currentMode == Mode.PROXIMITY_GUARD);
+            // PROXIMITY_GUARD claims fps ownership ONLY when its controller is
+            // genuinely running (isActive() == not IDLE). Two independent config
+            // keys can disagree: recording.mode can be PROXIMITY_GUARD while
+            // proximityGuard.enabled is false — in which case the controller never
+            // start()s, stays IDLE, and desiredCameraFps() returns 0. Without the
+            // isActive() guard, a parked ACC-off SENTRY unit with mode=PROXIMITY_GUARD
+            // would enter this branch, get proxFps=0 → configuredRecordingFps()
+            // (full 15fps), and RETURN — shadowing the surveillance idle-throttle
+            // below (surveillanceIdleFps) that would otherwise drop the HAL to the
+            // low idle rate. The old comment "PROXIMITY_GUARD never runs parked" was
+            // the false assumption behind this: a stale/disabled proximity mode DOES
+            // sit here parked. Gating on isActive() lets that case fall through to
+            // the idle throttle while a truly-running proximity controller still
+            // owns the fps as before.
+            boolean proximity = (currentMode == Mode.PROXIMITY_GUARD)
+                    && proximityController != null
+                    && proximityController.isActive();
             // activeConfiguredFps() picks the surveillance fps while the pipeline
             // sits in ACC-off SENTRY (pipelineIsRecording() counts surveillance as
-            // an owner), else the ACC-on recording fps. The proximity branch below
-            // is ACC-on only (PROXIMITY_GUARD never runs parked), so it keeps using
-            // configuredRecordingFps() directly — surveillance never reaches it.
+            // an owner), else the ACC-on recording fps.
             int fps = Math.max(activeConfiguredFps(), streamFps);
             if (proximity) {
                 // PROXIMITY detection is RADAR-driven, not camera-driven. While
@@ -2636,6 +2739,52 @@ public class RecordingModeManager {
                                 + (bsDemand > 0 ? "+BS" : "") + (streamFps > 0 ? "+stream" : "")
                                 + ", controller owns stride/bitrate)");
             }
+            // Parked-idle surveillance throttle (default-OFF opt-in): while ARMED
+            // surveillance sits idle (no active motion, not CONTINUOUS mode) drop
+            // the shared camera HAL to the low idle fps to cut capture-rail +
+            // compose/encode power. The recorder lane stays ON at stride 1 so the
+            // pre-record ring keeps filling; detection parity is preserved because
+            // reconcileCameraProfileLocked() co-sets the AI-lane wall-clock readback
+            // interval so the motion cadence is held at today's rate regardless of
+            // this HAL fps. On first-motion the engine pushes a reconcile
+            // (onSurveillanceActivityChanged) → hasActiveSurveillanceMotion() flips
+            // true → this branch is skipped → HAL ramps back to the full fps below.
+            // streamFps floor is preserved so an open live-view is never starved.
+            if (!proximity
+                    && UnifiedConfigManager.isSurveillanceIdleThrottle()
+                    && pipeline.isSurveillanceMode()
+                    && !pipeline.isContinuousSurveillance()
+                    && !pipeline.hasActiveSurveillanceMotion()) {
+                // Self-enforcing parity floor: the wall-clock readback gate can only
+                // DROP frames the HAL delivers, never manufacture them — so if the
+                // idle HAL fps were below the motion cadence (survFps/aiReadbackModulo,
+                // e.g. 15/3 = 5 Hz), motion detection would silently undersample vs
+                // today. Clamp the idle HAL floor to that cadence so a user's
+                // aggressive surveillanceIdleFps saves a little less power but NEVER
+                // regresses detection. At the default 5/15 this floor is exactly 5,
+                // matching the configured idle fps (no change).
+                //
+                // Quiet tier (issue #174): after a sustained no-motion period the AI
+                // cadence steps down to quietTierAiFps(), so the floor relaxes to
+                // that lower cadence — letting the HAL actually fall toward
+                // surveillanceIdleFps. The invariant still holds (HAL fps ≥ AI
+                // cadence): quietTierAiFps() is clamped ≤ surveillanceIdleFps, and
+                // idleFps is ≥ surveillanceIdleFps below. On first motion isQuietTierActive()
+                // flips false in this same pass, so the floor and the AI interval
+                // both restore to the full cadence together.
+                final int aiReadbackModulo = 3;  // == AiLaneGl.DEFAULT_READBACK_MODULO
+                int motionCadenceFloor = isQuietTierActive()
+                        ? quietTierAiFps()
+                        : (int) Math.ceil(configuredSurveillanceFps() / (double) aiReadbackModulo);
+                int idleFps = Math.max(
+                        Math.max(UnifiedConfigManager.getSurveillanceIdleFps(), motionCadenceFloor),
+                        streamFps);
+                // Only actually throttle if idle fps is below the full rate;
+                // otherwise fall through so we don't log a misleading "idle".
+                if (idleFps < fps) {
+                    return new CameraIntent(true, idleFps, true, "recording:surveillance-idle");
+                }
+            }
             // Continuous-style: own stride/bitrate (stride 1 + full bitrate).
             return new CameraIntent(true, fps, true, "recording:continuous-style");
         }
@@ -2646,6 +2795,15 @@ public class RecordingModeManager {
                     : UnifiedConfigManager.getBlindSpotIdleFps();
             return new CameraIntent(false, Math.max(bsFps, streamFps), false,
                     "blind-spot keep-warm (view " + (bsViewShown() ? "SHOWN" : "hidden") + ")");
+        }
+        // Rung 2b: camera-view overlay (show-camera) is the consumer. Renders the pano onto
+        // the native SurfaceControl lane exactly like a shown blind-spot view, so it needs a
+        // real fps (BS active rate) — NOT the ~1fps idle rung, which is why the overlay
+        // opened (✕ chrome) but showed no image. Recorder lane OFF (nothing records; the
+        // frames go straight to the SurfaceControl layer).
+        if (camViewKeepWarmActive()) {
+            int camFps = UnifiedConfigManager.getBlindSpotActiveFps();
+            return new CameraIntent(false, Math.max(camFps, streamFps), false, "camera-view overlay");
         }
         // Rung 3: live-view stream is the only consumer.
         if (streamFps > 0) {
@@ -2680,6 +2838,51 @@ public class RecordingModeManager {
             int prevFps = pipeline.getCameraTargetFps();
             pipeline.setRecorderLaneEnabled(want.laneEnabled);
             pipeline.setCameraTargetFps(want.fps);
+            // Parked-idle throttle: pin the AI motion-readback cadence to today's
+            // rate (survFps/3 Hz → period 3000/survFps ms) via a wall-clock gate,
+            // so the frame-counted native motion pipeline sees IDENTICAL cadence
+            // whether the HAL is at the idle fps or the full fps — and across the
+            // async ramp between them (no undersample transient). Applied for all
+            // surveillance states (idle AND active) when the throttle is on;
+            // cleared to 0 (legacy frame-count modulo) otherwise, keeping the OFF
+            // path byte-identical. Excludes CONTINUOUS (no AI lane).
+            if (UnifiedConfigManager.isSurveillanceIdleThrottle()
+                    && pipeline.isSurveillanceMode()
+                    && !pipeline.isContinuousSurveillance()) {
+                int survFps = configuredSurveillanceFps();
+                // Today's motion rate is survFps / AiLaneGl's readback modulo (3);
+                // the target inter-sample period is its inverse in ms. The 3 must
+                // stay in sync with AiLaneGl.DEFAULT_READBACK_MODULO (kept private
+                // there; inlined here to avoid a cross-package import for one int).
+                final int aiReadbackModulo = 3;
+                // Apply ~20% jitter tolerance: at idle the HAL delivers frames at
+                // ~the same period as the target (e.g. 200ms @5fps vs 200ms
+                // target), so a strict >= would drop a frame that arrives a hair
+                // early and halve the effective rate on that beat. Undershooting
+                // the gate by 20% lets near-period frames through — the cadence
+                // is then paced by the HAL delivery (5 Hz idle) as intended, and
+                // at full fps the gate still yields ~5 Hz (200ms/66ms ≈ every 3rd).
+                long targetMs = (survFps > 0)
+                        ? Math.round(1000.0 * aiReadbackModulo / survFps * 0.8)
+                        : 0L;
+                // Quiet tier (issue #174): after a sustained no-motion period, widen
+                // the gate to quietTierAiFps() Hz (e.g. 3 Hz → ~267ms with the same
+                // 20% tolerance) so the AI lane stops doing ~10 Hz PBO readbacks all
+                // night parked. Cadence stays CONSTANT within the tier (invariant
+                // preserved); the first motion event clears isQuietTierActive() in the
+                // same reconcile, restoring the full-rate targetMs above alongside the
+                // HAL ramp-up. Accepted tradeoff: worst-case first-motion detection
+                // latency rises to ~1/quietTierAiFps() for that first frame only.
+                if (isQuietTierActive()) {
+                    int quietFps = quietTierAiFps();
+                    if (quietFps > 0) {
+                        targetMs = Math.round(1000.0 / quietFps * 0.8);
+                    }
+                }
+                pipeline.setAiReadbackMinIntervalMs(targetMs);
+            } else {
+                pipeline.setAiReadbackMinIntervalMs(0L);
+            }
             if (want.ownStrideBitrate) {
                 pipeline.setRecorderFrameStride(1);
                 // activeConfiguredBitrate() = surveillance tier while parked in
@@ -2972,6 +3175,7 @@ public class RecordingModeManager {
                         logger.info("HW probe ACC-OFF CONFIRMED across re-reads "
                             + "(was authoritative ON) — write-through");
                         com.overdrive.app.monitor.AccMonitor.setAccState(false);
+                        dispatchProbedAccEdgeIfMeaningful(true, "rmm-hw-probe-confirmed-off");
                         return false;
                     }
 
@@ -2985,6 +3189,35 @@ public class RecordingModeManager {
                     } else {
                         logger.debug("HW probe agrees with authoritative AccMonitor — skipping write-through");
                     }
+                    // FIX (surveillance never auto-arms on park, observed 2026-07-28
+                    // log_X7RYXG6B; retryability hardened per audit R1 2026-07-29):
+                    // AccMonitor.setAccState alone updates the static + fires
+                    // notifyAccEdge (cluster/mirror teardown) but does NOT run
+                    // CameraDaemon's ACC chain, which is where the ENTIRE
+                    // sentry-arming path lives (safe-zone / schedule gates,
+                    // startSentryPipeline, arm-mode branch, door-lock gate, schedule
+                    // checker). When AccSentryDaemon stops delivering the ACC-OFF
+                    // IPC, this probe is the only component that still sees the park
+                    // — without this dispatch RMM tears the pipeline down for
+                    // mode=NONE and surveillance never re-arms for the whole park.
+                    //
+                    // CRITICAL PLACEMENT: this runs on EVERY definitive reading,
+                    // OUTSIDE the write-through branches above — deliberately
+                    // including the "HW probe agrees with AccMonitor" case. The
+                    // write-through only fires while AccMonitor disagrees with
+                    // hardware, and setAccState immediately erases that
+                    // disagreement; so a dispatch attached to the write-through was
+                    // attempted exactly once and, if it was dropped (dispatch
+                    // already in flight — the ACC chain can hold that gate for tens
+                    // of seconds), the edge was lost FOREVER, with
+                    // lastDispatchedAccIsOff latched to the opposite state so the
+                    // IPC dedup then suppressed every later edge too. Hanging the
+                    // call here instead makes each 30s tick a fresh retry:
+                    // dispatchProbedAccEdge gates on lastDispatchedAccIsOff (what
+                    // the CHAIN has processed), so it self-heals and is a cheap
+                    // no-op on every steady-state tick.
+                    dispatchProbedAccEdgeIfMeaningful(!isOn,
+                        ipcAuthoritative ? "rmm-hw-probe" : "rmm-hw-probe-no-ipc-yet");
                     return isOn;
                 }
                 // Sentinel / out-of-range — log and fall through.
@@ -3001,6 +3234,70 @@ public class RecordingModeManager {
         // Fallback to AccMonitor (last IPC-pushed value from AccSentryDaemon)
         return com.overdrive.app.monitor.AccMonitor.isAccOn();
     }
+
+    /**
+     * Hand a probe-discovered ACC edge to {@code CameraDaemon}'s full ACC chain
+     * (the only place sentry arming lives), unless this probe is the
+     * constructor's own boot seed.
+     *
+     * <p>CONSTRUCTOR GUARD — the reason this wrapper exists rather than calling
+     * {@code CameraDaemon.dispatchProbedAccEdge} directly: our constructor calls
+     * {@code queryAccStateFromHardware()} to seed {@code accIsOn} BEFORE
+     * {@code CameraDaemon.recordingModeManager} has been assigned (see
+     * CameraDaemon:363 / :2948 — the field is written with the constructor's
+     * return value). Dispatching then would drive the ACC chain, which calls
+     * {@code recordingModeManager.onAccStateChanged(...)}, against a null field
+     * (side-effects silently skipped, plus a "rmm null" warn) or — worse, if the
+     * ordering ever changed — against a half-constructed manager whose
+     * {@code pipeline}/{@code proximityController} refs aren't wired yet.
+     *
+     * <p>Requiring our own instance to be the published one makes the boot probe
+     * a no-op and keeps CameraDaemon's existing boot {@code RECOVERY:} probe
+     * (CameraDaemon:1255) the single owner of the cold-start dispatch — it runs
+     * AFTER construction and already handles the ACC-ON / rmm-null cases.
+     * Steady-state probes (resync ticker, setMode) all run post-publication and
+     * dispatch normally.
+     */
+    private void dispatchProbedAccEdgeIfMeaningful(boolean accIsOff, String reason) {
+        try {
+            if (CameraDaemon.getRecordingModeManager() != this) {
+                // Boot seed from our own constructor (field not yet assigned), or
+                // a superseded manager instance after a context recreate. Either
+                // way this instance must not drive daemon-wide lifecycle.
+                logger.debug("Probe ACC edge (" + reason + ") not dispatched — "
+                    + "manager not published yet (boot seed) or superseded");
+                return;
+            }
+            if (CameraDaemon.dispatchProbedAccEdge(accIsOff, reason)) {
+                // The daemon chain now owns this edge and will call our own
+                // onAccStateChanged() as part of it. Record that so
+                // resyncFromHardware does NOT additionally dispatch its local
+                // ACC handler for the same edge — on ACC-OFF that duplicate is
+                // actively harmful: the chain arms sentry (pipeline running),
+                // then a late local runActivateGuarded(NONE, "acc-off") would
+                // stop the pipeline we just armed, reproducing the very
+                // "surveillance not enabled" symptom this fix targets.
+                probeEdgeHandedOffToDaemon = accIsOff ? Boolean.TRUE : Boolean.FALSE;
+            }
+        } catch (Throwable t) {
+            // Never let the dispatch hook break the probe's return value — the
+            // caller still needs the ACC reading it asked for.
+            logger.warn("Probe ACC edge dispatch failed (" + reason + "): " + t.getMessage());
+        }
+    }
+
+    /**
+     * Set by {@link #dispatchProbedAccEdgeIfMeaningful} when CameraDaemon's ACC
+     * chain accepted a probe-discovered edge and will therefore invoke our
+     * {@link #onAccStateChanged} itself. Consumed (and cleared) by
+     * {@link #resyncFromHardware} so the same edge isn't handled twice.
+     *
+     * <p>Holds the {@code accIsOff} value that was handed off so a stale flag
+     * can never suppress a DIFFERENT, later edge. Volatile: written on the
+     * probing thread, read on the resync ticker (usually the same thread, but
+     * setMode probes from HTTP threads too).
+     */
+    private volatile Boolean probeEdgeHandedOffToDaemon = null;
 
     /** Single raw power-level read via the cached bodywork reflection, or -1 on
      *  failure. Caller interprets 0..3 as definitive (isOn = level>=2) and

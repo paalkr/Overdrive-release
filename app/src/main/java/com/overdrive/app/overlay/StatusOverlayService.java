@@ -175,6 +175,19 @@ public class StatusOverlayService extends Service {
     private static final long FAST_POLL_INTERVAL_MS = 1000;
     private static final long FAST_POLL_WINDOW_MS = 30_000;
 
+    // Fully-idle slow poll. The service can't just stopSelf() when the overlay
+    // is disabled — it also drives cabin-audio capture reconcile (see
+    // reconcileAudioCapture) and ACC-edge detection. But when BOTH the overlay
+    // has nothing to show AND audio capture isn't configured, the 3s (ACC-on) /
+    // 10s (ACC-off) /status poll + JSON parse + reconcile is pure wasted CPU +
+    // wakeups on the shared little cores, running 24/7 for a window that's never
+    // drawn. In that case poll at this slow cadence instead. Set by updateUI
+    // (which knows anythingToShow + audioEnabledConfig), read at the reschedule.
+    // An ACC OFF→ON edge still re-arms fast-poll on the next slow tick; the user
+    // has disabled the overlay, so ~30s reaction latency there is acceptable.
+    private volatile boolean overlayFullyIdle = false;
+    private static final long IDLE_POLL_INTERVAL_MS = 30_000;
+
     // Optimistic-mode guard. When the user taps a mode chip, we flip
     // configuredMode locally before the daemon has confirmed. An
     // already-in-flight pollStatus tick (already past fetchStatus, about
@@ -219,6 +232,72 @@ public class StatusOverlayService extends Service {
     private static final int DRAG_THRESHOLD = 10;
     private WindowManager.LayoutParams layoutParams;
 
+    // ── Camera-view CLOSE button (folded in here so it shares THIS service's
+    // foreground notification — no second notification — and this service's
+    // reliable lifecycle: it's started from MainActivity AND DaemonKeepaliveService,
+    // so its receiver is live whenever a camera view can be opened, even from a
+    // keymap/automation with the UI never launched).
+    //
+    // The camera view renders into a daemon-owned SurfaceControl layer with NO input
+    // channel, so a tappable close must live in an app overlay window. The daemon
+    // broadcasts an open/close edge (event-driven, zero poll/GPU) and we attach/detach
+    // a small ✕ window. Separate window + flag from the status pill so the two never
+    // interfere. ──
+    public static final String ACTION_CAMVIEW_STATE = "com.overdrive.app.action.CAMVIEW_STATE";
+
+    // ── Instant-replay clip segment ───────────────────────────────────────
+    // Edge signal from the daemon's ManualClipService (`am broadcast`, same
+    // shell/UID-2000 → app pattern as ACTION_CAMVIEW_STATE). The /status
+    // poll's `replay` block is the catch-up truth for missed broadcasts.
+    public static final String ACTION_REPLAY_STATE = "com.overdrive.app.action.REPLAY_STATE";
+    /** How long the terminal saved/failed color holds before reverting to idle gray. */
+    private static final long REPLAY_RESULT_HOLD_MS = 5000;
+    /** Stale-guard for a "recording" with no terminal signal on either channel:
+     *  max window is 62s + export headroom, so past this it reads as idle. */
+    private static final long REPLAY_RECORDING_STALE_MS = 120_000;
+    private LinearLayout replayContainer;
+    private ImageView ivReplayIcon;
+    private TextView tvReplayLabel;
+    // State pair mirrors the daemon's (state, elapsedRealtime-of-transition).
+    // Written by the broadcast receiver (main thread) and parseStatus (poll
+    // executor); consumed inside updateUI() so the idempotent repaint always
+    // derives color from state+age rather than a one-shot view write.
+    private volatile String replayState = "idle";     // idle|recording|saved|failed
+    private volatile long replayEventAtMs = 0;        // SystemClock.elapsedRealtime
+    private volatile boolean replayConfigured = false;
+    // Repaint tick for the 5s revert boundary; state itself decays via age.
+    private final Runnable replayRevertRunnable = () -> updateUI();
+    private boolean replayReceiverRegistered = false;
+    private final android.content.BroadcastReceiver replayStateReceiver =
+            new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (intent == null || !ACTION_REPLAY_STATE.equals(intent.getAction())) return;
+            String state = intent.getStringExtra("state");
+            if (state == null || state.isEmpty()) return;
+            adoptReplayState(state, android.os.SystemClock.elapsedRealtime(), 0);
+            // A replay lifecycle is in motion — fast-poll so the poll channel
+            // confirms the next transition within ~1s even if its broadcast
+            // is dropped.
+            fastPollUntilElapsedMs =
+                    android.os.SystemClock.elapsedRealtime() + FAST_POLL_WINDOW_MS;
+            handler.post(() -> updateUI());
+        }
+    };
+    private android.view.View camCloseButton;
+    private WindowManager.LayoutParams camCloseParams;
+    private boolean camCloseAttached = false;
+    private boolean camCloseReceiverRegistered = false;
+    private final android.content.BroadcastReceiver camCloseReceiver = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (intent == null || !ACTION_CAMVIEW_STATE.equals(intent.getAction())) return;
+            boolean active = intent.getBooleanExtra("active", false);
+            // Head-unit only — the cluster is a separate display we can't overlay.
+            String target = intent.getStringExtra("target");
+            boolean headUnit = target == null || !"cluster".equals(target);
+            setCamCloseVisible(active && headUnit);
+        }
+    };
+
 
     @Override
     public void onCreate() {
@@ -229,6 +308,23 @@ public class StatusOverlayService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         createNotificationChannel();
         startOverlayForeground();
+
+        // "Vehicle ON only" parked-shutdown gate: the status overlay polls /status every
+        // 10s against the now-dead daemon and re-arms itself via AlarmManager on task
+        // removal. If the stack was terminated for the parked window, stop and stay down
+        // until ACC-on recovery clears the marker. onOnly-guarded (fail-open) so onAndOff
+        // is unaffected; recoveryInProgress guard avoids self-stopping on the recovery edge.
+        try {
+            if (com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()
+                    && new java.io.File(com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH).exists()
+                    && !com.overdrive.app.ui.daemon.DaemonStartupManager.getRecoveryInProgress()) {
+                Log.w(TAG, "onOnly + parked-shutdown marker present — stopping status overlay");
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "parked-marker gate failed (" + t.getMessage() + ") — proceeding");
+        }
 
         if (!Settings.canDrawOverlays(this)) {
             Log.w(TAG, "SYSTEM_ALERT_WINDOW not granted — stopping");
@@ -242,6 +338,11 @@ public class StatusOverlayService extends Service {
         if (windowManager == null) {
             windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         }
+
+        // Arm the camera-view close-button receiver once (idempotent across restarts).
+        registerCamCloseReceiver();
+        // Arm the instant-replay state receiver once (idempotent across restarts).
+        registerReplayStateReceiver();
 
         // Theme refresh — caller flipped the app's day/night setting.
         // Rebuild the overlay against the new uiMode. rebuildOverlay() also
@@ -310,6 +411,196 @@ public class StatusOverlayService extends Service {
         return null;
     }
 
+    // ── Camera-view close button ──────────────────────────────────────────
+
+    /**
+     * Adopt a replay transition from either channel. The broadcast is the
+     * low-latency edge (eventAt = now, fetchStartMs = 0); the poll
+     * reconstructs the event time from the daemon's {@code stateAgeMs}
+     * (±HTTP jitter) and passes the elapsedRealtime at which the /status
+     * fetch STARTED.
+     *
+     * <p>Two rules resolve ordering:
+     * <ol>
+     *   <li><b>Authoritative snapshot:</b> a poll whose fetch began after our
+     *   newest local event (+jitter) read the daemon's state pair strictly
+     *   later than anything we know — adopt it unconditionally. This is the
+     *   self-heal for every missed/late/out-of-order broadcast (a dropped
+     *   "saved" on a fast clip, a stalled "recording" delivered after its
+     *   terminal event, a re-press right after a rejection): within one poll
+     *   tick the display converges on daemon truth.
+     *   <li><b>Edge guards:</b> samples that are NOT authoritative (broadcast
+     *   racing a poll sampled before it) go through staleness guards. The
+     *   lifecycle is monotonic per clip (recording → saved|failed), so a
+     *   "recording" whose start predates the terminal event we already know
+     *   is stale, while a genuinely NEW clip (started after that terminal
+     *   event) still passes — this keeps a sub-500ms accept→export cycle
+     *   from losing its blue.
+     * </ol>
+     * Synchronized: called from the main thread (receiver) and the poll
+     * executor; the guards are check-then-act over the state pair.
+     */
+    private synchronized void adoptReplayState(String state, long eventAtMs, long fetchStartMs) {
+        final long JITTER_MS = 500;
+        boolean authoritative = fetchStartMs > 0
+                && fetchStartMs > replayEventAtMs + JITTER_MS;
+        if (!authoritative) {
+            String cur = replayState;
+            if (state.equals(cur)) {
+                // Same state: only a meaningfully newer event refreshes the
+                // timestamp (a repeated failed press extends the red hold; a
+                // poll re-sampling the same transition does not).
+                if (eventAtMs <= replayEventAtMs + JITTER_MS) return;
+            } else if ("recording".equals(state)
+                    && ("saved".equals(cur) || "failed".equals(cur))
+                    && eventAtMs <= replayEventAtMs + JITTER_MS) {
+                // Stale pre-terminal sample (or an out-of-order broadcast
+                // pair): this recording phase started before the terminal
+                // event we already know about — not a new clip.
+                return;
+            } else if (eventAtMs < replayEventAtMs - JITTER_MS) {
+                // Cross-state sample older than what we already display.
+                return;
+            }
+        }
+        replayState = state;
+        replayEventAtMs = eventAtMs;
+        // Arm the repaint at the hold boundary for terminal states so the
+        // 5s revert lands on time instead of on the next poll tick.
+        handler.removeCallbacks(replayRevertRunnable);
+        if ("saved".equals(state) || "failed".equals(state)) {
+            long remaining = REPLAY_RESULT_HOLD_MS
+                    - (android.os.SystemClock.elapsedRealtime() - eventAtMs);
+            handler.postDelayed(replayRevertRunnable, Math.max(0, remaining) + 100);
+        }
+    }
+
+    /**
+     * Derive what the clip segment shows RIGHT NOW from the state pair.
+     * Terminal states decay to idle after {@link #REPLAY_RESULT_HOLD_MS};
+     * a "recording" with no terminal signal on either channel decays via
+     * {@link #REPLAY_RECORDING_STALE_MS} so a lost daemon can't pin the
+     * segment green forever.
+     */
+    private String computeReplayDisplay() {
+        String state = replayState;
+        long age = android.os.SystemClock.elapsedRealtime() - replayEventAtMs;
+        if ("recording".equals(state)) {
+            return age <= REPLAY_RECORDING_STALE_MS ? state : "idle";
+        }
+        if (("saved".equals(state) || "failed".equals(state))
+                && age <= REPLAY_RESULT_HOLD_MS) {
+            return state;
+        }
+        return "idle";
+    }
+
+    /** Register the replay-state broadcast receiver once — same exported
+     *  contract as {@link #registerCamCloseReceiver()} (daemon sender is
+     *  shell/UID-2000). */
+    private void registerReplayStateReceiver() {
+        if (replayReceiverRegistered) return;
+        try {
+            android.content.IntentFilter f = new android.content.IntentFilter(ACTION_REPLAY_STATE);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(replayStateReceiver, f, Context.RECEIVER_EXPORTED);
+            } else {
+                registerReceiver(replayStateReceiver, f);
+            }
+            replayReceiverRegistered = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "replayState receiver register failed: " + t.getMessage());
+        }
+    }
+
+    /** Register the camview-state broadcast receiver once. The sender is the daemon
+     *  (shell/UID-2000) via `am broadcast`, so on API 33+ the receiver must be exported;
+     *  on the API-29 head unit the plain register path is used. */
+    private void registerCamCloseReceiver() {
+        if (camCloseReceiverRegistered) return;
+        try {
+            android.content.IntentFilter f = new android.content.IntentFilter(ACTION_CAMVIEW_STATE);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(camCloseReceiver, f, Context.RECEIVER_EXPORTED);
+            } else {
+                registerReceiver(camCloseReceiver, f);
+            }
+            camCloseReceiverRegistered = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "camClose receiver register failed: " + t.getMessage());
+        }
+    }
+
+    /** Lazily build the ✕ button + its layout params (once). */
+    private void buildCamCloseButton() {
+        if (camCloseButton != null) return;
+        TextView tv = new TextView(this);
+        tv.setText("✕"); // ✕
+        tv.setTextColor(android.graphics.Color.WHITE);
+        tv.setTextSize(20);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        bg.setColor(android.graphics.Color.parseColor("#CC000000"));
+        bg.setStroke(2, android.graphics.Color.parseColor("#80FFFFFF"));
+        tv.setBackground(bg);
+        int pad = camDp(6);
+        tv.setPadding(pad, pad, pad, pad);
+        tv.setOnClickListener(v -> onCamCloseTapped());
+        camCloseButton = tv;
+
+        int size = camDp(40);
+        camCloseParams = new WindowManager.LayoutParams(
+                size, size,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT);
+        camCloseParams.gravity = Gravity.TOP | Gravity.END;
+        camCloseParams.x = camDp(16);
+        camCloseParams.y = camDp(16);
+    }
+
+    /** Attach/detach the ✕ window. Always runs on the main thread (WindowManager
+     *  add/removeView requirement); the broadcast receiver already runs on main. */
+    private void setCamCloseVisible(boolean visible) {
+        handler.post(() -> {
+            if (!Settings.canDrawOverlays(this)) return;
+            buildCamCloseButton();
+            if (camCloseButton == null || windowManager == null) return;
+            try {
+                if (visible && !camCloseAttached) {
+                    windowManager.addView(camCloseButton, camCloseParams);
+                    camCloseAttached = true;
+                } else if (!visible && camCloseAttached) {
+                    windowManager.removeView(camCloseButton);
+                    camCloseAttached = false;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "setCamCloseVisible(" + visible + ") failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void onCamCloseTapped() {
+        setCamCloseVisible(false); // immediate feedback; daemon confirms via broadcast
+        executor.execute(() -> {
+            java.net.HttpURLConnection conn = null;
+            try {
+                conn = com.overdrive.app.util.DaemonHttpClient.open("/api/camview/hide", "POST", 1500, 3000);
+                conn.getResponseCode();
+            } catch (Exception e) {
+                Log.w(TAG, "camview hide failed: " + e.getMessage());
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        });
+    }
+
+    private int camDp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
     @Override
     public void onDestroy() {
         // Order matters here:
@@ -335,6 +626,19 @@ public class StatusOverlayService extends Service {
         audioController = null;
         if (ctrl != null) {
             try { ctrl.stop(); } catch (Exception ignored) {}
+        }
+        // Tear down the camera-view close button + its receiver.
+        if (camCloseReceiverRegistered) {
+            try { unregisterReceiver(camCloseReceiver); } catch (Throwable ignored) {}
+            camCloseReceiverRegistered = false;
+        }
+        if (replayReceiverRegistered) {
+            try { unregisterReceiver(replayStateReceiver); } catch (Throwable ignored) {}
+            replayReceiverRegistered = false;
+        }
+        if (camCloseAttached && camCloseButton != null && windowManager != null) {
+            try { windowManager.removeView(camCloseButton); } catch (Throwable ignored) {}
+            camCloseAttached = false;
         }
         removeOverlay();
         super.onDestroy();
@@ -503,6 +807,9 @@ public class StatusOverlayService extends Service {
         recContainer = overlayView.findViewById(R.id.recContainer);
         tripContainer = overlayView.findViewById(R.id.tripContainer);
         micContainer = overlayView.findViewById(R.id.micContainer);
+        replayContainer = overlayView.findViewById(R.id.replayContainer);
+        ivReplayIcon = overlayView.findViewById(R.id.ivReplayIcon);
+        tvReplayLabel = overlayView.findViewById(R.id.tvReplayLabel);
         actionBar = overlayView.findViewById(R.id.actionBar);
         ivRecIcon = overlayView.findViewById(R.id.ivRecIcon);
         ivTripIcon = overlayView.findViewById(R.id.ivTripIcon);
@@ -876,19 +1183,37 @@ public class StatusOverlayService extends Service {
             // consistent across the four downstream reads in this tick;
             // they each call loadConfig()/getOemDashcam()/etc. and hit the
             // freshly-warmed cache without re-doing the I/O.
+            //
+            // ACC-ON COST FIX: this used to be forceReload(), which NULLS the
+            // cache and forces a full readText() + JSONObject parse + the
+            // ~515-line applyDefaults() migration walk on EVERY tick — i.e.
+            // every 3s for the entire drive, on the shared /data/local/tmp
+            // config under a lock the UID-2000 daemon also takes. loadConfig()
+            // achieves the same "warm the cache once for this tick's four
+            // downstream reads" goal, but is mtime-gated: it reparses only when
+            // the file actually changed on disk (which is the correct cross-UID
+            // freshness signal, since the daemon's writes bump mtime) and is
+            // nearly free otherwise. The only behavioural delta is a daemon
+            // write landing in the SAME wall-clock second as this read, which
+            // isCacheFresh() deliberately treats as stale-enough-to-reparse on
+            // the next call — invisible for a 3s status pill.
             try {
-                com.overdrive.app.config.UnifiedConfigManager.forceReload();
+                com.overdrive.app.config.UnifiedConfigManager.loadConfig();
             } catch (Throwable t) {
                 // Tolerate transient I/O — the downstream reads will fall
-                // back to the prior cached snapshot if forceReload didn't
-                // refresh.
+                // back to the prior cached snapshot.
             }
             try {
+                // Stamp BEFORE the fetch: any state the daemon reports was
+                // current at-or-after this instant, which is what lets
+                // adoptReplayState treat the sample as an authoritative
+                // snapshot relative to locally-known broadcast events.
+                long fetchStartElapsedMs = android.os.SystemClock.elapsedRealtime();
                 JSONObject status = fetchStatus();
                 if (status != null) {
                     daemonReachable = true;
                     consecutivePollFailures = 0;
-                    parseStatus(status);
+                    parseStatus(status, fetchStartElapsedMs);
                 } else {
                     consecutivePollFailures++;
                     if (consecutivePollFailures >= UNREACHABLE_THRESHOLD) {
@@ -937,6 +1262,10 @@ public class StatusOverlayService extends Service {
                 final long interval;
                 if (fastPollUntilElapsedMs > now) {
                     interval = FAST_POLL_INTERVAL_MS;
+                } else if (overlayFullyIdle) {
+                    // Overlay disabled + no audio to reconcile: slow way down.
+                    // A fresh ACC OFF→ON edge re-arms fast-poll on the next tick.
+                    interval = IDLE_POLL_INTERVAL_MS;
                 } else {
                     interval = accOn ? POLL_INTERVAL_MS : POLL_INTERVAL_ACC_OFF_MS;
                 }
@@ -1110,7 +1439,7 @@ public class StatusOverlayService extends Service {
         // shouldCapture && !isCapturing branch.
     }
 
-    private void parseStatus(JSONObject status) {
+    private void parseStatus(JSONObject status, long fetchStartElapsedMs) {
         try {
             // Suppress configuredMode overwrites while the user's
             // optimistic pick is still settling. Without this, an
@@ -1171,6 +1500,26 @@ public class StatusOverlayService extends Service {
                 currentGear = accOn ? "D" : "P";
             }
 
+            // Instant-replay block — poll catch-up for missed REPLAY_STATE
+            // broadcasts. The daemon reports (state, stateAgeMs); reconstruct
+            // the absolute transition time on OUR monotonic clock and let
+            // adoptReplayState decide whether the sample is newer than what
+            // the broadcast channel already delivered. Old daemons without
+            // the block simply leave the segment hidden (configured=false).
+            JSONObject replayStatus = status.optJSONObject("replay");
+            if (replayStatus != null) {
+                replayConfigured = replayStatus.optBoolean("configured", false);
+                String state = replayStatus.optString("state", "");
+                long ageMs = replayStatus.optLong("stateAgeMs", -1);
+                if (!state.isEmpty() && ageMs >= 0) {
+                    adoptReplayState(state,
+                            android.os.SystemClock.elapsedRealtime() - ageMs,
+                            fetchStartElapsedMs);
+                }
+            } else {
+                replayConfigured = false;
+            }
+
             JSONObject tripStatus = status.optJSONObject("tripStatus");
             if (tripStatus != null) {
                 tripEnabled = tripStatus.optBoolean("enabled", false);
@@ -1217,6 +1566,7 @@ public class StatusOverlayService extends Service {
         // (where the section doesn't exist yet) keep current behavior.
         boolean cameraOverlayEnabled = true;
         boolean tripOverlayEnabled = true;
+        boolean replayOverlayEnabled = true;
         try {
             // FIX M4: pollStatus() forceReloads once at the top of the
             // tick; the cache is hot here so loadConfig() is free.
@@ -1226,6 +1576,7 @@ public class StatusOverlayService extends Service {
             if (statusOverlayCfg != null) {
                 cameraOverlayEnabled = statusOverlayCfg.optBoolean("cameraVisible", true);
                 tripOverlayEnabled = statusOverlayCfg.optBoolean("tripVisible", true);
+                replayOverlayEnabled = statusOverlayCfg.optBoolean("replayVisible", true);
             }
         } catch (Exception e) {
             Log.w(TAG, "Failed to read statusOverlay prefs: " + e.getMessage());
@@ -1294,8 +1645,15 @@ public class StatusOverlayService extends Service {
             Log.d(TAG, "updateUI: nothing to show — removing overlay");
             removeOverlay();
             hadContentBefore = false;
+            // If audio capture also isn't configured, nothing here needs the
+            // fast poll — drop to the idle cadence (the poll can't stop
+            // entirely because it still drives audio reconcile + ACC-edge
+            // detection, but with audio off there's nothing to reconcile).
+            overlayFullyIdle = !audioEnabledConfig;
             return;
         }
+        // Something is shown (or audio is active) — keep the normal poll cadence.
+        overlayFullyIdle = false;
 
         // Hide overlay when ACC is off — car is parked, no need to show status.
         // We keep polling (at a slower rate) so we can show it again when ACC turns on.
@@ -1328,8 +1686,16 @@ public class StatusOverlayService extends Service {
         boolean shouldShowMic = audioEnabledConfig && recConfigured && cameraOverlayEnabled;
 
         if (!shouldShowRec && !shouldShowTrip && !shouldShowMic) {
-            // Configured but conditions don't require display (e.g., drive mode in P)
-            if (overlayView != null) overlayView.setVisibility(View.GONE);
+            // Configured but conditions don't require display (e.g., drive mode in P).
+            // Fully DETACH the window rather than leaving an empty GONE shell
+            // attached: a GONE view inside an attached TYPE_APPLICATION_OVERLAY
+            // still costs the system compositor a surface to blend every frame,
+            // which on the shared Adreno 610 competes with the native IVI. The
+            // poll's createOverlay() re-attaches at the saved position the moment
+            // real content returns (idempotent, restores PREF_POS_X/Y). Mirrors
+            // the "fully remove rather than leave an empty shell" pattern used by
+            // the both-segments-off branch just below.
+            removeOverlay();
             return;
         }
 
@@ -1516,6 +1882,46 @@ public class StatusOverlayService extends Service {
             micContainer.setVisibility(View.GONE);
         }
 
+        // Instant-replay clip segment. Visible only when a replay binding or
+        // automation actually exists (daemon-reported `configured`) so the
+        // majority of installs — which never set one up — see no new pill
+        // segment. Piggybacks on the camera segment toggle like MIC, plus
+        // its own Settings switch. Color states:
+        //   - GREEN (status_success): a replay was accepted and is collecting
+        //     its post-roll / exporting right now.
+        //   - BLUE (status_info): the replay_*.mp4 finalized — held for 5s
+        //     (REPLAY_RESULT_HOLD_MS) so the driver gets a positive "saved"
+        //     confirmation, then decays to the idle gray.
+        //   - RED (status_danger): the press did NOT produce a clip (rejected
+        //     — no history / busy / restart required — or the accepted export
+        //     failed). Held 5s. This used to be log-only, i.e. invisible.
+        //   - GRAY (status_stopped): armed and idle.
+        boolean replayVisibleByConfig = replayConfigured
+                && cameraOverlayEnabled && replayOverlayEnabled;
+        if (replayVisibleByConfig && replayContainer != null) {
+            replayContainer.setVisibility(View.VISIBLE);
+            String replayDisplay = computeReplayDisplay();
+            if ("recording".equals(replayDisplay)) {
+                ivReplayIcon.setImageResource(R.drawable.ic_overlay_replay_active);
+                tvReplayLabel.setText("CLIP");
+                tvReplayLabel.setTextColor(getColor(R.color.status_success));
+            } else if ("saved".equals(replayDisplay)) {
+                ivReplayIcon.setImageResource(R.drawable.ic_overlay_replay_saved);
+                tvReplayLabel.setText("CLIP");
+                tvReplayLabel.setTextColor(getColor(R.color.status_info));
+            } else if ("failed".equals(replayDisplay)) {
+                ivReplayIcon.setImageResource(R.drawable.ic_overlay_replay_inactive);
+                tvReplayLabel.setText("CLIP");
+                tvReplayLabel.setTextColor(getColor(R.color.status_danger));
+            } else {
+                ivReplayIcon.setImageResource(R.drawable.ic_overlay_replay_inactive);
+                tvReplayLabel.setText("CLIP");
+                tvReplayLabel.setTextColor(getColor(R.color.status_stopped));
+            }
+        } else if (replayContainer != null) {
+            replayContainer.setVisibility(View.GONE);
+        }
+
         // Trip: show only if enabled in config AND user hasn't toggled the
         // trip segment off in Settings → Status overlay.
         if (tripEnabled && tripOverlayEnabled) {
@@ -1533,13 +1939,17 @@ public class StatusOverlayService extends Service {
             tripContainer.setVisibility(View.GONE);
         }
 
-        // Show/hide the two separators based on which segments are visible.
-        // Layout order: REC | sep1 | MIC | sep2 | TRIP. A separator is
-        // visible iff there is at least one visible segment on each side.
+        // Show/hide the three separators based on which segments are visible.
+        // Layout order: REC | sep1 | MIC | sep2 | CLIP | sep3 | TRIP. A
+        // separator is visible iff there is at least one visible segment on
+        // each side of it.
         View separatorRecMic = overlayView.findViewById(R.id.separatorRecMic);
+        View separatorMicReplay = overlayView.findViewById(R.id.separatorMicReplay);
         View separator = overlayView.findViewById(R.id.separator);
         boolean recVisible = recContainer.getVisibility() == View.VISIBLE;
         boolean micVisible = micContainer.getVisibility() == View.VISIBLE;
+        boolean replayVisible = replayContainer != null
+                && replayContainer.getVisibility() == View.VISIBLE;
         boolean tripVisible = tripContainer.getVisibility() == View.VISIBLE;
         if (separatorRecMic != null) {
             // sep1 sits between REC and MIC — visible only when both sides
@@ -1547,10 +1957,15 @@ public class StatusOverlayService extends Service {
             separatorRecMic.setVisibility(
                 recVisible && micVisible ? View.VISIBLE : View.GONE);
         }
+        if (separatorMicReplay != null) {
+            // sep2 sits between (REC|MIC) and CLIP.
+            separatorMicReplay.setVisibility(
+                (recVisible || micVisible) && replayVisible ? View.VISIBLE : View.GONE);
+        }
         if (separator != null) {
-            // sep2 sits between (REC|MIC) and TRIP — visible iff trip is
-            // visible AND at least one of REC/MIC is visible.
-            boolean leftSideVisible = recVisible || micVisible;
+            // sep3 sits between (REC|MIC|CLIP) and TRIP — visible iff trip is
+            // visible AND anything to its left is visible.
+            boolean leftSideVisible = recVisible || micVisible || replayVisible;
             separator.setVisibility(
                 leftSideVisible && tripVisible ? View.VISIBLE : View.GONE);
         }

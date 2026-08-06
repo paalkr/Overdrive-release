@@ -177,7 +177,7 @@ class RecordingsFragment : Fragment() {
      */
     private val pendingPosts = mutableListOf<Runnable>()
 
-    enum class Source { DASHCAM, SURVEILLANCE }
+    enum class Source { DASHCAM, REPLAYS, SURVEILLANCE }
 
     private val isLandscape: Boolean
         get() = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -225,6 +225,7 @@ class RecordingsFragment : Fragment() {
                 // only, so proximity would land on an empty list there).
                 "sentry" -> currentSource = Source.SURVEILLANCE
                 "proximity", "normal" -> currentSource = Source.DASHCAM
+                "replay" -> currentSource = Source.REPLAYS
             }
         }
 
@@ -421,6 +422,15 @@ class RecordingsFragment : Fragment() {
                 // Dashcam segment hides the actor/severity rows, so push
                 // empty sets — otherwise stale state from a previous
                 // Surveillance session would silently filter Dashcam clips.
+                actors = emptySet()
+                severities = emptySet()
+            }
+            Source.REPLAYS -> {
+                // Instant replays only. No type chips (single type), and no
+                // actor/severity narrowing — replay clips are manual exports
+                // with no surveillance classification sidecar.
+                source = RecordingLibraryFragment.RecordingFilter.REPLAY
+                extra = null
                 actors = emptySet()
                 severities = emptySet()
             }
@@ -629,6 +639,7 @@ class RecordingsFragment : Fragment() {
         val group = view.findViewById<MaterialButtonToggleGroup>(R.id.segmentedSource)
         when (currentSource) {
             Source.DASHCAM -> group.check(R.id.segmentDashcam)
+            Source.REPLAYS -> group.check(R.id.segmentReplays)
             Source.SURVEILLANCE -> group.check(R.id.segmentSurveillance)
         }
         applyChipRowVisibility(view)
@@ -636,6 +647,7 @@ class RecordingsFragment : Fragment() {
             if (!isChecked) return@addOnButtonCheckedListener
             currentSource = when (checkedId) {
                 R.id.segmentSurveillance -> Source.SURVEILLANCE
+                R.id.segmentReplays -> Source.REPLAYS
                 else -> Source.DASHCAM
             }
             applyChipRowVisibility(view)
@@ -666,18 +678,24 @@ class RecordingsFragment : Fragment() {
      */
     private fun applyChipRowVisibility(view: View) {
         val isDashcam = currentSource == Source.DASHCAM
+        // Replays: single type, no actor/severity sidecars — every chip row
+        // is meaningless, so hide all three (place/storage/date still apply
+        // and live outside these rows).
+        val isReplays = currentSource == Source.REPLAYS
         view.findViewById<View>(R.id.rowTypeFilter)?.visibility =
             if (isDashcam) View.VISIBLE else View.GONE
         view.findViewById<View>(R.id.rowWhatFilter)?.visibility =
-            if (isDashcam) View.GONE else View.VISIBLE
+            if (isDashcam || isReplays) View.GONE else View.VISIBLE
         view.findViewById<View>(R.id.rowSeverityFilter)?.visibility =
-            if (isDashcam) View.GONE else View.VISIBLE
+            if (isDashcam || isReplays) View.GONE else View.VISIBLE
     }
 
     private fun setupSettingsAction(view: View) {
         view.findViewById<MaterialButton>(R.id.btnRecordingsSettings)?.setOnClickListener {
             val target = when (currentSource) {
-                Source.DASHCAM -> R.id.recordingSettingsWebFragment
+                // Replays are produced by the dashcam encoder's pre-record
+                // ring; their knobs live on the same recording settings page.
+                Source.DASHCAM, Source.REPLAYS -> R.id.recordingSettingsWebFragment
                 Source.SURVEILLANCE -> R.id.surveillanceSettingsWebFragment
             }
             findNavController().navigate(target)
@@ -912,6 +930,7 @@ class RecordingsFragment : Fragment() {
         val storageActive = storageFilter.isNotEmpty()
         val chipsActive = storageActive || when (currentSource) {
             Source.DASHCAM -> dashcamTypes.isNotEmpty() || placeFilter.isNotEmpty() || searchActive
+            Source.REPLAYS -> placeFilter.isNotEmpty() || searchActive
             Source.SURVEILLANCE -> actorClassFilter.isNotEmpty()
                 || severityFilter.isNotEmpty()
                 || placeFilter.isNotEmpty()
@@ -1073,6 +1092,27 @@ class RecordingsFragment : Fragment() {
             // /api/recordings/stats — flat counters covering both segments.
             val stats = try { RecordingsApiClient.fetchStats() } catch (_: Throwable) { null }
 
+            // Index down (daemon reachable, its index isn't): the counters are
+            // unknown, not zero. Post the honest header instead of running the
+            // direct-FS aggregate — that walk can't read SD/USB under the app
+            // UID and would render an authoritative "0 today · 0 total · 0 B"
+            // right above the library's own "index unavailable" card.
+            if (stats != null && stats.indexUnavailable) {
+                postCountsToUi(
+                    viewRef = viewRef,
+                    dashcamCount = 0,
+                    replaysCount = 0,
+                    surveillanceCount = 0,
+                    totalCount = 0,
+                    totalToday = 0,
+                    totalBytes = 0,
+                    sortedPlaces = availablePlaces,
+                    warming = false,
+                    indexDown = true
+                )
+                return@execute
+            }
+
             // Fallback path: the daemon couldn't be reached. Use the unified
             // scanner (it owns its own API-then-FS fallback ladder) so we
             // don't duplicate the FS walk here.
@@ -1084,20 +1124,24 @@ class RecordingsFragment : Fragment() {
                         it.type == RecordingFile.RecordingType.PROXIMITY ||
                         it.type == RecordingFile.RecordingType.OEM_DASHCAM
                 }
+                val replays = all.filter { it.type == RecordingFile.RecordingType.REPLAY }
                 val surveillance = all.filter { it.type == RecordingFile.RecordingType.SENTRY }
                 val dashcamStats = aggregate(dashcam, today0)
+                val replayStats = aggregate(replays, today0)
                 val surveillanceStats = aggregate(surveillance, today0)
-                val totalCount = dashcamStats.total + surveillanceStats.total
-                val totalToday = dashcamStats.today + surveillanceStats.today
-                val totalBytes = dashcamStats.bytes + surveillanceStats.bytes
+                val totalCount = dashcamStats.total + replayStats.total + surveillanceStats.total
+                val totalToday = dashcamStats.today + replayStats.today + surveillanceStats.today
+                val totalBytes = dashcamStats.bytes + replayStats.bytes + surveillanceStats.bytes
                 val segmentClips = when (sourceAtDispatch) {
                     Source.DASHCAM -> dashcam
+                    Source.REPLAYS -> replays
                     Source.SURVEILLANCE -> surveillance
                 }
                 val sortedPlaces = derivePlaceLabelsFromScan(segmentClips)
                 postCountsToUi(
                     viewRef = viewRef,
                     dashcamCount = dashcamStats.total.toLong(),
+                    replaysCount = replayStats.total.toLong(),
                     surveillanceCount = surveillanceStats.total.toLong(),
                     totalCount = totalCount.toLong(),
                     totalToday = totalToday.toLong(),
@@ -1131,11 +1175,13 @@ class RecordingsFragment : Fragment() {
             // type=normal to include OEM clips so they're already inside
             // normalCount. Sum normal + proximity for the segment badge.
             val dashcamCount = stats.normalCount + stats.proximityCount
+            val replaysCount = stats.replayCount
             val surveillanceCount = stats.sentryCount
 
             postCountsToUi(
                 viewRef = viewRef,
                 dashcamCount = dashcamCount,
+                replaysCount = replaysCount,
                 surveillanceCount = surveillanceCount,
                 totalCount = stats.totalCount,
                 totalToday = stats.totalToday,
@@ -1154,6 +1200,7 @@ class RecordingsFragment : Fragment() {
      */
     private fun Source.toApiType(): String = when (this) {
         Source.DASHCAM -> "normal"
+        Source.REPLAYS -> "replay"
         Source.SURVEILLANCE -> "sentry"
     }
 
@@ -1166,12 +1213,19 @@ class RecordingsFragment : Fragment() {
     private fun postCountsToUi(
         viewRef: WeakReference<View?>,
         dashcamCount: Long,
+        replaysCount: Long,
         surveillanceCount: Long,
         totalCount: Long,
         totalToday: Long,
         totalBytes: Long,
         sortedPlaces: List<String>,
-        warming: Boolean
+        warming: Boolean,
+        /**
+         * Recordings index is down: every count passed in is zero and NOT
+         * authoritative, so the header must say so instead of rendering
+         * "0 today · 0 total · 0 B" as fact.
+         */
+        indexDown: Boolean = false
     ) {
         val post = object : Runnable {
             override fun run() {
@@ -1186,24 +1240,39 @@ class RecordingsFragment : Fragment() {
                     totalCount.toInt(),
                     sizeText
                 )
-                v.findViewById<TextView>(R.id.tvRecordingsSummary)?.text =
-                    if (warming) "$baseSummary  ·  (building index)" else baseSummary
+                v.findViewById<TextView>(R.id.tvRecordingsSummary)?.text = when {
+                    indexDown -> activeCtx.getString(R.string.recordings_summary_index_down)
+                    warming -> "$baseSummary  ·  (building index)"
+                    else -> baseSummary
+                }
 
                 v.findViewById<TextView>(R.id.tvTitleCountBadge)?.let { badge ->
-                    if (totalCount > 0) {
+                    // Hide rather than show "0" while the index is down — the
+                    // count is unknown, not zero.
+                    if (totalCount > 0 && !indexDown) {
                         badge.visibility = View.VISIBLE
                         badge.text = totalCount.toString()
                     } else {
                         badge.visibility = View.GONE
                     }
                 }
+                // While the index is down the per-segment counts are unknown,
+                // so drop the "· N" suffix instead of asserting zero.
                 v.findViewById<MaterialButton>(R.id.segmentDashcam)?.text =
-                    activeCtx.getString(
+                    if (indexDown) activeCtx.getString(R.string.recordings_segment_dashcam)
+                    else activeCtx.getString(
                         R.string.recordings_segment_dashcam_count,
                         dashcamCount.toInt()
                     )
+                v.findViewById<MaterialButton>(R.id.segmentReplays)?.text =
+                    if (indexDown) activeCtx.getString(R.string.recordings_segment_replays)
+                    else activeCtx.getString(
+                        R.string.recordings_segment_replays_count,
+                        replaysCount.toInt()
+                    )
                 v.findViewById<MaterialButton>(R.id.segmentSurveillance)?.text =
-                    activeCtx.getString(
+                    if (indexDown) activeCtx.getString(R.string.recordings_segment_surveillance)
+                    else activeCtx.getString(
                         R.string.recordings_segment_surveillance_count,
                         surveillanceCount.toInt()
                     )
@@ -1232,7 +1301,11 @@ class RecordingsFragment : Fragment() {
                 // pile 30 redundant requests on the daemon.
                 warmingRetryRunnable?.let { mainHandler.removeCallbacks(it) }
                 warmingRetryRunnable = null
-                if (warming) {
+                // Poll while the index is REBUILDING or DOWN. Without the
+                // indexDown case the header would latch on "Counts
+                // unavailable" until the next onResume / user action, even
+                // after the daemon re-opened its index seconds later.
+                if (warming || indexDown) {
                     val attempt = warmingRetryAttempt
                             .coerceAtMost(WARMING_POLL_MAX_ATTEMPTS_FOR_BACKOFF)
                     val delay = (WARMING_POLL_INTERVAL_MS shl attempt)

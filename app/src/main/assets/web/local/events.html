@@ -12,7 +12,7 @@
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
     <script src="../shared/app-shell.js?v=2"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=17">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
@@ -429,6 +429,7 @@
         .storage-dot.normal { background: var(--brand-secondary); }
         .storage-dot.sentry { background: var(--danger); }
         .storage-dot.proximity { background: #fb923c; }
+        .storage-dot.replay { background: #3b82f6; }
         
         /* Recordings List Panel */
         .recordings-panel {
@@ -679,6 +680,11 @@
         .recording-badge.proximity {
             background: rgba(251, 146, 60, 0.2);
             color: #fb923c;
+        }
+
+        .recording-badge.replay {
+            background: rgba(59, 130, 246, 0.2);
+            color: #3b82f6;
         }
 
         /* v3 severity badges + actor summary (item 6) */
@@ -1611,6 +1617,12 @@
             justify-content: center;
             padding: 40px;
         }
+
+        /* Index-warming banner (built by events.js _showWarmingBanner). Reuses
+           .loading + .spinner but left-aligned and compact. */
+        .warming-banner { padding: 16px 12px; justify-content: flex-start; }
+        .warming-banner .spinner { width: 18px; height: 18px; border-width: 2px; flex: none; margin-right: 12px; }
+        .warming-banner-text { font-size: 13px; color: var(--text-secondary); }
         
         .spinner {
             width: 32px;
@@ -1710,6 +1722,10 @@
             background: rgba(251, 146, 60, 0.85);
         }
 
+        .timeline-marker.type-animal {
+            background: rgba(168, 85, 247, 0.85);
+        }
+
         .timeline-playhead {
             position: absolute;
             top: 50%;
@@ -1799,6 +1815,7 @@
         .legend-person { background: rgba(239, 68, 68, 0.85); }
         .legend-car { background: rgba(59, 130, 246, 0.85); }
         .legend-bike { background: rgba(251, 146, 60, 0.85); }
+        .legend-animal { background: rgba(168, 85, 247, 0.85); }
         
         /* Multi-Select Mode */
         .select-mode-btn {
@@ -1939,6 +1956,7 @@
                         <button class="filter-tab" data-filter="sentry" onclick="BYD.events.setFilter('sentry')" data-i18n="events.badge_sentry">Sentry</button>
                         <button class="filter-tab" data-filter="normal" onclick="BYD.events.setFilter('normal')" data-i18n="events.badge_normal">Normal</button>
                         <button class="filter-tab" data-filter="proximity" onclick="BYD.events.setFilter('proximity')" data-i18n="events.badge_proximity">Proximity</button>
+                        <button class="filter-tab" data-filter="replay" onclick="BYD.events.setFilter('replay')" data-i18n="events.tab_replays">Replays</button>
                     </div>
 
                     <div class="storage-stats" id="storageStats">
@@ -1960,6 +1978,10 @@
                             <div class="storage-item">
                                 <span class="storage-dot proximity"></span>
                                 <span id="proximityCount">0</span>
+                            </div>
+                            <div class="storage-item">
+                                <span class="storage-dot replay"></span>
+                                <span id="replayCount">0</span>
                             </div>
                         </div>
                     </div>
@@ -2175,6 +2197,7 @@
                     <span class="legend-item"><span class="legend-dot legend-person"></span><span data-i18n="events.actor_person">Person</span></span>
                     <span class="legend-item"><span class="legend-dot legend-car"></span><span data-i18n="events.actor_vehicle">Vehicle</span></span>
                     <span class="legend-item"><span class="legend-dot legend-bike"></span><span data-i18n="events.actor_bike">Bike</span></span>
+                    <span class="legend-item"><span class="legend-dot legend-animal"></span><span data-i18n="events.actor_animal">Animal</span></span>
                 </div>
                 <div class="video-controls">
                     <button type="button" class="video-ctrl-btn" id="videoPlayPauseBtn" data-i18n-attr="title:events.player_play_pause;aria-label:events.player_play_pause" title="Play/Pause" aria-label="Play/Pause">
@@ -2278,7 +2301,7 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
     <script src="../shared/events.js?v=storagefilter1"></script>
     <script>
