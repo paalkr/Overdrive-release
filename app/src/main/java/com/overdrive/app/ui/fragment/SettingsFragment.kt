@@ -68,7 +68,14 @@ class SettingsFragment : Fragment() {
     private enum class Section(
         val labelRes: Int,
         val iconRes: Int,
-        val navigates: Boolean = false
+        val navigates: Boolean = false,
+        /**
+         * FORK-LOCAL. Rows with this set open a DIALOG instead of swapping a child
+         * fragment into the detail pane, so they never become [currentSection] and
+         * [fragmentForSection] is never asked to map them. Without the flag a rail
+         * entry must have a Fragment, which the setup guide does not have.
+         */
+        val opensDialog: Boolean = false
     ) {
         APPEARANCE(R.string.settings_section_appearance, R.drawable.ic_dashboard),
         RECORDING(R.string.settings_section_recording, R.drawable.ic_recording, navigates = true),
@@ -77,6 +84,12 @@ class SettingsFragment : Fragment() {
         SECURITY(R.string.settings_section_security, R.drawable.ic_security_lock),
         DAEMONS(R.string.settings_section_daemons, R.drawable.ic_services),
         PRIVACY(R.string.settings_section_privacy, R.drawable.ic_delete),
+        SETUP_GUIDE(
+            R.string.settings_section_setup_guide,
+            R.drawable.ic_help,
+            navigates = true,
+            opensDialog = true
+        ),
     }
 
     private var currentSection: Section = Section.APPEARANCE
@@ -184,7 +197,17 @@ class SettingsFragment : Fragment() {
             row.findViewById<ImageView>(R.id.subrailRowChevron).visibility =
                 if (section.navigates) View.VISIBLE else View.GONE
 
-            row.setOnClickListener { selectSection(section, animate = true) }
+            row.setOnClickListener {
+                if (section.opensDialog) {
+                    // Dialog-type row: show it over the current pane and leave the rail
+                    // selection where it was. Deliberately NOT selectSection() — that
+                    // would set currentSection to a section fragmentForSection() cannot
+                    // map, and leave the rail highlighting an empty detail pane.
+                    activity?.let { com.overdrive.app.overlay.SetupGuideDialog.show(it) }
+                } else {
+                    selectSection(section, animate = true)
+                }
+            }
 
             rowsContainer.addView(row)
             rowViews[section] = row
@@ -249,6 +272,12 @@ class SettingsFragment : Fragment() {
         Section.SECURITY -> SettingsSecurityFragment()
         Section.DAEMONS -> SettingsDaemonsFragment()
         Section.PRIVACY -> SettingsPrivacyFragment()
+        // Dialog-type rows never reach here — their click handler short-circuits before
+        // selectSection(), so this branch exists only to keep the `when` exhaustive. If
+        // it ever fires, a dialog row was routed as a pane row.
+        Section.SETUP_GUIDE -> throw IllegalStateException(
+            "SETUP_GUIDE is a dialog row (opensDialog=true) and has no detail fragment"
+        )
     }
 
     // ============================================================
