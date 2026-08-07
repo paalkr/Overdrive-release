@@ -886,6 +886,8 @@
     <string name="settings_section_recording">Recording</string>
     <string name="settings_section_surveillance">Surveillance</string>
     <string name="settings_section_daemons">Daemons</string>
+    <string name="settings_section_setup_guide">Setup guide</string>
+    <string name="settings_section_setup_guide_subtitle">Re-run the getting-started steps, including the BYD auto-start fix that every install resets.</string>
     <string name="settings_section_privacy">Privacy &amp; data</string>
     <string name="settings_section_overlay">Status overlay</string>
     <string name="settings_section_security">Security</string>
