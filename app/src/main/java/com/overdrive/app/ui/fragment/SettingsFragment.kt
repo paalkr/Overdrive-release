@@ -338,17 +338,6 @@ class SettingsFragment : Fragment() {
         view.findViewById<View>(R.id.cardSectionDaemons)?.setOnClickListener {
             findNavController().navigateDrillDown(R.id.daemonsFragment)
         }
-        // FORK-LOCAL: manual re-entry to the setup guide. Not a drill-down — the guide
-        // is a dialog, so it shows over this fragment. Uses show() rather than
-        // showIfNeeded() deliberately: showIfNeeded() no-ops once the stored
-        // last_seen_install_time matches the current install, which is exactly the state
-        // a user is in when they come looking for this. The autostart step inside is the
-        // reason this exists (every `install -r` re-blocks autostart, and dismissing the
-        // post-install wizard leaves no other route back to that button).
-        view.findViewById<View>(R.id.cardSetupGuide)?.setOnClickListener {
-            val activity = activity ?: return@setOnClickListener
-            com.overdrive.app.overlay.SetupGuideDialog.show(activity)
-        }
     }
 
     /**

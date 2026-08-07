@@ -94,6 +94,18 @@ class SettingsAboutFragment : Fragment() {
             (activity as? MainActivity)?.invokeCheckForUpdates()
         }
 
+        // FORK-LOCAL: manual re-entry to the setup guide. show() rather than
+        // showIfNeeded() is deliberate — showIfNeeded() no-ops once the stored
+        // last_seen_install_time matches the current install, which is exactly the
+        // state a user is in when they come looking for this row. The reason it
+        // matters is step 2, the BYD auto-start fix: every `install -r` re-blocks
+        // autostart (mapAppOpsData[uid] := 1 on PACKAGE_REPLACED) and dismissing
+        // the post-install wizard otherwise leaves reinstalling as the only way back.
+        view.findViewById<View>(R.id.cardSetupGuide)?.setOnClickListener {
+            val activity = activity ?: return@setOnClickListener
+            com.overdrive.app.overlay.SetupGuideDialog.show(activity)
+        }
+
         view.findViewById<View>(R.id.cardBackupExport).setOnClickListener {
             startBackupExport()
         }

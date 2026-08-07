@@ -242,6 +242,70 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <!-- FORK-LOCAL: Setup guide re-entry.
+             SetupGuideDialog.showIfNeeded() only fires when the package's
+             lastUpdateTime passes the stored marker, so once the post-install
+             wizard is dismissed there is no route back to it. Step 2 of that guide
+             is the BYD auto-start fix, which every `install -r` silently re-blocks,
+             so without this the only way back was reinstalling.
+             It lives HERE rather than on the Settings hub because
+             SettingsFragment has two disjoint layout variants and the head unit
+             renders the LANDSCAPE one (a sub-rail of section->Fragment mappings,
+             which a dialog does not fit). About is reachable from the main
+             navigation rail in both orientations, so this is the one placement
+             that is actually visible on the car. -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardSetupGuide"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="@dimen/card_gap_vertical"
+            android:clickable="true"
+            android:focusable="true"
+            app:cardBackgroundColor="?attr/colorSurfaceContainer"
+            app:cardCornerRadius="@dimen/card_radius_standard"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                style="@style/SettingsRow.Inner"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content">
+
+                <ImageView
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:contentDescription="@null"
+                    android:src="@drawable/ic_help"
+                    app:tint="?attr/colorPrimary" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/settings_section_setup_guide"
+                        android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
+                        android:textColor="?attr/colorOnSurface" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="@string/settings_section_setup_guide_subtitle"
+                        android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                        android:textColor="?attr/colorOnSurfaceVariant" />
+                </LinearLayout>
+
+                <ImageView
+                    style="@style/SettingsRow.Chevron"
+                    android:src="@drawable/ic_chevron_right" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
         <!-- Backup & Restore — export settings to a file / restore them on this
              same head unit. Goes through the daemon's atomic write (REPLACE_CONFIG
              IPC). Same core as the web/Telegram surfaces. -->
