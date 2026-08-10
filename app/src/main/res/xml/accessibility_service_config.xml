@@ -16,12 +16,19 @@
       the dialog appear (the enabler primarily polls, so the event is
       belt-and-suspenders).
 
-  Event types and flags are the UNION of (2) and (3): key filtering needs no
-  window events, the enabler does, and neither capability disables the other.
+   4. FORK-LOCAL: seat-position capture — typeViewLongClicked lets
+      onAccessibilityEvent notice the user long-pressing BYD's seat-position
+      buttons (com.byd.carsettings:id/location{1,2,3}) to save a position, and
+      mirror that geometry into OverDrive's own position store via the daemon.
+      flagReportViewIds (already set) exposes getViewIdResourceName() so the
+      match is by resource-id, not localized button text.
+
+  Event types and flags are the UNION of (2), (3) and (4): key filtering needs no
+  window events, the enabler + capture do, and none disables the others.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeViewLongClicked"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagRequestFilterKeyEvents|flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
     android:canRequestFilterKeyEvents="true"
