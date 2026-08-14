@@ -962,6 +962,16 @@ public class HttpServer {
             return SeatDebugApiHandler.handle(method, path, body, out);
         }
 
+        // Interior-ambient READS, side by side across the SDK per-area getters,
+        // the Light-device feature ids and BYD's own carsettings provider. The
+        // ambient write path is proven but the read path is not, and a saved
+        // position that carries ambient state has to capture something that
+        // survives a round-trip. Read-only; the lights never change.
+        // See AmbientDebugApiHandler.
+        if (path.startsWith("/api/debug/ambient/")) {
+            return AmbientDebugApiHandler.handle(method, path, body, out);
+        }
+
         // Radar blind-spot ALERT register probe — read-only. The `blindSpot` automation
         // signal has never been confirmed on a car, and its whole read path logs at DEBUG
         // (stripped by R8 in release), so the values have to come back as JSON.
