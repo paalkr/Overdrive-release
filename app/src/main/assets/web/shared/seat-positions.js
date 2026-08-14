@@ -345,7 +345,7 @@ const SeatPositions = {
                         // the car's name to fall back to, so this is a revert, not a delete.
                         : '<div class="sp-menu-sep"></div>' +
                             '<button data-act="alias">' + this.ICONS.pencil +
-                                this.esc(this.t('seatpos.set_alias', 'Rename')) + '</button>' +
+                                this.esc(this.t('seatpos.set_alias', 'Rename in OverDrive')) + '</button>' +
                             (p.carName ? '<button data-act="clearAlias">' + this.ICONS.undo +
                                 this.esc(this.t('seatpos.clear_alias', 'Use the car’s name')) +
                                 '</button>' : '')) +
@@ -545,7 +545,7 @@ const SeatPositions = {
      */
     async setAlias(p) {
         const alias = await this.prompt(
-            this.t('seatpos.alias_title', 'Rename position'),
+            this.t('seatpos.alias_title', 'Rename in OverDrive'),
             this.t('seatpos.alias_body', 'The car keeps calling it {0}. This name is only used in OverDrive.')
                 .replace('{0}', p.carName || p.name),
             p.name);
