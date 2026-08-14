@@ -316,6 +316,11 @@ const SeatPositions = {
                     (uses.length ? '<button class="sp-chip used-by" data-act="usedBy">' + this.ICONS.bolt +
                         this.esc(this.usesLabel(uses.length)) + '</button>' : '') +
                 '</div>' +
+                // Only when renamed: the alias replaces the car's name in the title, and the
+                // slot chip alone ("From car · slot 2") does not say which stored position
+                // that is. Shown here so an aliased row can still be matched against what the
+                // car's own UI calls it.
+                (p.carName ? '<div class="sp-carname">' + this.esc(p.carName) + '</div>' : '') +
                 '<div class="sp-axes">' + this.axesHtml(p.axes) + '</div>' +
             '</div>' +
             '<div class="sp-row-actions">' +
