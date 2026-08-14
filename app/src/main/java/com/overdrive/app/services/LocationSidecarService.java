@@ -529,8 +529,16 @@ public class LocationSidecarService extends Service implements LocationListener 
 
             if (isFirstFix) {
                 Log.i(TAG, "First location fix: " + latitude + ", " + longitude);
-            } else if (com.overdrive.app.BuildConfig.DEBUG) {
-                // Individual fixes go to DEBUG; only shown if explicitly requested in logcat.
+            } else if (Log.isLoggable(TAG, Log.DEBUG)) {
+                // Opt-in per fix, and the gate has to be isLoggable rather than
+                // BuildConfig.DEBUG: every custom build IS a debug build, so that check was
+                // always true and this line ran at the provider's 1 Hz. At that rate it
+                // alone held the main logcat buffer down to about 20 SECONDS of history,
+                // which made the buffer useless for diagnosing anything — a home-panel
+                // outage on 2026-08-14 was first misread as "the code never ran" because
+                // its log lines had already rotated out. Turn it back on when needed with
+                //   adb shell setprop log.tag.LocationSidecar DEBUG
+                // which takes effect without a reinstall.
                 Log.d(TAG, "Location update (moved=" + String.format("%.1f", distanceMoved) + "m): " + latitude + ", " + longitude);
             }
             
