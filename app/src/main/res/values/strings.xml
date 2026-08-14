@@ -890,9 +890,16 @@
     <string name="settings_section_setup_guide">Setup guide</string>
     <string name="settings_section_setup_guide_subtitle">Re-run the getting-started steps, including the BYD auto-start fix that every install resets.</string>
     <string name="settings_section_privacy">Privacy &amp; data</string>
-    <string name="settings_section_overlay">Status overlay</string>
+    <string name="settings_section_overlay">Overlays</string>
     <string name="settings_section_security">Security</string>
-    <string name="settings_overlay_subtitle">Choose which floating status indicators stay visible.</string>
+    <!-- Pane subtitle. Was "…floating status indicators…" — the pane now also holds
+         the home dashboard, which is not an indicator. -->
+    <string name="settings_overlay_subtitle">Choose which floating surfaces stay visible.</string>
+    <string name="settings_overlay_pill_title">Status pill</string>
+    <string name="settings_overlay_pill_subtitle">Show the floating pill with the indicators below. Stays visible over every app.</string>
+    <string name="settings_overlay_dashboard_title">Home dashboard</string>
+    <string name="settings_overlay_dashboard_subtitle">Fill the unused part of the home screen with your own layout. Appears only while the home screen is in focus.</string>
+    <string name="settings_overlay_both_warning">The pill keeps the position you dragged it to and floats above the dashboard, so it can cover part of your layout. Running both is supported but not recommended.</string>
     <string name="settings_overlay_camera_title">Camera indicator</string>
     <string name="settings_overlay_camera_subtitle">Show the REC / PROX badge while recording is active.</string>
     <string name="settings_overlay_trip_title">Trip indicator</string>
@@ -901,6 +908,22 @@
     <string name="settings_overlay_replay_subtitle">Show the CLIP badge: green while a replay records, blue for 5s once saved, red when it fails. Appears only when a replay binding or automation exists.</string>
     <string name="settings_overlay_roadsense_title">RoadSense overlay</string>
     <string name="settings_overlay_roadsense_subtitle">Show the floating RoadSense pill and hazard card while RoadSense is enabled.</string>
+
+    <!-- Home dashboard: notification + the failures a panel cell can report.
+         Success is deliberately silent (the cell shows a checkmark), so there is
+         no "applied" string here. -->
+    <string name="home_panel_notif_title">Home dashboard</string>
+    <string name="home_panel_notif_text">Showing your layout on the home screen</string>
+    <string name="home_panel_err_failed">Could not reach OverDrive\'s service.</string>
+    <string name="home_panel_err_unknown_action">This button is set to something this version does not know how to do.</string>
+    <string name="home_panel_err_no_position">No seat position is assigned to this button yet.</string>
+    <string name="home_panel_err_seat_failed">Could not apply the position.</string>
+    <string name="home_panel_err_needs_ack">Seat positions need to be confirmed for this car once, on the Seat Positions page.</string>
+    <string name="home_panel_err_no_app">No app is assigned to this button yet.</string>
+    <string name="home_panel_err_app_failed">Could not open that app.</string>
+    <string name="home_panel_err_no_pair">This button needs two apps assigned to it.</string>
+    <string name="home_panel_err_split_failed">Could not open the first app in split screen.</string>
+    <string name="home_panel_err_split_second">Opened the first app, but not the second one.</string>
     <!-- Was "About & updates" — Check for Updates row was removed from
          the About page, so the menu / rail label is now just "About". -->
     <string name="settings_section_about">About</string>

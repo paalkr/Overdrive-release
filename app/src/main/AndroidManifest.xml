@@ -528,6 +528,19 @@
             android:foregroundServiceType="specialUse"
             android:exported="false" />
 
+        <!-- Home dashboard overlay - a WebView panel filling the strip the stock
+             launcher leaves as wallpaper, shown only while the home screen has
+             focus. A SIBLING of StatusOverlayService, not a mode of it: the pill
+             draws over every app, this one only over the launcher, and the two are
+             enabled independently.
+             exported=false: unlike the RoadSense overlay this is never launched by
+             the shell-uid daemon. It is driven from the app process, where both its
+             trigger (the accessibility service) and its WebView already live. -->
+        <service
+            android:name="com.overdrive.app.homepanel.HomePanelOverlayService"
+            android:foregroundServiceType="specialUse"
+            android:exported="false" />
+
         <!-- Media Playback Service - plays the "Play Audio" automation/keymap sound
              in the REAL app process. exported=true is REQUIRED: the CameraDaemon
              (shell uid 2000, synthetic context) launches it via

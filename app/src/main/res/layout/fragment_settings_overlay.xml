@@ -1,17 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Settings → Status overlay pane.
+  Settings → Floating surfaces pane.
 
-  Four switch rows in a single MaterialCardView for floating status surfaces:
-    1. Camera / recording indicator (REC / PROX)
-    2. Instant replay indicator (CLIP)
-    3. Trip indicator (TRIP)
-    4. RoadSense pill / hazard card
+  Three groups, one card each, because these are three independent surfaces and a
+  single card would imply one master governs all of them:
+
+    1. Status pill      — master + its three indicators (REC/PROX, CLIP, TRIP).
+                          Draws over EVERY app; no focus gating.
+    2. Home dashboard   — master only. Draws over the LAUNCHER only.
+                          Independent of the pill: enabling this must never imply
+                          the pill appears elsewhere. When both masters are on, the
+                          warning card below the row explains that the pill floats
+                          above the dashboard at whatever position it was dragged to.
+    3. RoadSense        — master for its own pill/hazard card, gated by the
+                          RoadSense feature master on its own page.
 
   IDs the Kotlin driver (SettingsOverlayFragment) reads:
-    rowOverlayCamera, swOverlayCamera
-    rowOverlayReplay, swOverlayReplay
-    rowOverlayTrip,   swOverlayTrip
+    rowOverlayPill,      swOverlayPill
+    rowOverlayCamera,    swOverlayCamera
+    rowOverlayReplay,    swOverlayReplay
+    rowOverlayTrip,      swOverlayTrip
+    rowOverlayDashboard, swOverlayDashboard
+    cardOverlayBothWarning
     rowOverlayRoadSense, swOverlayRoadSense
 -->
 <androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
@@ -46,7 +56,7 @@
             android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
             android:textColor="?attr/colorOnSurfaceVariant" />
 
-        <!-- ============== TOGGLES CARD ============== -->
+        <!-- ============== STATUS PILL ============== -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -60,9 +70,9 @@
                 android:orientation="vertical"
                 android:paddingVertical="4dp">
 
-                <!-- Camera / recording indicator -->
+                <!-- Pill master -->
                 <LinearLayout
-                    android:id="@+id/rowOverlayCamera"
+                    android:id="@+id/rowOverlayPill"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:background="?attr/selectableItemBackground"
@@ -83,6 +93,56 @@
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_marginStart="16dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/settings_overlay_pill_title"
+                            android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
+                            android:textColor="?attr/colorOnSurface" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="@string/settings_overlay_pill_subtitle"
+                            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                            android:textColor="?attr/colorOnSurfaceVariant" />
+                    </LinearLayout>
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/swOverlayPill"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:clickable="true"
+                        android:focusable="true" />
+                </LinearLayout>
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginHorizontal="@dimen/card_padding_standard"
+                    android:alpha="0.5"
+                    android:background="?attr/colorOutlineVariant" />
+
+                <!-- Camera / recording indicator (nested under the pill master) -->
+                <LinearLayout
+                    android:id="@+id/rowOverlayCamera"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:background="?attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:padding="@dimen/card_padding_standard"
+                    android:paddingStart="48dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
                         android:layout_weight="1"
                         android:orientation="vertical">
 
@@ -114,8 +174,8 @@
                     android:layout_width="match_parent"
                     android:layout_height="1dp"
                     android:layout_marginHorizontal="@dimen/card_padding_standard"
-                    android:background="?attr/colorOutlineVariant"
-                    android:alpha="0.5" />
+                    android:alpha="0.5"
+                    android:background="?attr/colorOutlineVariant" />
 
                 <!-- Instant replay indicator -->
                 <LinearLayout
@@ -127,19 +187,12 @@
                     android:focusable="true"
                     android:gravity="center_vertical"
                     android:orientation="horizontal"
-                    android:padding="@dimen/card_padding_standard">
-
-                    <ImageView
-                        android:layout_width="@dimen/card_icon_standard"
-                        android:layout_height="@dimen/card_icon_standard"
-                        android:contentDescription="@null"
-                        android:src="@drawable/ic_overlay_replay_active"
-                        app:tint="?attr/colorPrimary" />
+                    android:padding="@dimen/card_padding_standard"
+                    android:paddingStart="48dp">
 
                     <LinearLayout
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:layout_marginStart="16dp"
                         android:layout_weight="1"
                         android:orientation="vertical">
 
@@ -171,8 +224,8 @@
                     android:layout_width="match_parent"
                     android:layout_height="1dp"
                     android:layout_marginHorizontal="@dimen/card_padding_standard"
-                    android:background="?attr/colorOutlineVariant"
-                    android:alpha="0.5" />
+                    android:alpha="0.5"
+                    android:background="?attr/colorOutlineVariant" />
 
                 <!-- Trip indicator -->
                 <LinearLayout
@@ -184,19 +237,12 @@
                     android:focusable="true"
                     android:gravity="center_vertical"
                     android:orientation="horizontal"
-                    android:padding="@dimen/card_padding_standard">
-
-                    <ImageView
-                        android:layout_width="@dimen/card_icon_standard"
-                        android:layout_height="@dimen/card_icon_standard"
-                        android:contentDescription="@null"
-                        android:src="@drawable/ic_overlay_trip_active"
-                        app:tint="?attr/colorPrimary" />
+                    android:padding="@dimen/card_padding_standard"
+                    android:paddingStart="48dp">
 
                     <LinearLayout
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:layout_marginStart="16dp"
                         android:layout_weight="1"
                         android:orientation="vertical">
 
@@ -223,15 +269,112 @@
                         android:clickable="true"
                         android:focusable="true" />
                 </LinearLayout>
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
 
-                <View
+        <!-- ============== HOME DASHBOARD ============== -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/card_gap_vertical"
+            app:cardBackgroundColor="?attr/colorSurfaceContainer"
+            app:cardCornerRadius="@dimen/card_radius_standard"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingVertical="4dp">
+
+                <LinearLayout
+                    android:id="@+id/rowOverlayDashboard"
                     android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:layout_marginHorizontal="@dimen/card_padding_standard"
-                    android:background="?attr/colorOutlineVariant"
-                    android:alpha="0.5" />
+                    android:layout_height="wrap_content"
+                    android:background="?attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:padding="@dimen/card_padding_standard">
 
-                <!-- RoadSense pill / hazard card -->
+                    <ImageView
+                        android:layout_width="@dimen/card_icon_standard"
+                        android:layout_height="@dimen/card_icon_standard"
+                        android:contentDescription="@null"
+                        android:src="@drawable/ic_dashboard"
+                        app:tint="?attr/colorPrimary" />
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="16dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/settings_overlay_dashboard_title"
+                            android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
+                            android:textColor="?attr/colorOnSurface" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="@string/settings_overlay_dashboard_subtitle"
+                            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                            android:textColor="?attr/colorOnSurfaceVariant" />
+                    </LinearLayout>
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/swOverlayDashboard"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:clickable="true"
+                        android:focusable="true" />
+                </LinearLayout>
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Shown only while BOTH masters are on. Same treatment as the Tailscale
+             proxy warning: error container, no stroke. -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardOverlayBothWarning"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/card_gap_vertical"
+            android:visibility="gone"
+            app:cardBackgroundColor="?attr/colorErrorContainer"
+            app:cardCornerRadius="@dimen/card_radius_accent"
+            app:cardElevation="0dp"
+            app:strokeWidth="0dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:padding="14dp"
+                android:text="@string/settings_overlay_both_warning"
+                android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                android:textColor="?attr/colorOnErrorContainer" />
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ============== ROADSENSE ============== -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/card_gap_vertical"
+            app:cardBackgroundColor="?attr/colorSurfaceContainer"
+            app:cardCornerRadius="@dimen/card_radius_standard"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingVertical="4dp">
+
                 <LinearLayout
                     android:id="@+id/rowOverlayRoadSense"
                     android:layout_width="match_parent"

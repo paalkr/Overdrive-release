@@ -9,11 +9,14 @@ import android.util.Log;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
+import com.overdrive.app.homepanel.HomePanelFocus;
 import com.overdrive.app.ui.daemon.DaemonStartupManager;
 import com.overdrive.app.util.DaemonHttpClient;
 
 import java.net.HttpURLConnection;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -225,9 +228,51 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+
+        // Window changes tell the home dashboard whether the launcher is the thing on
+        // screen. This service is already subscribed to both event types (see
+        // onServiceConnected), so this costs no new permission.
+        //
+        // BOTH types are needed, learned on the car 2026-08-13: coming back to the
+        // ALREADY-RUNNING launcher fires TYPE_WINDOWS_CHANGED, not
+        // TYPE_WINDOW_STATE_CHANGED — the launcher's window already exists, so its
+        // state does not change, only the window stack does. Handling only
+        // WINDOW_STATE_CHANGED meant the panel never appeared when you pressed home,
+        // which is the only way anyone actually gets there.
+        //
+        // WINDOWS_CHANGED carries no useful getPackageName(), so the package comes from
+        // the active window instead. That read is not free and this event is chatty, so
+        // it is gated on the feature being switched on at all.
+        int type = event.getEventType();
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                || type == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            try {
+                if (HomePanelFocus.isWanted()) {
+                    String fg = null;
+                    String cls = null;
+                    if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                            && event.getPackageName() != null) {
+                        fg = event.getPackageName().toString();
+                        // The activity class distinguishes the launcher's home screen
+                        // from its app drawer and customize screens, which are separate
+                        // activities in the same package.
+                        if (event.getClassName() != null) cls = event.getClassName().toString();
+                    } else {
+                        fg = activeWindowPackage();
+                    }
+                    if (fg != null) HomePanelFocus.onForegroundPackage(this, fg, cls);
+                }
+            } catch (Throwable t) {
+                // A panel bug must never take down key filtering or seat capture.
+                Log.w(TAG, "home-panel focus update failed: " + t.getMessage());
+            }
+            return;
+        }
+
         // Only interested in the user long-pressing a BYD seat-position button (the
         // "save current position" gesture). Everything else is ignored cheaply.
-        if (event == null || event.getEventType() != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
+        if (event.getEventType() != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
         CharSequence pkg = event.getPackageName();
         if (pkg == null) return;
         if (!SEAT_POS_PKG.contentEquals(pkg) && !SEAT_POS_WIDGET_PKG.contentEquals(pkg)) return;
@@ -290,6 +335,88 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             if (src != null) { try { src.recycle(); } catch (Throwable ignored) {} }
         }
         return -1;
+    }
+
+    /**
+     * Package owning the active window, or null. Used for the events that do not carry
+     * a useful package name, and by the home dashboard's own watchdog through
+     * {@link #getRootInActiveWindow()}.
+     */
+    public String activeWindowPackage() {
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            if (root == null) return null;
+            CharSequence pkg = root.getPackageName();
+            return pkg == null ? null : pkg.toString();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (root != null) {
+                try { root.recycle(); } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    /**
+     * Titles of the launcher windows that identify which launcher surface is up. The BYD
+     * launcher keeps ONE window at a fixed id and retitles it per surface, so the title is
+     * the only thing that distinguishes them — the activity never changes. Observed on the
+     * car 2026-08-14 by driving the UI: plain home carries {@code BydLauncher_CardBarwindow};
+     * entering "edit home layout" replaces it with {@code EditWindow} at the same window id;
+     * the app drawer has neither (it is a real activity, {@code .Launcher}).
+     */
+    private static final String LAUNCHER_HOME_WINDOW = "BydLauncher_CardBarwindow";
+    private static final String LAUNCHER_EDIT_WINDOW = "EditWindow";
+
+    /** What the accessibility window list says is on screen right now. */
+    public static final class Surfaces {
+        /** Package owning the active window, or null when it cannot be read. */
+        public final String activePackage;
+        /** The launcher's plain-home window is present. */
+        public final boolean homeWindow;
+        /** The launcher's edit-layout window is present. */
+        public final boolean editWindow;
+
+        Surfaces(String activePackage, boolean homeWindow, boolean editWindow) {
+            this.activePackage = activePackage;
+            this.homeWindow = homeWindow;
+            this.editWindow = editWindow;
+        }
+    }
+
+    /**
+     * Read the current surfaces from the accessibility window list.
+     *
+     * <p>This exists because the window list answers questions the event stream cannot. An
+     * event's activity class is absent on window-stack changes and unchanged for a launcher
+     * that swaps surfaces inside one activity, so any verdict cached from the last event that
+     * happened to carry a class goes stale — which is what left the home panel drawn over the
+     * edit-layout screen, and made returning home take two presses (2026-08-14).
+     *
+     * <p>Titles only, deliberately: no {@code getRoot()} per window, which would walk node
+     * trees on a chatty callback.
+     */
+    public Surfaces surfaces() {
+        String active = activeWindowPackage();
+        boolean home = false;
+        boolean edit = false;
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo w : windows) {
+                    if (w == null) continue;
+                    CharSequence title = w.getTitle();
+                    if (title == null) continue;
+                    if (LAUNCHER_HOME_WINDOW.contentEquals(title)) home = true;
+                    else if (LAUNCHER_EDIT_WINDOW.contentEquals(title)) edit = true;
+                }
+            }
+        } catch (Throwable t) {
+            // A window-list read must never break key filtering or seat capture.
+            Log.w(TAG, "surfaces() failed: " + t.getMessage());
+        }
+        return new Surfaces(active, home, edit);
     }
 
     /**

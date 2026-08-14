@@ -1558,6 +1558,17 @@ public class StatusOverlayService extends Service {
         // sees a ghost pill they can't dismiss without killing the
         // app process.
         if (!running.get()) return;
+
+        // Pill master switch (statusOverlay.enabled, absent = on so the pill
+        // predating this key keeps working). Deliberately hides the WINDOW rather
+        // than stopping the service: this service also owns the camera-view ✕
+        // window and the camview/replay receivers, folded in here on purpose to
+        // share one reliable lifecycle. Stopping it would take the ✕ with it.
+        if (!com.overdrive.app.config.UnifiedConfigManager.isStatusOverlayEnabled()) {
+            setActionBarExpanded(false);
+            removeOverlay();
+            return;
+        }
         // User-facing visibility toggles. Stored in the unified config file
         // (/data/local/tmp/overdrive_config.json) rather than SharedPreferences
         // because both the app UID and the shell/daemon UID need to see the

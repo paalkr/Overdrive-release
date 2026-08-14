@@ -108,6 +108,9 @@ object PreferencesManager {
         appContextRef?.let { ctx ->
             try {
                 com.overdrive.app.overlay.StatusOverlayService.refreshTheme(ctx)
+                // The home dashboard needs the same nudge for the same reason: its
+                // palette lives in CSS and a plain Service never sees the flip.
+                com.overdrive.app.homepanel.HomePanelOverlayService.refreshTheme(ctx)
             } catch (e: Throwable) {
                 Log.w(TAG, "overlay theme refresh failed: ${e.message}")
             }
