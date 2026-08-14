@@ -91,6 +91,14 @@ public class TripApiHandler {
                 return handleGetRange();
             }
 
+            // Route: GET /api/trips/current — the trip in progress, for live
+            // readouts. Added for the home dashboard's glance cells; everything in
+            // it is tracked live by the recorder or derived from the trip's start
+            // values, and anything not yet knowable is null rather than zero.
+            if (path.equals("/api/trips/current") && "GET".equals(method)) {
+                return handleGetCurrent();
+            }
+
             // Route: GET/POST /api/trips/config
             if (path.equals("/api/trips/config")) {
                 if ("GET".equals(method)) return handleGetConfig();
@@ -624,6 +632,29 @@ public class TripApiHandler {
      * Reads current SoC from VehicleDataMonitor, speed from GpsMonitor,
      * temp from VehicleDataMonitor, DNA from database.
      */
+    /**
+     * The trip in progress. Always answers, never errors: an inactive trip is a
+     * legitimate answer ({@code active:false}), and so is a disabled trip system.
+     * The recent-consumption figure is present either way, since it comes from
+     * completed trips and is useful while parked.
+     */
+    private JSONObject handleGetCurrent() {
+        JSONObject response = new JSONObject();
+        try {
+            response.put("success", true);
+            response.put("enabled", manager.isEnabled());
+            response.put("trip", manager.currentTripSnapshot());
+        } catch (Exception e) {
+            logger.error("Error building current-trip response", e);
+            try {
+                response.put("success", false);
+                response.put("error", String.valueOf(e.getMessage()));
+            } catch (Exception ignored) {
+            }
+        }
+        return response;
+    }
+
     private JSONObject handleGetRange() {
         RangeEstimator estimator = manager.getRangeEstimator();
         TripDatabase db = manager.getDatabase();

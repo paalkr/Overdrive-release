@@ -582,6 +582,14 @@ object UnifiedConfigManager {
             config.put("keymap", it)
         }
 
+        // Home-dashboard section: {enabled, activeLayoutId, layouts:[...]}. Layouts
+        // are user-authored, so nothing to seed beyond the section itself; enabled
+        // defaults false at read time so an update never adds a surface to a home
+        // screen unasked. Same shape rationale as keymap above.
+        config.optJSONObject("homePanel") ?: JSONObject().also {
+            config.put("homePanel", it)
+        }
+
         // Surveillance defaults
         if (!surveillance.has("minObjectSize")) surveillance.put("minObjectSize", 0.08)
         if (!surveillance.has("aiConfidence")) surveillance.put("aiConfidence", 0.25)
@@ -3024,6 +3032,7 @@ object UnifiedConfigManager {
     @JvmStatic
     fun getStatusOverlay(): JSONObject {
         return loadConfig().optJSONObject("statusOverlay") ?: JSONObject().apply {
+            put("enabled", true)
             put("cameraVisible", true)
             put("tripVisible", true)
         }
@@ -3055,6 +3064,57 @@ object UnifiedConfigManager {
     fun setRemoteCommunication(remoteCommunication: JSONObject): Boolean {
         return updateSection("remoteCommunication", remoteCommunication)
     }
+    /**
+     * Master switch for the floating pill as a whole.
+     *
+     * Defaults to true: the pill predates this key, so an install that already
+     * has a statusOverlay section (or none at all) must keep showing it. The
+     * three per-segment flags stay independent of this — turning the master off
+     * hides the pill without forgetting which segments were wanted.
+     */
+    @JvmStatic
+    fun isStatusOverlayEnabled(): Boolean = getStatusOverlay().optBoolean("enabled", true)
+
+    /**
+     * Home-dashboard (home-screen panel) section.
+     *
+     * Deliberately a SIBLING of statusOverlay rather than a mode of it: the pill
+     * draws over every app, the dashboard only over the launcher, and the two are
+     * enabled independently. Enabling the dashboard must never imply the pill.
+     *
+     *   {enabled, activeLayoutId, layouts:[{id, name, cells:[{type,x,y,w,h,ref,label}]}]}
+     *
+     * Defaults to enabled=false so an app update never puts a new surface on
+     * anyone's home screen. `layouts` starts empty; the feature seeds its starter
+     * layout on first enable (HomePanelLayouts.defaultLayout) rather than baking
+     * a layout document into the config manager.
+     */
+    @JvmStatic
+    fun getHomePanel(): JSONObject {
+        return loadConfig().optJSONObject("homePanel") ?: JSONObject().apply {
+            put("enabled", false)
+            put("activeLayoutId", "daily")
+            put("layouts", org.json.JSONArray())
+        }
+    }
+
+    /**
+     * Update the home-dashboard section (shallow merge, like every other section).
+     */
+    @JvmStatic
+    fun setHomePanel(homePanel: JSONObject): Boolean {
+        return updateSection("homePanel", homePanel)
+    }
+
+    /**
+     * Update individual home-dashboard keys.
+     */
+    @JvmStatic
+    fun setHomePanelValues(values: Map<String, Any>): Boolean =
+        updateValues("homePanel", values)
+
+    @JvmStatic
+    fun isHomePanelEnabled(): Boolean = getHomePanel().optBoolean("enabled", false)
     
     /**
      * Get BYD Cloud config section.
