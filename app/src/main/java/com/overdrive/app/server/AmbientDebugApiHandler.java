@@ -100,6 +100,12 @@ public final class AmbientDebugApiHandler {
         // position rather than something read off the car.
         putFeature(fids, bodyworkDevice, "musicMode", BydFeatureIds.BODY_ATMOSPHERE_LIGHT_MUSIC);
         putFeature(fids, bodyworkDevice, "atmosphereSwitch", BydFeatureIds.BODY_ATMOSPHERE_LIGHT_SWITCH);
+        // The RAW colour-count config, next to the count derived from it below. AmbientProbe
+        // maps an unreadable config and a config of 4 to the same answer (30), so without the
+        // raw value there is no way to tell "this car has 30 colours" from "the read failed and
+        // 30 is the fallback" — which is exactly the question a continuous-looking picker on a
+        // 126-colour trim raises.
+        putFeature(fids, settingDevice, "ialColourConfig", 0x3FF0000A);
         r.put("featureIds", fids);
 
         // --- Route 3: BYD's own carsettings provider, what the native UI writes ---
