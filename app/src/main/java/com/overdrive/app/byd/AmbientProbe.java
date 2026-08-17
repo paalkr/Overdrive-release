@@ -67,6 +67,9 @@ public final class AmbientProbe {
     private static final int NIGHT_DIM_SET = 0x4EF42044;
     private static final int CUSTOM_MODE = 0x2730001A;
     private static final int CUSTOM_MODE_SET = 0x4C11302D;
+    /** How many colours this trim exposes; maps 3/5/6 to 6/63/126, anything else to 30. */
+    private static final int IAL_COLOUR_CONFIG = 0x3FF0000A;
+    private static final int DEFAULT_COLOUR_MAX = 30;
 
     private AmbientProbe() {}
 
@@ -119,13 +122,16 @@ public final class AmbientProbe {
      */
     public static int colourMax(Context ctx) {
         Object setting = device(ctx, SETTING_DEVICE);
-        Integer cfg = intOrNull(BydDeviceHelper.callGetter(setting, "getIALColorConfig"));
-        if (cfg == null) return 30;
+        if (setting == null) return DEFAULT_COLOUR_MAX;
+        // A feature-id read, not a named getter: BYD reads SET_IAL_COLOR_CONFIG off the HAL
+        // and maps it to a count. There is no getIALColorConfig() method to call.
+        Integer cfg = validOrNull(BydDeviceHelper.callGetSingle(setting, IAL_COLOUR_CONFIG));
+        if (cfg == null) return DEFAULT_COLOUR_MAX;
         switch (cfg) {
             case 3:  return 6;
             case 5:  return 63;
             case 6:  return 126;
-            default: return 30;
+            default: return DEFAULT_COLOUR_MAX;
         }
     }
 

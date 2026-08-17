@@ -67,14 +67,12 @@ const SeatPositions = {
         document.addEventListener('click', (e) => {
             if (!e.target.closest || !e.target.closest('.sp-menu-wrap')) this.closeMenus(null);
         });
-        // Swatch selection inside the dialog. Delegated because the swatches are rebuilt
-        // each time the picker opens, so a listener bound at render time would go stale.
-        document.getElementById('spDialogHtml').addEventListener('click', (e) => {
-            const sw = e.target.closest && e.target.closest('.sp-swatch-pick');
-            if (!sw) return;
-            const prev = document.querySelector('.sp-swatch-pick.is-picked');
-            if (prev) prev.classList.remove('is-picked');
-            sw.classList.add('is-picked');
+        // Colour readout while dragging. Delegated because the dialog's contents are rebuilt
+        // each time it opens, so a listener bound at render time would go stale.
+        document.getElementById('spDialogHtml').addEventListener('input', (e) => {
+            if (!e.target || e.target.id !== 'spColour') return;
+            const num = document.getElementById('spColourNum');
+            if (num) num.textContent = e.target.value;
         });
         // Poll the live geometry so "pose the seat, then save" works without a manual
         // refresh. Only while the tab is visible and only while ACC is on — with ACC off
@@ -692,24 +690,45 @@ const SeatPositions = {
         return (this.palette && this.palette[i]) ? this.palette[i] : 'transparent';
     },
 
+    /**
+     * The colour ramp as a CSS gradient. Used as the slider's track so the control reads as
+     * a continuous colour picker, which is what the car's own screen looks like.
+     *
+     * <p>The stop COUNT and the hex table are deliberately independent. The car exposes
+     * 6, 30, 63 or 126 colours depending on trim, and this app only knows the hex values for
+     * the 30-colour ramp — so a swatch per colour cannot be drawn on a bigger palette, while
+     * a gradient can: it shows the ramp, and the slider position picks the index along it.
+     */
+    paletteGradient() {
+        const cols = (this.palette && this.palette.length) ? this.palette : ['#000000', '#FFFFFF'];
+        const stops = cols.map((hex, i) =>
+            hex + ' ' + ((i / Math.max(1, cols.length - 1)) * 100).toFixed(2) + '%');
+        return 'linear-gradient(90deg, ' + stops.join(', ') + ')';
+    },
+
     async ambientColour(p) {
-        const max = Math.min(this.colourMax || 30, this.palette.length || 30);
-        const current = this.ambientColourOf(p);
-        const swatches = [];
-        for (let n = 1; n <= max; n++) {
-            swatches.push('<button type="button" class="sp-swatch-pick' + (n === current ? ' is-current' : '') +
-                '" data-colour="' + n + '" style="background:' + this.esc(this.paletteHex(n)) + '"></button>');
-        }
-        const html = '<div class="sp-swatches">' + swatches.join('') + '</div>';
+        const max = this.colourMax || 30;
+        const current = this.ambientColourOf(p) || 1;
+        const html =
+            '<div class="sp-colour-pick">' +
+                '<input type="range" id="spColour" class="sp-colour-range" min="1" max="' + max +
+                    '" value="' + current + '" style="background:' + this.esc(this.paletteGradient()) + '">' +
+                '<div class="sp-colour-meta">' +
+                    '<span id="spColourNum">' + current + '</span>' +
+                    '<span class="sp-colour-of">/ ' + max + '</span>' +
+                '</div>' +
+            '</div>';
         const ok = await this.confirm(
             this.t('seatpos.colour_title', 'Change the colour'),
             this.t('seatpos.colour_body', 'Sets the colour stored on this position. The car is not changed until the position is applied.'),
             html, false, this.t('seatpos.save', 'Save'));
         if (!ok) return;
-        const picked = document.querySelector('.sp-swatch-pick.is-picked');
-        if (!picked) return;
+        const slider = document.getElementById('spColour');
+        if (!slider) return;
+        const chosen = slider.value;
+        if (Number(chosen) === Number(this.ambientColourOf(p))) return;
         const res = await this.post('/api/positions/ambient-colour?id=' + encodeURIComponent(p.id) +
-            '&colour=' + encodeURIComponent(picked.dataset.colour)).catch(() => null);
+            '&colour=' + encodeURIComponent(chosen)).catch(() => null);
         if (!res || res.error) {
             this.toast((res && res.error) || this.t('seatpos.colour_failed', 'Could not change the colour'), 'error');
             return;
