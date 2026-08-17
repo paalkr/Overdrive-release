@@ -261,6 +261,37 @@ public final class PositionStore {
         }
     }
 
+    /**
+     * Replace the stored ambient block on an entry, captured or user-created.
+     *
+     * <p>Unlike geometry, this is allowed on CAPTURED entries too. A captured entry's
+     * geometry is off-limits because it mirrors the car's own slot, but the ambient block is
+     * something OverDrive added on top — BYD's slots never stored it — so there is no car
+     * state being contradicted, and re-capture overwrites it from the car anyway.
+     *
+     * @return the updated entry, or null if absent or the block is empty.
+     */
+    public JSONObject setAmbient(String id, JSONObject ambient) {
+        if (id == null || isEmpty(ambient)) return null;
+        synchronized (LOCK) {
+            JSONObject root = load();
+            JSONArray arr = root.optJSONArray("positions");
+            int i = indexOf(arr, id);
+            if (i < 0) return null;
+            JSONObject entry = arr.optJSONObject(i);
+            if (entry == null) return null;
+            try {
+                entry.put("ambient", ambient);
+                arr.put(i, entry);
+                save(root);
+            } catch (Throwable t) {
+                log("setAmbient failed: " + t);
+                return null;
+            }
+            return entry;
+        }
+    }
+
     /** Which parts an entry carries, for callers deciding what to apply or what to show. */
     public static boolean hasGeometry(JSONObject entry) {
         return entry != null && !isEmpty(entry.optJSONObject("axes"));

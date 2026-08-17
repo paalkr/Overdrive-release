@@ -132,6 +132,16 @@ public final class PositionsApiHandler {
             // "the car did not say" from "the lights are off".
             JSONObject ambient = readLiveAmbient();
             if (ambient != null && ambient.length() > 0) cur.put("ambient", ambient);
+            // The colour swatches, and how many of them THIS car has. The palette is a
+            // static table, but the bound is a HAL read and varies by trim (6/30/63/126),
+            // so a picker built from the table alone would offer colours the car rejects.
+            try {
+                Context cctx = resolveContext();
+                cur.put("ambientColourMax", com.overdrive.app.byd.AmbientProbe.colourMax(cctx));
+                cur.put("ambientPalette",
+                        new JSONArray(java.util.Arrays.asList(
+                                com.overdrive.app.byd.light.LightConstants.AMBIENT_COLOURS)));
+            } catch (Throwable ignore) { }
             HttpResponse.sendJson(out, cur.toString());
             return true;
         }
@@ -142,6 +152,7 @@ public final class PositionsApiHandler {
         if (pathOnly.equals("/api/positions/save"))    return handleSave(out, q, body);
         if (pathOnly.equals("/api/positions/rename"))  return handleRename(out, q, body);
         if (pathOnly.equals("/api/positions/alias"))   return handleAlias(out, q, body);
+        if (pathOnly.equals("/api/positions/ambient-colour")) return handleAmbientColour(out, q, body);
 
         HttpResponse.sendError(out, 404, "Unknown positions endpoint");
         return true;
@@ -380,6 +391,65 @@ public final class PositionsApiHandler {
             }
         }
         return outArr;
+    }
+
+    /**
+     * Change the ambient COLOUR stored on a position, without touching the car.
+     *
+     * <p>The counterpart to capture: geometry is capture-only because a typed axis value is
+     * a seat pose nobody chose, but a colour is a deliberate pick from a fixed palette, so
+     * choosing one directly is the natural way to do it. Editing the stored value rather
+     * than the car's live state means the position can be tuned without sitting in the car
+     * with the lights on.
+     *
+     * <p>Applies to whichever zone is named ({@code front}, {@code rear}, or {@code both},
+     * the default). Refuses a position with no ambient part rather than inventing one: a
+     * colour alone is not an ambient capture, and a half-built ambient block would apply as
+     * a colour change with no brightness, which is not what anyone saved.
+     */
+    private static boolean handleAmbientColour(OutputStream out, Map<String, String> q, String body) throws Exception {
+        String id = param(q, body, "id");
+        Integer colour = parseInt(param(q, body, "colour"));
+        if (id == null || colour == null) {
+            HttpResponse.sendJsonError(out, "ambient-colour needs an id and a colour");
+            return true;
+        }
+        JSONObject pos = PositionStore.getInstance().getById(id);
+        if (pos == null) { HttpResponse.sendJsonError(out, "no position with id=" + id); return true; }
+        JSONObject ambient = pos.optJSONObject("ambient");
+        if (ambient == null || ambient.length() == 0) {
+            HttpResponse.sendJsonError(out, "this position stores no ambient light to change");
+            return true;
+        }
+        int max = 30;
+        try { max = com.overdrive.app.byd.AmbientProbe.colourMax(resolveContext()); } catch (Throwable ignore) { }
+        if (colour < 1 || colour > max) {
+            HttpResponse.sendJsonError(out, "colour must be 1.." + max + " on this car");
+            return true;
+        }
+        String zone = param(q, body, "zone");
+        boolean front = zone == null || "both".equalsIgnoreCase(zone) || "front".equalsIgnoreCase(zone);
+        boolean rear = zone == null || "both".equalsIgnoreCase(zone) || "rear".equalsIgnoreCase(zone);
+        JSONObject next = new JSONObject(ambient.toString());
+        if (front) setZoneColour(next, "front", colour);
+        if (rear) setZoneColour(next, "rear", colour);
+        JSONObject entry = PositionStore.getInstance().setAmbient(id, next);
+        if (entry == null) { HttpResponse.sendJsonError(out, "could not update id=" + id); return true; }
+        log("ambient colour " + id + " zone=" + (zone == null ? "both" : zone) + " -> " + colour);
+        HttpResponse.sendJson(out, entry.toString());
+        return true;
+    }
+
+    /**
+     * Set a zone's colour only when that zone was captured. Creating the zone here would
+     * assert the car has it — and on a car whose rear zone never reported, an invented rear
+     * block would start applying a colour to lights that do not exist.
+     */
+    private static void setZoneColour(JSONObject ambient, String zone, int colour) throws Exception {
+        JSONObject z = ambient.optJSONObject(zone);
+        if (z == null) return;
+        z.put("colour", colour);
+        ambient.put(zone, z);
     }
 
     /**

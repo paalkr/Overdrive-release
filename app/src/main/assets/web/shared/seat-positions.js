@@ -24,6 +24,8 @@ const SeatPositions = {
     modelConfirmed: false,
     modelAcknowledged: false,
     appliedId: null,
+    palette: [],
+    colourMax: 30,
     _pollTimer: null,
 
     // Axis table. Order here is the display order. Groups match the two batches
@@ -64,6 +66,15 @@ const SeatPositions = {
         // Close any open row menu on an outside click.
         document.addEventListener('click', (e) => {
             if (!e.target.closest || !e.target.closest('.sp-menu-wrap')) this.closeMenus(null);
+        });
+        // Swatch selection inside the dialog. Delegated because the swatches are rebuilt
+        // each time the picker opens, so a listener bound at render time would go stale.
+        document.getElementById('spDialogHtml').addEventListener('click', (e) => {
+            const sw = e.target.closest && e.target.closest('.sp-swatch-pick');
+            if (!sw) return;
+            const prev = document.querySelector('.sp-swatch-pick.is-picked');
+            if (prev) prev.classList.remove('is-picked');
+            sw.classList.add('is-picked');
         });
         // Poll the live geometry so "pose the seat, then save" works without a manual
         // refresh. Only while the tab is visible and only while ACC is on — with ACC off
@@ -133,8 +144,14 @@ const SeatPositions = {
             const r = await fetch('/api/positions/current', { cache: 'no-store' });
             const j = await r.json();
             this.current = (j && j.axes) ? j.axes : null;
+            this.currentAmbient = (j && j.ambient) ? j.ambient : null;
+            // The swatch list is static but the BOUND is a HAL read and differs by trim, so
+            // the picker offers what this car has rather than what the table happens to hold.
+            if (Array.isArray(j && j.ambientPalette)) this.palette = j.ambientPalette;
+            if (j && j.ambientColourMax) this.colourMax = j.ambientColourMax;
         } catch (e) {
             this.current = null;
+            this.currentAmbient = null;
         }
         this.renderCurrent();
     },
@@ -321,6 +338,7 @@ const SeatPositions = {
                 // that is. Shown here so an aliased row can still be matched against what the
                 // car's own UI calls it.
                 (p.carName ? '<div class="sp-carname">' + this.esc(p.carName) + '</div>' : '') +
+                this.partsSummaryHtml(p) +
                 '<div class="sp-axes">' + this.axesHtml(p.axes) + '</div>' +
             '</div>' +
             '<div class="sp-row-actions">' +
@@ -334,6 +352,11 @@ const SeatPositions = {
                     '<div class="sp-menu">' +
                         '<button data-act="useInAutomation">' + this.ICONS.link +
                             this.esc(this.t('seatpos.use_in_automation', 'Use in an automation')) + '</button>' +
+                        // Colour is the one stored value worth picking directly: it comes from
+                        // a fixed palette, so choosing one is not the same as typing a seat
+                        // pose nobody chose. Only offered where there is ambient to change.
+                        (p.ambient ? '<button data-act="ambientColour">' + this.ICONS.pencil +
+                            this.esc(this.t('seatpos.change_colour', 'Change the colour')) + '</button>' : '') +
                         (isUser ? '<div class="sp-menu-sep"></div>' +
                             '<button data-act="rename">' + this.ICONS.pencil +
                                 this.esc(this.t('seatpos.rename', 'Rename')) + '</button>' +
@@ -436,6 +459,7 @@ const SeatPositions = {
         if (act === 'rename') return this.rename(p);
         if (act === 'alias') return this.setAlias(p);
         if (act === 'clearAlias') return this.clearAlias(p);
+        if (act === 'ambientColour') return this.ambientColour(p);
         if (act === 'delete') return this.remove(p);
     },
 
@@ -496,11 +520,40 @@ const SeatPositions = {
         this.render();
     },
 
+    /**
+     * The three save options, as radios inside the shared dialog. Ambient is offered only
+     * when the car actually reported some — an option that always fails is worse than an
+     * option that is not there.
+     */
+    partsHtml(selected) {
+        const opts = [
+            ['all', this.t('seatpos.parts_all', 'Everything'),
+                    this.t('seatpos.parts_all_hint', 'Seat, mirrors and the interior lighting')],
+            ['geometry', this.t('seatpos.parts_geometry', 'Seat & mirrors'),
+                    this.t('seatpos.parts_geometry_hint', 'The position the car is in right now')],
+            ['ambient', this.t('seatpos.parts_ambient', 'Ambient light'),
+                    this.t('seatpos.parts_ambient_hint', 'Colour, brightness and the light modes')]
+        ].filter(o => o[0] === 'geometry' || this.currentAmbient);
+        return '<div class="sp-parts">' + opts.map(([v, label, hint]) =>
+            '<label class="sp-part"><input type="radio" name="spParts" value="' + v + '"' +
+                (v === (selected || 'all') ? ' checked' : '') + '>' +
+            '<span class="sp-part-text"><span class="sp-part-label">' + this.esc(label) + '</span>' +
+            '<span class="sp-part-hint">' + this.esc(hint) + '</span></span></label>').join('') + '</div>';
+    },
+
+    chosenParts() {
+        const el = document.querySelector('input[name="spParts"]:checked');
+        return el ? el.value : 'all';
+    },
+
     async saveAsNew() {
         const name = await this.prompt(this.t('seatpos.save_new_title', 'Save current position'),
-            this.t('seatpos.save_new_body', 'Stores the seat and mirror geometry the car is in right now.'), '');
+            this.t('seatpos.save_new_body', 'Saves what the car is set to right now.'), '',
+            this.partsHtml('all'));
         if (!name) return;
-        const res = await this.post('/api/positions/create?name=' + encodeURIComponent(name)).catch(() => null);
+        const parts = this.chosenParts();
+        const res = await this.post('/api/positions/create?name=' + encodeURIComponent(name) +
+            '&parts=' + encodeURIComponent(parts)).catch(() => null);
         if (!res || res.error) {
             this.toast((res && res.error) || this.t('seatpos.save_failed', 'Could not save the position'), 'error');
             return;
@@ -513,11 +566,12 @@ const SeatPositions = {
         const uses = this.usedBy(p.id);
         const ok = await this.confirm(
             this.t('seatpos.overwrite_title', 'Overwrite {0}?').replace('{0}', p.name),
-            this.t('seatpos.overwrite_body', 'The current seat and mirror geometry replaces what is stored under this name. This cannot be undone.') +
-                (uses.length ? ' ' + this.t('seatpos.overwrite_used', 'These automations will start applying the new geometry.') : ''),
-            uses.length ? this.usesHtml(uses) : '');
+            this.t('seatpos.overwrite_body', 'What the car is set to right now replaces what is stored under this name. Anything you do not save here is left as it was. This cannot be undone.') +
+                (uses.length ? ' ' + this.t('seatpos.overwrite_used', 'These automations will start applying the new settings.') : ''),
+            this.partsHtml('all') + (uses.length ? this.usesHtml(uses) : ''));
         if (!ok) return;
-        const res = await this.post('/api/positions/save?id=' + encodeURIComponent(p.id)).catch(() => null);
+        const res = await this.post('/api/positions/save?id=' + encodeURIComponent(p.id) +
+            '&parts=' + encodeURIComponent(this.chosenParts())).catch(() => null);
         if (!res || res.error) {
             this.toast((res && res.error) || this.t('seatpos.save_failed', 'Could not save the position'), 'error');
             return;
@@ -606,6 +660,63 @@ const SeatPositions = {
             });
     },
 
+    /**
+     * What a position actually stores. Shown because two positions can now differ in kind,
+     * not just in value — "why did applying this not move the seat" is answered here rather
+     * than by applying it and watching nothing happen.
+     */
+    partsSummaryHtml(p) {
+        const bits = [];
+        if (p.axes && Object.keys(p.axes).length) bits.push(this.t('seatpos.parts_geometry', 'Seat & mirrors'));
+        if (p.ambient) {
+            const c = this.ambientColourOf(p);
+            bits.push(this.t('seatpos.parts_ambient', 'Ambient light') +
+                (c ? ' <span class="sp-swatch" style="background:' + this.esc(this.paletteHex(c)) + '"></span>' : ''));
+        }
+        if (!bits.length) return '';
+        return '<div class="sp-parts-summary">' + bits.join('<span class="sp-dot">·</span>') + '</div>';
+    },
+
+    /** The stored colour, front first — the zone a person looks at. */
+    ambientColourOf(p) {
+        const a = p && p.ambient;
+        if (!a) return null;
+        const f = a.front && a.front.colour;
+        const r = a.rear && a.rear.colour;
+        return f || r || null;
+    },
+
+    /** Palette is 1-based on the car; the array is not. */
+    paletteHex(colour) {
+        const i = Number(colour) - 1;
+        return (this.palette && this.palette[i]) ? this.palette[i] : 'transparent';
+    },
+
+    async ambientColour(p) {
+        const max = Math.min(this.colourMax || 30, this.palette.length || 30);
+        const current = this.ambientColourOf(p);
+        const swatches = [];
+        for (let n = 1; n <= max; n++) {
+            swatches.push('<button type="button" class="sp-swatch-pick' + (n === current ? ' is-current' : '') +
+                '" data-colour="' + n + '" style="background:' + this.esc(this.paletteHex(n)) + '"></button>');
+        }
+        const html = '<div class="sp-swatches">' + swatches.join('') + '</div>';
+        const ok = await this.confirm(
+            this.t('seatpos.colour_title', 'Change the colour'),
+            this.t('seatpos.colour_body', 'Sets the colour stored on this position. The car is not changed until the position is applied.'),
+            html, false, this.t('seatpos.save', 'Save'));
+        if (!ok) return;
+        const picked = document.querySelector('.sp-swatch-pick.is-picked');
+        if (!picked) return;
+        const res = await this.post('/api/positions/ambient-colour?id=' + encodeURIComponent(p.id) +
+            '&colour=' + encodeURIComponent(picked.dataset.colour)).catch(() => null);
+        if (!res || res.error) {
+            this.toast((res && res.error) || this.t('seatpos.colour_failed', 'Could not change the colour'), 'error');
+            return;
+        }
+        this.load();
+    },
+
     // ── dialogs ─────────────────────────────────────────────────────────────────
 
     _dialog(title, body, html, opts) {
@@ -645,8 +756,8 @@ const SeatPositions = {
         });
     },
 
-    prompt(title, body, value) {
-        return this._dialog(title, body, '', {
+    prompt(title, body, value, html) {
+        return this._dialog(title, body, html || '', {
             prompt: true, value: value,
             confirmLabel: this.t('seatpos.save', 'Save')
         });

@@ -257,3 +257,64 @@
 @media (prefers-reduced-motion: reduce) {
     .sp-batch.run .led { animation: none; }
 }
+
+/* ── what a position stores ─────────────────────────────────────────────────── */
+/* Two positions can now differ in KIND, not just in value, so the row says which. */
+.sp-parts-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--tertiary);
+}
+.sp-dot { opacity: 0.5; }
+.sp-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    vertical-align: middle;
+    border: 1px solid var(--outline-variant);
+}
+
+/* ── save-parts chooser ─────────────────────────────────────────────────────── */
+.sp-parts { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.sp-part {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--outline-variant);
+    border-radius: 10px;
+    cursor: pointer;
+}
+.sp-part:hover { background: var(--surface-container-high); }
+.sp-part input { margin-top: 2px; flex: none; }
+.sp-part-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sp-part-label { font-weight: 600; font-size: 14px; }
+.sp-part-hint { font-size: 12px; color: var(--tertiary); }
+
+/* ── colour picker ──────────────────────────────────────────────────────────── */
+/* Fixed-size wrapping grid: the palette is 30+ swatches on some trims and a single
+   row would either overflow the dialog or shrink each one past tapping size. */
+.sp-swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
+}
+.sp-swatch-pick {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    padding: 0;
+}
+/* The car's current colour is outlined; the one being picked is filled-outline, so the
+   two states stay distinguishable when they are the same swatch. */
+.sp-swatch-pick.is-current { border-color: var(--outline); }
+.sp-swatch-pick.is-picked {
+    border-color: var(--on-surface);
+    box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--on-surface);
+}
