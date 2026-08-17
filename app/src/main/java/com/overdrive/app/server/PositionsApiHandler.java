@@ -30,8 +30,11 @@ import java.util.Map;
  *       {@code force=YES} overrides. Also accepts the id in a JSON body, which is how the
  *       automation action reaches it.</li>
  *   <li>{@code POST /api/positions/delete?id=..}        — remove a stored position</li>
- *   <li>{@code POST /api/positions/create?name=..}      — save the live geometry as a new user entry</li>
- *   <li>{@code POST /api/positions/save?id=..}          — overwrite a user entry with the live geometry</li>
+ *   <li>{@code POST /api/positions/create?name=..&parts=..} — save the live state as a new user
+ *       entry. {@code parts} is {@code all} (default), {@code geometry} or {@code ambient}.</li>
+ *   <li>{@code POST /api/positions/save?id=..&parts=..} — save the live state over a user entry.
+ *       A part not asked for is left as it was, so ambient can be added to an existing
+ *       geometry-only position without re-posing the seat.</li>
  *   <li>{@code POST /api/positions/rename?id=..&name=..} — rename a user entry, id unchanged</li>
  *   <li>{@code POST /api/positions/alias?id=..&alias=..} — alias a CAPTURED entry; empty clears</li>
  * </ul>
@@ -123,7 +126,13 @@ public final class PositionsApiHandler {
         if (pathOnly.equals("/api/positions/current") && "GET".equals(method)) {
             JSONObject axes = readLive(out);
             if (axes == null) return true;
-            HttpResponse.sendJson(out, new JSONObject().put("axes", axes).toString());
+            JSONObject cur = new JSONObject().put("axes", axes);
+            // Live ambient rides along so the page can show what the car is set to now and
+            // offer "save this". Absent rather than empty when unreadable, so the UI can tell
+            // "the car did not say" from "the lights are off".
+            JSONObject ambient = readLiveAmbient();
+            if (ambient != null && ambient.length() > 0) cur.put("ambient", ambient);
+            HttpResponse.sendJson(out, cur.toString());
             return true;
         }
         if (pathOnly.equals("/api/positions/capture")) return handleCapture(out, q);
@@ -193,7 +202,12 @@ public final class PositionsApiHandler {
         String slotName = (ps[1] != null) ? ps[1] : ("Posisjon " + slot);
         String name = (profile != null ? profile : "default") + " - " + slotName;
         long now = System.currentTimeMillis();
-        JSONObject entry = PositionStore.getInstance().upsertCaptured(profile, slot, name, axes, now);
+        // A captured entry mirrors the car, so it takes the ambient state too — the whole
+        // point of storing it here is that the car's own slots carry geometry ONLY, so an
+        // OverDrive mirror that also remembers the lighting is strictly more than the native
+        // position it shadows. Null when the car will not report it; never a default.
+        JSONObject ambient = com.overdrive.app.byd.AmbientProbe.read(ctx);
+        JSONObject entry = PositionStore.getInstance().upsertCaptured(profile, slot, name, axes, ambient, now);
         log("captured profile=" + profile + " slot=" + slot + " name=" + name
                 + " model=" + resolvedModel() + " axes=" + axes);
         // Confirm the capture on screen. Without this the long-press is completely silent from
@@ -278,10 +292,16 @@ public final class PositionsApiHandler {
     private static boolean handleCreate(OutputStream out, Map<String, String> q, String body) throws Exception {
         String name = param(q, body, "name");
         if (name == null) { HttpResponse.sendJsonError(out, "create needs a name"); return true; }
-        JSONObject axes = readLive(out);
-        if (axes == null) return true;
-        JSONObject entry = PositionStore.getInstance().createUser(name, axes, System.currentTimeMillis());
-        if (entry == null) { HttpResponse.sendJsonError(out, "name must be 1..60 characters"); return true; }
+        Parts parts = Parts.parse(param(q, body, "parts"));
+        JSONObject axes = parts.geometry ? readLive(out) : null;
+        if (parts.geometry && axes == null) return true;   // readLive already answered
+        JSONObject ambient = parts.ambient ? readLiveAmbient() : null;
+        if (parts.ambient && ambient == null) {
+            HttpResponse.sendJsonError(out, "read of live ambient state returned nothing");
+            return true;
+        }
+        JSONObject entry = PositionStore.getInstance().createUser(name, axes, ambient, System.currentTimeMillis());
+        if (entry == null) { HttpResponse.sendJsonError(out, "name must be 1..60 characters, and at least one part must be saved"); return true; }
         log("created " + entry.optString("id") + " name=" + name);
         HttpResponse.sendJson(out, entry.toString());
         return true;
@@ -295,9 +315,15 @@ public final class PositionsApiHandler {
     private static boolean handleSave(OutputStream out, Map<String, String> q, String body) throws Exception {
         String id = param(q, body, "id");
         if (id == null) { HttpResponse.sendJsonError(out, "save needs an id"); return true; }
-        JSONObject axes = readLive(out);
-        if (axes == null) return true;
-        JSONObject entry = PositionStore.getInstance().updateAxes(id, axes, System.currentTimeMillis());
+        Parts parts = Parts.parse(param(q, body, "parts"));
+        JSONObject axes = parts.geometry ? readLive(out) : null;
+        if (parts.geometry && axes == null) return true;
+        JSONObject ambient = parts.ambient ? readLiveAmbient() : null;
+        if (parts.ambient && ambient == null) {
+            HttpResponse.sendJsonError(out, "read of live ambient state returned nothing");
+            return true;
+        }
+        JSONObject entry = PositionStore.getInstance().updateParts(id, axes, ambient, System.currentTimeMillis());
         if (entry == null) {
             HttpResponse.sendJsonError(out, "no user position with id=" + id + " (captured positions cannot be overwritten)");
             return true;
@@ -384,6 +410,37 @@ public final class PositionsApiHandler {
      * Read the live 13-axis bundle, writing the error response itself and returning null when it
      * cannot. Shared by create and save.
      */
+    /**
+     * Which parts of a position a save should capture. A captured entry always takes
+     * everything (it mirrors the car); this is the user-created side, where "save just my
+     * lighting onto this seat position" is a real thing to want.
+     *
+     * <p>Unknown values fall back to everything rather than erroring: the caller asked to
+     * save, and saving more than asked is recoverable while saving nothing looks like the
+     * button is broken.
+     */
+    private static final class Parts {
+        final boolean geometry;
+        final boolean ambient;
+        private Parts(boolean geometry, boolean ambient) {
+            this.geometry = geometry;
+            this.ambient = ambient;
+        }
+        static Parts parse(String v) {
+            String s = (v == null) ? "" : v.trim().toLowerCase(java.util.Locale.ROOT);
+            if (s.equals("geometry") || s.equals("seat")) return new Parts(true, false);
+            if (s.equals("ambient") || s.equals("light")) return new Parts(false, true);
+            return new Parts(true, true);
+        }
+    }
+
+    /** Live interior-light state, or null when the car will not report it. */
+    private static JSONObject readLiveAmbient() {
+        Context ctx = resolveContext();
+        if (ctx == null) return null;
+        return com.overdrive.app.byd.AmbientProbe.read(ctx);
+    }
+
     private static JSONObject readLive(OutputStream out) throws Exception {
         Context ctx = resolveContext();
         if (ctx == null) {
@@ -408,8 +465,13 @@ public final class PositionsApiHandler {
             HttpResponse.sendJson(out, 503, new JSONObject().put("error", "Daemon Context unavailable").toString());
             return true;
         }
+        boolean hasGeometry = PositionStore.hasGeometry(pos);
+        boolean hasAmbient = PositionStore.hasAmbient(pos);
+        if (!hasGeometry && !hasAmbient) {
+            HttpResponse.sendJsonError(out, "position stores nothing to apply");
+            return true;
+        }
         JSONObject axes = pos.optJSONObject("axes");
-        if (axes == null || axes.length() == 0) { HttpResponse.sendJsonError(out, "position has no axes"); return true; }
 
         // Applying on a model the axis map has not been confirmed against needs one explicit
         // acknowledgement, not a refusal. The write is a round trip — every value was read from
@@ -421,7 +483,11 @@ public final class PositionsApiHandler {
         String model = resolvedModel();
         PositionStore store = PositionStore.getInstance();
         boolean acked = "YES".equals(q.get("ack")) || "1".equals(q.get("ack"));
-        if (!PositionStore.isModelConfirmed(model) && !store.isModelAcknowledged(model)) {
+        // The acknowledgement exists because the AXIS ID MAP is what might differ on an
+        // unconfirmed model. Ambient rides on named SDK calls with the zone as an argument,
+        // not on a per-car id table, so an ambient-only position has nothing to mis-address
+        // and is not worth interrupting the user for.
+        if (hasGeometry && !PositionStore.isModelConfirmed(model) && !store.isModelAcknowledged(model)) {
             if (!acked) {
                 JSONObject r = new JSONObject();
                 r.put("needsModelAck", true);
@@ -432,16 +498,42 @@ public final class PositionsApiHandler {
             }
             store.acknowledgeModel(model);
         }
-        Map<String, Float> overrides = new LinkedHashMap<>();
-        for (java.util.Iterator<String> it = axes.keys(); it.hasNext(); ) {
-            String k = it.next();
-            overrides.put(k, (float) axes.optDouble(k, Double.NaN));
-        }
         boolean force = "YES".equals(q.get("force"));
-        JSONObject res = BodyworkSeatProbe.applyFull(ctx, overrides, force);
+        JSONObject res = new JSONObject();
+
+        // Geometry, when the position carries it. The two-batch sequence is all-or-nothing by
+        // construction: a mirror-only batch is accepted and inert, so applyFull always writes
+        // both batches and there is no half-geometry state to end up in.
+        if (hasGeometry) {
+            Map<String, Float> overrides = new LinkedHashMap<>();
+            for (java.util.Iterator<String> it = axes.keys(); it.hasNext(); ) {
+                String k = it.next();
+                overrides.put(k, (float) axes.optDouble(k, Double.NaN));
+            }
+            res = BodyworkSeatProbe.applyFull(ctx, overrides, force);
+        }
+
+        // Ambient, when the position carries it. Independent of the geometry write: a
+        // different device, no batching, and no gear gate — so an ambient-only position is
+        // free to apply while driving, which is exactly what makes one worth having.
+        if (hasAmbient) {
+            try {
+                res.put("ambient", com.overdrive.app.byd.AmbientProbe.apply(ctx, pos.optJSONObject("ambient")));
+            } catch (Throwable t) {
+                res.put("ambient", new JSONObject()
+                        .put("applied", false)
+                        .put("reason", t.getClass().getSimpleName() + ": " + t.getMessage()));
+            }
+        }
+
         res.put("appliedId", id);
-        log("apply " + id + " model=" + model + " confirmed=" + PositionStore.isModelConfirmed(model)
-                + " -> batch1=" + res.optJSONObject("batch1") + " batch2=" + res.optJSONObject("batch2"));
+        JSONArray applied = new JSONArray();
+        if (hasGeometry) applied.put("geometry");
+        if (hasAmbient) applied.put("ambient");
+        res.put("appliedParts", applied);
+        log("apply " + id + " model=" + model + " geometry=" + hasGeometry + " ambient=" + hasAmbient
+                + " -> batch1=" + res.optJSONObject("batch1") + " batch2=" + res.optJSONObject("batch2")
+                + " ambientRes=" + res.optJSONObject("ambient"));
         HttpResponse.sendJson(out, res.toString());
         return true;
     }
