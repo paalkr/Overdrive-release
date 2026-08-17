@@ -1,5 +1,6 @@
 package com.overdrive.app.server;
 
+import com.overdrive.app.byd.AmbientProbe;
 import com.overdrive.app.byd.BydCarSettings;
 import com.overdrive.app.byd.BydDataCollector;
 import com.overdrive.app.byd.BydDeviceHelper;
@@ -107,6 +108,20 @@ public final class AmbientDebugApiHandler {
         putSetting(settings, "lighting_ambient_brightness");
         putSetting(settings, "lighting_ambient_field");
         r.put("settings", settings);
+
+        // --- The capture bundle a saved position would actually store, via the same
+        //     code path apply() reads back. Reported alongside the raw routes above so a
+        //     disagreement between "what we would store" and "what the HAL says" is
+        //     visible in one response rather than needing two calls to compare.
+        try {
+            android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            JSONObject captured = AmbientProbe.read(ctx);
+            r.put("capture", captured != null ? captured : JSONObject.NULL);
+            r.put("colourMax", AmbientProbe.colourMax(ctx));
+        } catch (Throwable t) {
+            r.put("capture", JSONObject.NULL);
+            r.put("captureError", t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
 
         // --- What the app actually consumes today ---
         JSONObject derived = new JSONObject();
