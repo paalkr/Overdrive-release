@@ -185,9 +185,20 @@ public final class AmbientProbe {
         if (ambient.has("musicMode")) steps.put("musicModeOff", writeSwitch(setting, MUSIC_MODE_SET, false));
         if (ambient.has("dynamicColours")) steps.put("dynamicColoursOff", writeSwitch(light, DYNAMIC_COLOURS_SET, false));
 
-        // 3. Per-zone colour + brightness.
-        steps.put("front", applyZone(setting, AREA_FRONT, ambient.optJSONObject("front")));
-        steps.put("rear", applyZone(setting, AREA_REAR, ambient.optJSONObject("rear")));
+        // 3. Per-zone colour + brightness. Writing a zone selects it as a side effect, so the
+        //    zone the capture had selected goes LAST and the selector ends where it started —
+        //    no extra call, and nothing left pointing at whichever zone happened to be written
+        //    second. (An earlier attempt restored the selection explicitly afterwards, but the
+        //    only selection call reachable from here is the 2-arg setIALArea, which reports
+        //    success without selecting anything.)
+        boolean rearLast = ambient.optInt("area", AREA_FRONT) == AREA_REAR;
+        int first = rearLast ? AREA_FRONT : AREA_REAR;
+        int second = rearLast ? AREA_REAR : AREA_FRONT;
+        steps.put(first == AREA_FRONT ? "front" : "rear",
+                applyZone(first, ambient.optJSONObject(first == AREA_FRONT ? "front" : "rear")));
+        settle();
+        steps.put(second == AREA_FRONT ? "front" : "rear",
+                applyZone(second, ambient.optJSONObject(second == AREA_FRONT ? "front" : "rear")));
 
         // 4. Standing preferences that do not interact with colour.
         if (ambient.has("nightAutoDim")) {
@@ -197,16 +208,7 @@ public final class AmbientProbe {
             steps.put("customMode", BydDeviceHelper.sendSetCommand(light, CUSTOM_MODE_SET, ambient.getInt("customMode")));
         }
 
-        // 5. Put the zone selector back where the capture had it. Applying a position walks
-        //    the selector through each zone to write it, so without this the car is left on
-        //    whichever zone happened to be written last — a visible change to the car's own
-        //    ambient screen that the user never asked for.
-        if (ambient.has("area")) {
-            int area = ambient.getInt("area");
-            if (area >= 1) steps.put("areaRestored", ok(BydDeviceHelper.callMethod(setting, "setIALArea", area, 0)));
-        }
-
-        // 6. Restore the dynamic modes last, so they take over from a known static state
+        // 4b. Restore the dynamic modes last, so they take over from a known static state
         //    rather than fighting the writes above.
         if (wantMusic) steps.put("musicModeOn", writeSwitch(setting, MUSIC_MODE_SET, true));
         if (wantDynamic) steps.put("dynamicColoursOn", writeSwitch(light, DYNAMIC_COLOURS_SET, true));
@@ -223,39 +225,42 @@ public final class AmbientProbe {
     }
 
     /**
-     * One zone's colour and brightness.
+     * One zone's colour and brightness, through {@link BydDataCollector}'s zoned API.
      *
-     * <p><b>The area must be SELECTED before the write, even though the setter takes it as an
-     * argument.</b> BYD's own slider passes {@code getAmbientAreaValue()} — the currently
-     * selected area — so the argument has to MATCH the selection rather than establish it.
-     * Writing area 1 while area 2 is selected returns result code 0 and changes nothing:
-     * accepted and inert, the same failure shape as a mirror-only seat batch.
+     * <p>Deliberately NOT a direct {@code setIALColor} call. Selecting the zone first is
+     * required — a write to an unselected area returns result code 0 and changes nothing —
+     * and the selection itself is fiddly enough to be worth not reimplementing: there are
+     * two {@code setIALArea} overloads, the 2-arg one BYD's own UI uses returns 0 without
+     * selecting anything on this car, and the working path needs the 1-arg form plus a
+     * light-device feature-id fallback for trims that refuse it. All of that already exists
+     * behind {@code setAmbientLightZoned} / {@code setAmbientBrightnessZoned}, which are
+     * field-proven; a second implementation here just means two things to get wrong.
      *
-     * <p>Proven on the car 2026-08-20: without the select, a colour write reported success and
-     * the colour never moved; with it, front and rear were set to different colours
-     * simultaneously and both read back correctly.
+     * <p>Brightness goes in as a percentage because that is the public signature, and
+     * {@code level * 20} round-trips exactly through its {@code round(percent/100*5)} —
+     * 0→0 through 5→5 — so the captured 0..5 level is preserved.
      */
-    private static JSONObject applyZone(Object setting, int area, JSONObject zone) throws JSONException {
+    private static JSONObject applyZone(int area, JSONObject zone) throws JSONException {
         JSONObject r = new JSONObject();
         if (zone == null) {
             r.put("skipped", "not captured");
             return r;
         }
-        boolean hasWork = zone.has("colour") || zone.has("brightness");
-        if (!hasWork) {
-            r.put("skipped", "nothing stored for this zone");
+        String zoneName = (area == AREA_REAR) ? "rear" : "front";
+        BydDataCollector collector;
+        try {
+            collector = BydDataCollector.getInstance();
+        } catch (Throwable t) {
+            r.put("skipped", "collector unavailable");
             return r;
         }
-        // Select first. Reported rather than asserted: if the selection is refused, the writes
-        // below are the ones that will silently do nothing, and that is worth being able to see.
-        r.put("areaSelected", ok(BydDeviceHelper.callMethod(setting, "setIALArea", area, 0)));
         if (zone.has("colour")) {
-            int colour = zone.getInt("colour");
-            r.put("colour", ok(BydDeviceHelper.callMethod(setting, "setIALColor", area, colour, 0)));
+            r.put("colour", collector.setAmbientLightZoned(zoneName, zone.getInt("colour")));
         }
         if (zone.has("brightness")) {
+            if (zone.has("colour")) settle();   // same zone, but still two writes in a row
             int level = clamp(zone.getInt("brightness"), 0, BRIGHTNESS_MAX);
-            r.put("brightness", ok(BydDeviceHelper.callMethod(setting, "setIALBrightness", area, level, 0)));
+            r.put("brightness", collector.setAmbientBrightnessZoned(zoneName, level * 20));
         }
         return r;
     }
@@ -263,16 +268,24 @@ public final class AmbientProbe {
     // ── plumbing ────────────────────────────────────────────────────────────────
 
     /**
-     * BYD devices refuse an ordinary app context; the permissive wrapper is what makes
-     * them answer from the daemon.
+     * The device handle, preferring {@link BydDataCollector}'s OWN field over building one.
      *
-     * <p>Passing the permissive context to {@code getInstance} is not sufficient on its
-     * own: these devices are singletons, so one created earlier by something else keeps
-     * whatever context it was built with. {@code swapContext} overwrites the cached field,
-     * which is the step that actually makes the permission gate pass. Reuses
-     * {@link BodyworkSeatProbe}'s pair rather than adding a third copy of both.
+     * <p>The earlier version wrapped the singleton in a PermissiveContext and called
+     * {@code swapContext} to install it. That works for reading, but it MUTATES a singleton
+     * the rest of the app shares — and the first write issued after the swap is silently
+     * lost. Measured on the car: applying two zones back to back, whichever zone was written
+     * FIRST never landed and the second always did, regardless of which one it was. A single
+     * write from elsewhere in the app, with no swap before it, always worked.
+     *
+     * <p>So take the collector's handle as-is. It is already built with a context the HAL
+     * accepts — that is how every other vehicle command in the app works — and nothing here
+     * has to disturb it. The permissive build is kept only as a fallback for the case where
+     * the collector has no handle at all, where a mutated singleton is not a concern because
+     * there is no shared one to mutate.
      */
     private static Object device(Context ctx, String cls) {
+        Object own = collectorField(cls);
+        if (own != null) return own;
         if (ctx == null) return null;
         try {
             Context app = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
@@ -280,6 +293,26 @@ public final class AmbientProbe {
             Object device = BydDeviceHelper.getDevice(cls, permissive);
             if (device != null) BodyworkSeatProbe.swapContext(device, permissive);
             return device;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Read the collector's private device handle without touching it. Same reflection the
+     * ambient debug endpoint uses; the collector exposes typed helpers rather than the
+     * devices themselves, and this needs the device to reach feature ids it has no helper for.
+     */
+    private static Object collectorField(String cls) {
+        String field = cls.equals(LIGHT_DEVICE) ? "lightDevice"
+                : cls.equals(SETTING_DEVICE) ? "settingDevice"
+                : null;
+        if (field == null) return null;
+        try {
+            BydDataCollector c = BydDataCollector.getInstance();
+            java.lang.reflect.Field f = c.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            return f.get(c);
         } catch (Throwable t) {
             return null;
         }
@@ -310,6 +343,28 @@ public final class AmbientProbe {
 
     private static Integer validOrNull(int v) {
         return v < 0 ? null : v;
+    }
+
+    /**
+     * Let one ambient write land before the next.
+     *
+     * <p>Measured on the car: two zone writes issued back to back in-process lose the FIRST
+     * one every time, whichever zone it is, while the same two writes made as separate HTTP
+     * requests both land — the round-trip between them was the only difference. So the HAL
+     * needs a moment between a zone selection and the next one, and in-process calls are fast
+     * enough to outrun it.
+     *
+     * <p>Same shape as the seat apply, which spaces its two bodywork batches 50 ms apart for
+     * the same reason. Erring generously here: the whole apply is a handful of writes on a
+     * user action, so a few hundred milliseconds costs nothing anyone can feel, while being
+     * too quick costs a silently-dropped setting.
+     */
+    private static void settle() {
+        try {
+            Thread.sleep(150L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static int clamp(int v, int lo, int hi) {
