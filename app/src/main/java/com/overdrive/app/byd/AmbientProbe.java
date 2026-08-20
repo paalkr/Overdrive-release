@@ -69,7 +69,8 @@ public final class AmbientProbe {
     private static final int CUSTOM_MODE_SET = 0x4C11302D;
     /** How many colours this trim exposes; maps 3/5/6 to 6/63/126, anything else to 30. */
     private static final int IAL_COLOUR_CONFIG = 0x3FF0000A;
-    private static final int DEFAULT_COLOUR_MAX = 30;
+    /** BYD's default SEEKBAR max — one less than the colour count (see colourMax). */
+    private static final int DEFAULT_SEEKBAR_MAX = 30;
 
     private AmbientProbe() {}
 
@@ -116,23 +117,31 @@ public final class AmbientProbe {
     }
 
     /**
-     * The palette size this trim exposes, so the UI offers the colours the car has rather
-     * than a hardcoded range. Falls back to BYD's own default when the config is
-     * unreadable.
+     * The HIGHEST valid colour on this trim, so the UI offers the colours the car actually
+     * has rather than a hardcoded range.
+     *
+     * <p>Note the {@code +1}. BYD's {@code getAmbientColorMax()} returns a SEEKBAR MAX, and
+     * its slider writes {@code progress + 1} — so a seekbar max of 30 means 31 colours,
+     * numbered 1..31. Measured on the car 2026-08-20 by dragging BYD's own slider to each
+     * end: it pins at 31, and the app's 31-entry palette table matches exactly.
+     *
+     * <p>Reading the config rather than assuming still matters, because the seekbar max is
+     * 6, 30, 63 or 126 depending on trim — this car is simply the 30 one.
      */
     public static int colourMax(Context ctx) {
         Object setting = device(ctx, SETTING_DEVICE);
-        if (setting == null) return DEFAULT_COLOUR_MAX;
+        if (setting == null) return DEFAULT_SEEKBAR_MAX + 1;
         // A feature-id read, not a named getter: BYD reads SET_IAL_COLOR_CONFIG off the HAL
-        // and maps it to a count. There is no getIALColorConfig() method to call.
+        // and maps it to a seekbar max. There is no getIALColorConfig() method to call.
         Integer cfg = validOrNull(BydDeviceHelper.callGetSingle(setting, IAL_COLOUR_CONFIG));
-        if (cfg == null) return DEFAULT_COLOUR_MAX;
-        switch (cfg) {
-            case 3:  return 6;
-            case 5:  return 63;
-            case 6:  return 126;
-            default: return DEFAULT_COLOUR_MAX;
+        int seekbarMax;
+        switch (cfg == null ? -1 : cfg) {
+            case 3:  seekbarMax = 6; break;
+            case 5:  seekbarMax = 63; break;
+            case 6:  seekbarMax = 126; break;
+            default: seekbarMax = DEFAULT_SEEKBAR_MAX; break;
         }
+        return seekbarMax + 1;
     }
 
     // ── apply ───────────────────────────────────────────────────────────────────
