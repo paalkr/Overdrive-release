@@ -188,12 +188,21 @@ public final class AmbientProbe {
             steps.put("customMode", BydDeviceHelper.sendSetCommand(light, CUSTOM_MODE_SET, ambient.getInt("customMode")));
         }
 
-        // 5. Restore the dynamic modes last, so they take over from a known static state
+        // 5. Put the zone selector back where the capture had it. Applying a position walks
+        //    the selector through each zone to write it, so without this the car is left on
+        //    whichever zone happened to be written last — a visible change to the car's own
+        //    ambient screen that the user never asked for.
+        if (ambient.has("area")) {
+            int area = ambient.getInt("area");
+            if (area >= 1) steps.put("areaRestored", ok(BydDeviceHelper.callMethod(setting, "setIALArea", area, 0)));
+        }
+
+        // 6. Restore the dynamic modes last, so they take over from a known static state
         //    rather than fighting the writes above.
         if (wantMusic) steps.put("musicModeOn", writeSwitch(setting, MUSIC_MODE_SET, true));
         if (wantDynamic) steps.put("dynamicColoursOn", writeSwitch(light, DYNAMIC_COLOURS_SET, true));
 
-        // 6. Main switch OFF last when the capture had it off — doing it first would make
+        // 7. Main switch OFF last when the capture had it off — doing it first would make
         //    every write above a no-op against dark lights.
         if (ambient.has("mainSwitch") && !ambient.getBoolean("mainSwitch")) {
             steps.put("mainSwitch", writeSwitch(light, MAIN_SWITCH_SET, false));
@@ -205,9 +214,17 @@ public final class AmbientProbe {
     }
 
     /**
-     * One zone's colour and brightness. Uses the 3-arg setters BYD's own sliders call,
-     * which carry the area explicitly — so no separate area-selection step is needed and
-     * the currently-selected zone is left alone.
+     * One zone's colour and brightness.
+     *
+     * <p><b>The area must be SELECTED before the write, even though the setter takes it as an
+     * argument.</b> BYD's own slider passes {@code getAmbientAreaValue()} — the currently
+     * selected area — so the argument has to MATCH the selection rather than establish it.
+     * Writing area 1 while area 2 is selected returns result code 0 and changes nothing:
+     * accepted and inert, the same failure shape as a mirror-only seat batch.
+     *
+     * <p>Proven on the car 2026-08-20: without the select, a colour write reported success and
+     * the colour never moved; with it, front and rear were set to different colours
+     * simultaneously and both read back correctly.
      */
     private static JSONObject applyZone(Object setting, int area, JSONObject zone) throws JSONException {
         JSONObject r = new JSONObject();
@@ -215,6 +232,14 @@ public final class AmbientProbe {
             r.put("skipped", "not captured");
             return r;
         }
+        boolean hasWork = zone.has("colour") || zone.has("brightness");
+        if (!hasWork) {
+            r.put("skipped", "nothing stored for this zone");
+            return r;
+        }
+        // Select first. Reported rather than asserted: if the selection is refused, the writes
+        // below are the ones that will silently do nothing, and that is worth being able to see.
+        r.put("areaSelected", ok(BydDeviceHelper.callMethod(setting, "setIALArea", area, 0)));
         if (zone.has("colour")) {
             int colour = zone.getInt("colour");
             r.put("colour", ok(BydDeviceHelper.callMethod(setting, "setIALColor", area, colour, 0)));
