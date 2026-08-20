@@ -7,15 +7,27 @@
       let onKeyEvent intercept hardware buttons (steering-wheel / dash keys) BEFORE
       the OEM handler, so the user can rebind them. This is a standard a11y
       capability — no root, no signature permission, no INJECT_EVENTS.
-  We keep accessibilityEventTypes empty: we observe NO window/view events, only
-  filter key events, so this adds no event-callback overhead.
+   3. Autostart auto-enable — AutoStartEnabler drives BYD's
+      com.byd.appstartmanagement dialog through the a11y APIs.
+      canRetrieveWindowContent + flagRetrieveInteractiveWindows are what let
+      getWindows() reach that dialog's window: it is mShowToOwnerOnly, so
+      getRootInActiveWindow returns the launcher and uiautomator cannot see it
+      at all. canPerformGestures backs the dispatchGesture coordinate-tap
+      fallback, and typeWindowsChanged notices the dialog appear — the enabler
+      polls as its primary mechanism, so that event is belt-and-suspenders.
+
+  Event types and flags are the UNION of (2) and (3). notificationTimeout stays
+  at the key filter's 100 ms: a longer value coalesces event delivery, which is
+  wrong for a service that also filters hardware keys, and the enabler does not
+  depend on it.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
-    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagRequestFilterKeyEvents|flagReportViewIds"
+    android:accessibilityFlags="flagRequestFilterKeyEvents|flagRetrieveInteractiveWindows|flagReportViewIds"
     android:canRequestFilterKeyEvents="true"
     android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
     android:notificationTimeout="100"
     android:settingsActivity="com.overdrive.app.ui.MainActivity" />

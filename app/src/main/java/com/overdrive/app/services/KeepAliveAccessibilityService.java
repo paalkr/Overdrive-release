@@ -3,6 +3,8 @@ package com.overdrive.app.services;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
@@ -30,7 +32,24 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     private static final String TAG = "KeepAliveA11y";
 
-    private static KeepAliveAccessibilityService instance;
+    // volatile: written on the main thread in onServiceConnected/onUnbind/onDestroy,
+    // read from callers on other threads (the setup wizard's autostart button).
+    private static volatile KeepAliveAccessibilityService instance;
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /** The bound service, or null when the a11y service isn't enabled or connected. */
+    public static KeepAliveAccessibilityService getInstance() {
+        return instance;
+    }
+
+    /**
+     * Result of a deliberate, button-triggered autostart-enable run. Delivered on the
+     * main thread so UI callers can update views directly.
+     */
+    public interface Callback {
+        void onResult(boolean success, AutoStartEnabler.Result result);
+    }
 
     public static boolean isRunning() {
         return instance != null;
@@ -194,6 +213,53 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             Log.w(TAG, "onKeyEvent error, passing through: " + t.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Drive {@link AutoStartEnabler} once, off the main thread, reporting the outcome back
+     * on it.
+     *
+     * <p>Triggered deliberately from the setup wizard's button and never automatically. An
+     * earlier version ran it from onServiceConnected, which re-fired on every reconnect and
+     * app-churn and repeatedly popped BYD's dialog in the user's face. Single-flight is
+     * enforced inside the enabler, so a double-tap cannot double-run.
+     */
+    public void runAutoStartEnabler(final Callback callback) {
+        try {
+            final AutoStartEnabler enabler = new AutoStartEnabler(this);
+            Thread worker = new Thread(() -> {
+                AutoStartEnabler.Result result = null;
+                try {
+                    result = enabler.run();
+                } catch (Throwable t) {
+                    Log.w(TAG, "runAutoStartEnabler worker threw: " + t);
+                }
+                final AutoStartEnabler.Result fResult = result;
+                final boolean success = result == AutoStartEnabler.Result.SUCCESS
+                        || result == AutoStartEnabler.Result.ALREADY_OFF;
+                mainHandler.post(() -> {
+                    if (callback == null) return;
+                    try {
+                        callback.onResult(success, fResult);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "AutoStartEnabler callback threw: " + t);
+                    }
+                });
+            }, "autostart-enabler");
+            worker.start();
+        } catch (Throwable t) {
+            Log.w(TAG, "runAutoStartEnabler failed to start worker: " + t);
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(false, null));
+            }
+        }
+    }
+
+    @Override
+    public boolean onUnbind(Intent intent) {
+        Log.i(TAG, "AccessibilityService unbound — clearing instance");
+        instance = null;
+        return super.onUnbind(intent);
     }
 
     @Override
