@@ -27,11 +27,25 @@ public class TelemetrySample {
      *  than WGS84-ellipsoidal. The two differ by the local geoid undulation
      *  (tens of metres); a mid-trip source flip must reset elevation deltas. */
     public final boolean altitudeIsMsl;
+    /** The GPS fix's own wall-clock time (epoch ms); 0 = unreported. Distinct from
+     *  {@link #timestampMs}, which is when the sample was RECORDED. A fix arrives
+     *  already ~0.7s old, and seconds old through turns, so anything aligning this
+     *  track against another recording needs when the position was TAKEN. */
+    public final long gpsFixTimeUtc;
 
     public TelemetrySample(long timestampMs, int speedKmh, int accelPedalPercent,
                            int brakePedalPercent, boolean brakePedalPressed,
                            int gearMode, double lat, double lon, double altitude,
                            double verticalAccuracyM, boolean altitudeIsMsl) {
+        this(timestampMs, speedKmh, accelPedalPercent, brakePedalPercent, brakePedalPressed,
+                gearMode, lat, lon, altitude, verticalAccuracyM, altitudeIsMsl, 0L);
+    }
+
+    public TelemetrySample(long timestampMs, int speedKmh, int accelPedalPercent,
+                           int brakePedalPercent, boolean brakePedalPressed,
+                           int gearMode, double lat, double lon, double altitude,
+                           double verticalAccuracyM, boolean altitudeIsMsl,
+                           long gpsFixTimeUtc) {
         this.timestampMs = timestampMs;
         this.speedKmh = speedKmh;
         this.accelPedalPercent = accelPedalPercent;
@@ -43,6 +57,7 @@ public class TelemetrySample {
         this.altitude = altitude;
         this.verticalAccuracyM = verticalAccuracyM;
         this.altitudeIsMsl = altitudeIsMsl;
+        this.gpsFixTimeUtc = gpsFixTimeUtc;
     }
 
     /**
@@ -64,6 +79,8 @@ public class TelemetrySample {
             json.put("lo", lon);
             json.put("al", altitude);
             if (verticalAccuracyM > 0) json.put("va", verticalAccuracyM);
+            // Omitted when unreported so existing files stay byte-identical in shape.
+            if (gpsFixTimeUtc > 0) json.put("gt", gpsFixTimeUtc);
             if (altitudeIsMsl) json.put("am", true);
         } catch (Exception e) {
             // JSONObject.put only throws on null key, which won't happen here
@@ -86,7 +103,8 @@ public class TelemetrySample {
                 json.optDouble("lo", 0.0),
                 json.optDouble("al", 0.0),
                 json.optDouble("va", 0.0),
-                json.optBoolean("am", false)
+                json.optBoolean("am", false),
+                json.optLong("gt", 0L)
         );
     }
 }
