@@ -71,6 +71,10 @@ public class MqttConnectionManager {
     // Telemetry cache — prevents multiple MQTT threads from hammering BYD hardware concurrently.
     // Poll the car once, cache the result, let all publishers grab the cached JSON.
     private volatile JSONObject lastCachedTelemetry = null;
+    // ACC state at the previous collectTelemetry(), to detect the off→on edge and drop
+    // the cache (see collectTelemetry). Starts true so a daemon restart while driving
+    // does not read as a wake and invalidate for nothing.
+    private volatile boolean prevAccOnForCache = true;
     private volatile long lastCollectionTimeMs = 0;
     private volatile long lastCachedCabinExpiresAtMs = 0;
     private static final long TELEMETRY_CACHE_TTL_MS = 2000; // 2 seconds
@@ -589,6 +593,20 @@ public class MqttConnectionManager {
      */
     private synchronized CollectedTelemetry collectTelemetry() {
         long now = System.currentTimeMillis();
+
+        // On the ACC off→on edge, drop the cached snapshot. It was collected while parked
+        // and carries pre-drive values. The state-change flush re-SENDS every key on this
+        // edge, but re-sending a parked snapshot only delivers stale data promptly — the
+        // collect itself has to be fresh. The reverse edge needs no equivalent: the parked
+        // publish cadence gives a 2s cache no chance to matter.
+        boolean accNowForCache = false;
+        try {
+            accNowForCache = com.overdrive.app.monitor.AccMonitor.isAccOn();
+        } catch (Throwable ignored) { }
+        if (accNowForCache && !prevAccOnForCache) {
+            lastCachedTelemetry = null;
+        }
+        prevAccOnForCache = accNowForCache;
 
         // If we collected data less than 2 seconds ago, return the cached copy immediately.
         // This protects the BYD hardware from being spammed by multiple MQTT threads.
