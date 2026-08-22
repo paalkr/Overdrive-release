@@ -49,7 +49,10 @@ data class RecordingFile(
     // silent SD→internal fallback (the SD card is bridged behind the USB power
     // rail, so cutting USB power unmounts it and clips fall back to internal).
     // Null = unknown/unclassified; the adapter omits the badge.
-    val storageType: String? = null
+    val storageType: String? = null,
+    // Daemon-backed fallbacks for volumes the app process cannot open directly.
+    val videoUrl: String? = null,
+    val thumbnailUrl: String? = null,
 ) {
     // Secondary constructor for MediaStore results
     constructor(
@@ -72,6 +75,7 @@ data class RecordingFile(
     
     val name: String get() = file.name
     val path: String get() = file.absolutePath
+    val playbackSource: String get() = videoUrl ?: path
     
     val formattedDate: String
         get() = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()).format(Date(timestamp))

@@ -1,30 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Triple-purpose config:
+  Four purposes share this one service, so the config below is the UNION of what
+  each needs. None of them disables another.
+
    1. Process keep-alive — the binding alone gives the app the highest
-      process-priority tier so BYD firmware won't kill it (original purpose).
+      process-priority tier so BYD firmware won't kill it (the original purpose).
+
    2. Physical-key mapping — flagRequestFilterKeyEvents + canRequestFilterKeyEvents
       let onKeyEvent intercept hardware buttons (steering-wheel / dash keys) BEFORE
-      the OEM handler, so the user can rebind them. This is a standard a11y
-      capability — no root, no signature permission, no INJECT_EVENTS.
+      the OEM handler, so the user can rebind them. A standard a11y capability:
+      no root, no signature permission, no INJECT_EVENTS.
+
    3. FORK-LOCAL: autostart auto-enable (AutoStartEnabler) drives BYD's
-      com.byd.appstartmanagement dialog via the a11y APIs. That needs
-      canRetrieveWindowContent + flagRetrieveInteractiveWindows to let
-      getWindows() reach BYD's dialog window (getRootInActiveWindow returns the
-      launcher, not the dialog — verified), canPerformGestures for the
-      dispatchGesture coordinate-tap fallback, and typeWindowsChanged to notice
-      the dialog appear (the enabler primarily polls, so the event is
-      belt-and-suspenders).
+      com.byd.appstartmanagement dialog through the a11y APIs. That dialog is
+      mShowToOwnerOnly, so getRootInActiveWindow returns the launcher rather than
+      the dialog and uiautomator cannot see it at all — reaching it needs
+      canRetrieveWindowContent + flagRetrieveInteractiveWindows. canPerformGestures
+      backs the dispatchGesture coordinate-tap fallback, and typeWindowsChanged
+      notices the dialog appear (the enabler polls as its primary mechanism, so
+      that event is belt-and-suspenders).
 
-   4. FORK-LOCAL: seat-position capture — typeViewLongClicked lets
-      onAccessibilityEvent notice the user long-pressing BYD's seat-position
-      buttons (com.byd.carsettings:id/location{1,2,3}) to save a position, and
-      mirror that geometry into OverDrive's own position store via the daemon.
-      flagReportViewIds (already set) exposes getViewIdResourceName() so the
-      match is by resource-id, not localized button text.
+   4. Seat-position capture — typeViewLongClicked lets onAccessibilityEvent notice
+      the user long-pressing BYD's seat-position buttons to mirror that geometry
+      into OverDrive's own store. flagReportViewIds exposes
+      getViewIdResourceName() so the match is by resource-id rather than by
+      localized button text.
 
-  Event types and flags are the UNION of (2), (3) and (4): key filtering needs no
-  window events, the enabler + capture do, and none disables the others.
+  FORK-LOCAL: the home panel also reads the window list for foreground detection,
+  which typeWindowsChanged and flagRetrieveInteractiveWindows (3) already cover.
+
+  notificationTimeout stays at the key filter's 100 ms. A longer value coalesces
+  event delivery, which is wrong for a service that also filters hardware keys,
+  and nothing else here depends on it.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"

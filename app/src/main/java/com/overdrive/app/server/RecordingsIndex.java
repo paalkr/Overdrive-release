@@ -16,9 +16,12 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -87,8 +90,11 @@ public final class RecordingsIndex {
     // FILE_LOCK=SOCKET: process-level lock via a localhost socket, NOT
     // suitable for cross-UID coordination. App UID never opens this DB
     // directly; it reads via /api/recordings.
+    // AUTO_COMPACT_FILL_RATE=50: idle-CPU tuning shared by all seven H2 stores
+    // (see SocHistoryDatabase.JDBC_URL for the full rationale).
     private static final String JDBC_URL = "jdbc:h2:file:" + DB_PATH +
-            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE";
+            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE" +
+            ";AUTO_COMPACT_FILL_RATE=50";
 
     // Filename patterns mirror RecordingsApiHandler exactly. Kept in sync
     // there too because the parser is the single point of truth — any
@@ -143,9 +149,14 @@ public final class RecordingsIndex {
     // value means something is interrupting the DB write threads.
     private int reconnectCount = 0;
 
-    // Coalesces the post-reconnect heal so repeated reconnects don't stack
-    // reconcile threads.
-    private final AtomicBoolean reconcileAfterReconnectRunning = new AtomicBoolean(false);
+    // All asynchronous repair sources converge here. A burst before execution
+    // becomes one pass; requests arriving during that pass become one follow-up.
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> reconcileReasons =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final CoalescingTaskRunner reconcileRequests;
+    // Synchronous warmup reconciliation and asynchronous repair must not walk
+    // the same FUSE roots concurrently.
+    private final Object reconcileExecutionLock = new Object();
 
     // ---------------- queryStats() memo ----------------
     //
@@ -276,7 +287,13 @@ public final class RecordingsIndex {
     private final AtomicInteger warmupTotal = new AtomicInteger(0);
     private final AtomicInteger warmupDone = new AtomicInteger(0);
 
-    private RecordingsIndex() {}
+    private RecordingsIndex() {
+        reconcileRequests = new CoalescingTaskRunner(command -> {
+            Thread thread = new Thread(command, "RecordingsIndexReconcile");
+            thread.setDaemon(true);
+            thread.start();
+        }, this::runRequestedReconcile);
+    }
 
     // =================================================================
     // Lifecycle
@@ -509,7 +526,7 @@ public final class RecordingsIndex {
                     + " re-index anything missed while it was down.");
             // The dead window silently dropped upserts/removes, so the index
             // now drifts from disk. Heal it in the background.
-            kickReconcileAfterReconnect();
+            requestReconcile("store-reconnect");
             return true;
         } catch (Exception e) {
             // CRITICAL: drop the half-open connection. getConnection() may
@@ -600,24 +617,41 @@ public final class RecordingsIndex {
     }
 
     /**
-     * Fire a one-shot background reconcile after a reconnect so rows missed
-     * while the connection was dead get re-indexed without waiting for the
-     * next storage hot-plug. Coalesced — a second reconnect while a heal is
-     * still running does not stack another thread.
+     * Queue a background reconcile without stacking FUSE walks.
+     *
+     * @return true when the request was queued or merged into a running worker;
+     *         false during shutdown or when the worker could not be started.
      */
-    private void kickReconcileAfterReconnect() {
-        if (!reconcileAfterReconnectRunning.compareAndSet(false, true)) return;
-        Thread t = new Thread(() -> {
-            try {
-                reconcile();
-            } catch (Throwable thr) {
-                logger.warn("Post-reconnect reconcile failed: " + thr.getMessage());
-            } finally {
-                reconcileAfterReconnectRunning.set(false);
-            }
-        }, "RecordingsIndexReconnectHeal");
-        t.setDaemon(true);
-        t.start();
+    public boolean requestReconcile(String reason) {
+        if (shuttingDown) return false;
+        if (reason != null && !reason.isEmpty()) reconcileReasons.offer(reason);
+        try {
+            reconcileRequests.request();
+            return true;
+        } catch (Throwable failure) {
+            logger.warn("Could not schedule recordings reconcile (" + reason + "): "
+                    + failure.getMessage());
+            // The runner keeps its pending bit and the reason remains queued.
+            // A later request retries scheduling without losing diagnostics.
+            return false;
+        }
+    }
+
+    private void runRequestedReconcile() {
+        StringBuilder reasons = new StringBuilder();
+        String reason;
+        while ((reason = reconcileReasons.poll()) != null) {
+            if (reasons.length() > 0) reasons.append(',');
+            reasons.append(reason);
+        }
+        if (reasons.length() > 0) {
+            logger.debug("Running requested reconcile: " + reasons);
+        }
+        try {
+            reconcile();
+        } catch (Throwable failure) {
+            logger.warn("Requested reconcile failed: " + failure.getMessage());
+        }
     }
 
     /**
@@ -841,10 +875,8 @@ public final class RecordingsIndex {
      * per unindexed file, so a K-file drift chopped the monitor into K windows
      * of ~30ms and every concurrent queryStats/queryRecordings/queryDates
      * request queued behind them. That defeated the explicit intent documented
-     * in reconcile() ("we deliberately do NOT hold the lock across the
-     * locateFile() stat() calls ... they can each block 100-500ms, serializing
-     * every concurrent queryRecordings/queryCount/queryStats request"), which
-     * kept locateFile() out of the lock but then re-entered it here.
+    * in reconcile(): filesystem fingerprinting stays outside the monitor so
+    * FUSE metadata stalls cannot serialize every query behind a parse.
      *
      * <p>Only the short MERGE ({@link #upsertRow}) is synchronized — the same
      * split the warmup pipeline already uses (4 unsynchronized parser threads
@@ -1041,6 +1073,46 @@ public final class RecordingsIndex {
     }
 
     /**
+     * Count index rows whose {@code abs_path} sits under one of the given
+     * directory roots. Used by the API handler's read-drift check: comparing
+     * the on-disk file count against THIS count — restricted to the roots
+     * whose listings were authoritative this pass — is what makes the
+     * comparison safe with offline-volume rows retained in the index (an
+     * unplugged SD card's rows are not under any scannable root, so they
+     * don't perpetually skew the comparison; see the reconcile Phase 2
+     * retention rationale).
+     *
+     * <p>Rows with NULL/empty abs_path are not counted; if their file is on
+     * disk the first mismatch-triggered reconcile repairs abs_path via
+     * upsert, so the comparison converges instead of re-firing forever.
+     *
+     * @return the count, or -1 when the index is unavailable / query failed
+     *         (callers must skip the comparison, not treat it as 0).
+     */
+    public synchronized int countRowsUnderRoots(List<String> roots) {
+        if (roots == null || roots.isEmpty()) return -1;
+        if (!isAvailable()) return -1;
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM recordings WHERE ");
+        for (int i = 0; i < roots.size(); i++) {
+            if (i > 0) sql.append(" OR ");
+            sql.append("abs_path LIKE ?");
+        }
+        final String query = sql.toString();
+        final List<String> params = roots;
+        Integer count = withRetry("countRowsUnderRoots", null, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(query)) {
+                for (int i = 0; i < params.size(); i++) {
+                    ps.setString(i + 1, params.get(i) + "/%");
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getInt(1) : 0;
+                }
+            }
+        });
+        return count != null ? count : -1;
+    }
+
+    /**
      * True when {@code filename} is present in the index. Used by the
      * API handler's repair-on-read path to avoid double-upserting files
      * that are already known.
@@ -1218,19 +1290,6 @@ public final class RecordingsIndex {
         addDirFiles(entries, sm.getAllRecordingsDirs(), null);
         addDirFiles(entries, sm.getAllSurveillanceDirs(), null);
         addDirFiles(entries, sm.getAllProximityDirs(), null);
-        // Legacy paths — keep mirrored with RecordingsApiHandler.
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/recordings")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/sentry_events")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/proximity_events")),
-                null);
 
         // Dedup by filename (mirror dirs hold the same .mp4).
         Set<String> seen = new HashSet<>(entries.size() * 2);
@@ -1399,93 +1458,221 @@ public final class RecordingsIndex {
     }
 
     /**
-     * Reconcile the index against the filesystem. Walks every dir,
-     * upserts unknown files, removes index rows whose mp4 is gone.
+      * Reconcile the index against the filesystem. Walks every dir,
+      * upserts new or changed files, removes index rows whose mp4 is gone.
      * Backstop for FileObserver event drops on FUSE-mounted SD cards.
-     * Cheap when the index is in sync — every existing row is one
-     * stat() call.
+      * Cheap when the index is in sync — existing rows compare filesystem
+      * fingerprints without parsing sidecar JSON.
      */
     public void reconcile() {
+        synchronized (reconcileExecutionLock) {
+            reconcileInternal();
+        }
+    }
+
+    private void reconcileInternal() {
         if (!isAvailable()) return;
         long t0 = System.currentTimeMillis();
         StorageManager sm = StorageManager.getInstance();
 
-        Set<String> diskNames = new HashSet<>();
-        scanDirNames(diskNames, sm.getAllRecordingsDirs());
-        scanDirNames(diskNames, sm.getAllSurveillanceDirs());
-        scanDirNames(diskNames, sm.getAllProximityDirs());
-
-        // Three-phase walk: index enumerate → drop missing → upsert new.
+          // Three-phase walk: index snapshot → drop missing → upsert new/changed.
         // The SELECT enumerate is synchronized so the snapshot is
         // consistent. The per-row remove()/upsert() calls re-acquire the
-        // monitor themselves; we deliberately do NOT hold the lock across
-        // the locateFile() stat() calls because on FUSE-mounted SD cards
-        // they can each block 100-500ms, serializing every concurrent
+          // monitor themselves; filesystem fingerprinting stays outside that
+          // monitor because FUSE metadata calls can block, serializing every concurrent
         // queryRecordings/queryCount/queryStats request behind reconcile.
         // Accept temporary inconsistency — a file deleted between the
         // collect and verify phases will be cleaned up on the next
         // periodic reconcile (the operation is idempotent).
         int removed = 0;
         int added = 0;
-        // Files seen by scanDirNames() (exists, readable, size>0) but not
-        // findable by locateFile() — usually means a mount path drift or a
-        // symlinked dir that scanDirNames() followed but locateFile()'s
-        // canonical dir list does not. Surfaced in the summary so operators
-        // can spot data-loss-shaped gaps instead of silent skips.
-        int unlocatable = 0;
+        int refreshed = 0;
+        int failed = 0;
 
-        // Phase 1: snapshot the index under the monitor.
-        Set<String> indexNames;
+        // Phase 1: snapshot the index under the monitor — BEFORE the disk
+        // scan. Ordering matters (audit finding: reconcile deletion race):
+        // with scan-first, a file finalized + indexed AFTER its directory was
+        // scanned but BEFORE the snapshot appears in indexFiles, is absent
+        // from diskFiles, and Phase 2 removes its brand-new row. Snapshot-
+        // first inverts every race outcome to a safe one: a file indexed
+        // after the snapshot but found by the scan takes the idempotent
+        // ADD/upsert path; a file deleted after the snapshot makes remove() a
+        // no-op on the next pass.
+        Map<String, IndexedFileState> indexFiles;
         synchronized (this) {
             // Built inside the body so a reconnect-retry re-enumerates into a
-            // fresh set rather than merging two partial snapshots.
-            indexNames = withRetry("reconcile: index enumerate", null, () -> {
-                Set<String> names = new HashSet<>();
+            // fresh map rather than merging two partial snapshots.
+            indexFiles = withRetry("reconcile: index enumerate", null, () -> {
+                Map<String, IndexedFileState> rows = new HashMap<>();
                 try (PreparedStatement ps = connection.prepareStatement(
-                        "SELECT filename FROM recordings");
+                        "SELECT filename, abs_path, size_bytes, mp4_mtime, sidecar_mtime"
+                                + " FROM recordings");
                      ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) names.add(rs.getString(1));
+                    while (rs.next()) {
+                        rows.put(rs.getString(1), new IndexedFileState(
+                                rs.getString(2), rs.getLong(3), rs.getLong(4), rs.getLong(5)));
+                    }
                 }
-                return names;
+                return rows;
             });
         }
         // null (not empty) distinguishes "enumerate failed" from "index is
         // legitimately empty". Bailing on failure is important: an empty
         // snapshot would make Phase 2 believe every indexed row is missing.
-        if (indexNames == null) {
+        if (indexFiles == null) {
             logger.warn("reconcile: index enumerate unavailable — skipping this pass");
             return;
         }
 
+        // Disk scan. authoritativeRoots collects the directories whose
+        // enumeration provably completed (Java listFiles() non-null, or shell
+        // ls drained fully with exit 0) — only THOSE directories' contents are
+        // ground truth for Phase 2's removals. A dir that is missing (volume
+        // unmounted), listed partially (shell timeout), or failed to list
+        // never lands in the set, so its rows are retained. This is both the
+        // partial-listing safety fix and the offline-volume model: an
+        // unmounted SD/USB volume's dirs drop out of getAll*Dirs() (or fail
+        // exists()), its rows survive reconcile, and they rejoin the live set
+        // when the volume remounts — instead of being mass-pruned on the
+        // first reconcile that runs while the card is offline.
+        Map<String, RecordingFileFingerprint> diskFiles = new LinkedHashMap<>();
+        Set<String> authoritativeRoots = new HashSet<>();
+        Set<String> observedNames = new HashSet<>();
+        scanDirFiles(diskFiles, sm.getAllRecordingsDirs(), authoritativeRoots, observedNames);
+        scanDirFiles(diskFiles, sm.getAllSurveillanceDirs(), authoritativeRoots, observedNames);
+        scanDirFiles(diskFiles, sm.getAllProximityDirs(), authoritativeRoots, observedNames);
+
         // Phase 2: drop rows whose file is gone. remove() takes the
         // monitor per call; that's fine — we want short critical sections
         // here so query threads can interleave.
-        for (String name : indexNames) {
-            if (!diskNames.contains(name)) {
-                if (remove(name)) removed++;
+        //
+        // A row is prunable ONLY when its absence is PROVEN: its abs_path
+        // places it under a directory whose listing this pass was
+        // authoritative, AND no complete listing anywhere observed its
+        // filename (observedNames is raw listing output — see scanDirFiles
+        // for why pruning must not depend on the post-listing isFile()/size
+        // syscalls that feed diskFiles). Rows with a missing/empty abs_path
+        // can't be attributed to any scanned directory, so they are never
+        // pruned here (a later upsert repairs abs_path when the file is seen
+        // again).
+        int retainedUnverifiable = 0;
+        for (Map.Entry<String, IndexedFileState> e : indexFiles.entrySet()) {
+            if (diskFiles.containsKey(e.getKey())) continue;
+            if (observedNames.contains(e.getKey())) continue;  // listing saw it — not prunable
+            if (!isUnderAuthoritativeRoot(e.getValue().absolutePath, authoritativeRoots)) {
+                retainedUnverifiable++;
+                continue;
             }
+            if (remove(e.getKey())) removed++;
+        }
+        if (retainedUnverifiable > 0) {
+            logger.info("Reconcile: retained " + retainedUnverifiable
+                    + " row(s) not covered by an authoritative directory listing"
+                    + " (offline volume, partial/failed listing, or missing abs_path)"
+                    + " — not pruning");
         }
 
-        // Phase 3: upsert anything not already known. locateFile() is
-        // intentionally OUTSIDE any synchronized block — its stat() calls
-        // can stall on FUSE mounts and would otherwise serialize queries.
-        for (String name : diskNames) {
-            if (!indexNames.contains(name)) {
-                File f = locateFile(name, sm);
-                if (f != null) {
-                    if (upsert(f)) added++;
-                } else {
-                    unlocatable++;
-                    logger.warn("reconcile: file seen on disk but not locatable: " + name);
-                }
+        // Phase 3: parse only new or fingerprint-changed files. Active-first
+        // map insertion also repairs abs_path when the same filename moved
+        // between roots or volumes.
+        for (Map.Entry<String, RecordingFileFingerprint> entry : diskFiles.entrySet()) {
+            RecordingFileFingerprint fingerprint = entry.getValue();
+            IndexedFileState indexed = indexFiles.get(entry.getKey());
+            RecordingFileFingerprint.Decision decision = fingerprint.decisionAgainst(
+                    indexed != null ? indexed.absolutePath : null,
+                    indexed != null ? indexed.sizeBytes : 0L,
+                    indexed != null ? indexed.mp4Mtime : 0L,
+                    indexed != null ? indexed.sidecarMtime : 0L);
+            switch (decision) {
+                case ADD:
+                    if (upsert(fingerprint.file)) added++; else failed++;
+                    break;
+                case REFRESH:
+                    if (upsert(fingerprint.file)) refreshed++; else failed++;
+                    break;
+                case UNCHANGED:
+                    break;
             }
         }
         long ms = System.currentTimeMillis() - t0;
-        if (added > 0 || removed > 0 || unlocatable > 0) {
-            logger.info("Reconcile: +" + added + " / -" + removed
-                    + (unlocatable > 0 ? " / unlocatable=" + unlocatable : "")
-                    + " in " + ms + "ms");
+        if (added > 0 || refreshed > 0 || removed > 0 || failed > 0) {
+            // `failed` replaces the old `unlocatable` counter: an upsert that keeps
+            // refusing (unreadable mp4, unparseable name, tombstoned) is retried every
+            // pass, so a silent zero here hid a permanently-stuck row.
+            logger.info("Reconcile: +" + added + " / ~" + refreshed + " / -" + removed
+                    + (failed > 0 ? " / !" + failed : "") + " in " + ms + "ms");
         }
+    }
+
+    private static final class IndexedFileState {
+        final String absolutePath;
+        final long sizeBytes;
+        final long mp4Mtime;
+        final long sidecarMtime;
+
+        IndexedFileState(String absolutePath, long sizeBytes,
+                         long mp4Mtime, long sidecarMtime) {
+            this.absolutePath = absolutePath;
+            this.sizeBytes = sizeBytes;
+            this.mp4Mtime = mp4Mtime;
+            this.sidecarMtime = sidecarMtime;
+        }
+    }
+
+    /**
+     * Scan {@code dirs} into {@code out}, recording in
+     * {@code authoritativeRoots} the absolute path of every directory whose
+     * enumeration was COMPLETE (see {@link StorageManager.DirListing}), and
+     * in {@code observedNames} every filename such a complete listing
+     * CONTAINED — recorded straight off the listing, BEFORE the per-file
+     * isFile()/size filters below.
+     *
+     * <p>That ordering is the point (audit finding: destructive mid-scan
+     * pruning): the per-file checks are separate syscalls made AFTER the
+     * listing. If the volume drops between the two, every isFile() fails and
+     * {@code out} ends up empty while the root is already marked
+     * authoritative — and Phase 2 would prune every row under it. Pruning
+     * therefore keys off {@code observedNames} (pure listing output, no
+     * post-listing syscalls): a file the listing SAW is never prunable this
+     * pass, however its follow-up stat calls fared. The fingerprints in
+     * {@code out} are used only for the additive upsert path, where acting
+     * on a filtered/partial view merely under-adds and self-corrects.
+     *
+     * <p>The files of an incomplete listing are still collected into
+     * {@code out} for the same additive reason — but the directory is not
+     * authoritative, so Phase 2 will not prune its rows.
+     */
+    private void scanDirFiles(Map<String, RecordingFileFingerprint> out, List<File> dirs,
+                              Set<String> authoritativeRoots, Set<String> observedNames) {
+        StorageManager sm = StorageManager.getInstance();
+        for (File dir : dirs) {
+            if (dir == null) continue;
+            StorageManager.DirListing listing = sm.listMp4FilesChecked(dir);
+            if (listing.complete) {
+                authoritativeRoots.add(dir.getAbsolutePath());
+                for (File file : listing.files) {
+                    observedNames.add(file.getName());
+                }
+            }
+            for (File file : listing.files) {
+                if (!file.isFile() || out.containsKey(file.getName())) continue;
+                RecordingFileFingerprint fingerprint = RecordingFileFingerprint.from(file);
+                if (fingerprint.sizeBytes > 0) out.put(file.getName(), fingerprint);
+            }
+        }
+    }
+
+    /**
+     * True when {@code absPath} sits directly under one of the directories
+     * whose listing this reconcile pass was authoritative. Null/empty
+     * abs_path is never covered (non-prunable by construction).
+     */
+    private static boolean isUnderAuthoritativeRoot(String absPath, Set<String> roots) {
+        if (absPath == null || absPath.isEmpty()) return false;
+        for (String root : roots) {
+            if (absPath.startsWith(root + "/")) return true;
+        }
+        return false;
     }
 
     private void scanDirNames(Set<String> out, List<File> dirs) {
@@ -1499,22 +1686,6 @@ public final class RecordingsIndex {
                 if (f.isFile() && f.length() > 0) out.add(f.getName());
             }
         }
-    }
-
-    private File locateFile(String name, StorageManager sm) {
-        for (File dir : sm.getAllRecordingsDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        for (File dir : sm.getAllSurveillanceDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        for (File dir : sm.getAllProximityDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        return null;
     }
 
     // =================================================================
@@ -1999,7 +2170,7 @@ public final class RecordingsIndex {
         // Sidecar enrichment — same logic as
         // RecordingsApiHandler.parseRecordingUncached, kept close to
         // identical so existing callers don't notice the swap.
-        File sidecar = new File(mp4.getParentFile(), name.replace(".mp4", ".json"));
+        File sidecar = RecordingFileFingerprint.sidecarFor(mp4);
         if (sidecar.exists() && sidecar.canRead()) {
             r.sidecarMtime = sidecar.lastModified();
             try {
@@ -2113,8 +2284,13 @@ public final class RecordingsIndex {
                     }
                 }
             } catch (Exception se) {
-                // Sidecar parse failure is non-fatal; row still indexed
-                // with bare mp4 metadata.
+                // Sidecar parse failure is non-fatal; row still indexed with bare
+                // mp4 metadata. Reset the fingerprint so reconcile keeps seeing this
+                // row as REFRESH-eligible: persisting a mtime that MATCHES disk
+                // alongside NULL enrichment would latch UNCHANGED and strip the
+                // place chip / hero thumb permanently (a truncated-mid-rewrite
+                // sidecar is exactly the transient case that must self-heal).
+                r.sidecarMtime = 0L;
             }
         }
 
@@ -2165,8 +2341,9 @@ public final class RecordingsIndex {
         rec.put("dateFormatted", FMT_DATE_DISPLAY.get().format(d));
         rec.put("timeFormatted", FMT_TIME_DISPLAY.get().format(d));
 
-        rec.put("videoUrl", "/video/" + name);
-        rec.put("thumbnailUrl", "/thumb/" + name);
+        String mediaQuery = mediaPathQuery(absPath);
+        rec.put("videoUrl", "/video/" + name + mediaQuery);
+        rec.put("thumbnailUrl", "/thumb/" + name + mediaQuery);
 
         int sv = rs.getInt("schema_version");
         if (sv > 0) rec.put("schemaVersion", sv);
@@ -2186,7 +2363,11 @@ public final class RecordingsIndex {
         if (animal > 0) rec.put("animalCount", animal);
 
         String hero = rs.getString("hero_thumb");
-        if (hero != null) rec.put("heroThumbnailUrl", "/thumb/" + hero);
+        if (hero != null) {
+            File parent = new File(absPath).getParentFile();
+            String heroPath = parent == null ? hero : new File(parent, hero).getAbsolutePath();
+            rec.put("heroThumbnailUrl", "/thumb/" + hero + mediaPathQuery(heroPath));
+        }
 
         String classes = rs.getString("actor_classes");
         if (classes != null && !classes.isEmpty()) {
@@ -2227,6 +2408,11 @@ public final class RecordingsIndex {
         rec.put("ymd", rs.getString("ymd"));
 
         return rec;
+    }
+
+    private static String mediaPathQuery(String absolutePath) throws Exception {
+        return "?path=" + java.net.URLEncoder.encode(absolutePath, "UTF-8")
+                .replace("+", "%20");
     }
 
     private static String bucketLabelFor(long ts) {

@@ -9,9 +9,9 @@ import com.google.android.material.switchmaterial.SwitchMaterial
 import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
 import com.overdrive.app.homepanel.HomePanelOverlayService
+import com.overdrive.app.overlay.StatusOverlayUiWriter
 import com.overdrive.app.roadsense.config.RoadSenseConfig
 import com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
-import org.json.JSONObject
 
 /**
  * Settings → Floating surfaces pane.
@@ -35,6 +35,7 @@ import org.json.JSONObject
 class SettingsOverlayFragment : Fragment() {
     private var roadSenseSwitch: SwitchMaterial? = null
     private var roadSenseRow: View? = null
+    private var remoteCommunicationBinder: RemoteCommunicationSettingsBinder? = null
     private var roadSenseMasterOn = false
     private var applyingRoadSenseConfig = false
 
@@ -43,6 +44,11 @@ class SettingsOverlayFragment : Fragment() {
     private var bothWarning: View? = null
     private val pillChildRows = mutableListOf<View>()
     private val pillChildSwitches = mutableListOf<SwitchMaterial>()
+    // Guards the three status-pill listeners while a failed write reverts its
+    // switch: setChecked() fires the listener even programmatically, and an
+    // unguarded revert would re-enter persist() with the stale value —
+    // ping-ponging forever if the write keeps failing.
+    private var applyingStatusOverlayConfig = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -108,18 +114,27 @@ class SettingsOverlayFragment : Fragment() {
             swRoadSense.isChecked = !swRoadSense.isChecked
         }
 
-        swPill.setOnCheckedChangeListener { _, checked ->
-            persist("enabled", checked)
-            setPillChildrenEnabled(checked)
-            refreshBothWarning()
+        swPill.setOnCheckedChangeListener { button, checked ->
+            if (!applyingStatusOverlayConfig) {
+                persist("enabled", checked, button)
+                setPillChildrenEnabled(checked)
+                refreshBothWarning()
+            }
         }
         swDashboard.setOnCheckedChangeListener { _, checked -> persistDashboard(checked) }
-        swCamera.setOnCheckedChangeListener { _, checked -> persist("cameraVisible", checked) }
-        swReplay.setOnCheckedChangeListener { _, checked -> persist("replayVisible", checked) }
-        swTrip.setOnCheckedChangeListener { _, checked -> persist("tripVisible", checked) }
+        swCamera.setOnCheckedChangeListener { button, checked ->
+            if (!applyingStatusOverlayConfig) persist("cameraVisible", checked, button)
+        }
+        swReplay.setOnCheckedChangeListener { button, checked ->
+            if (!applyingStatusOverlayConfig) persist("replayVisible", checked, button)
+        }
+        swTrip.setOnCheckedChangeListener { button, checked ->
+            if (!applyingStatusOverlayConfig) persist("tripVisible", checked, button)
+        }
         swRoadSense.setOnCheckedChangeListener { _, checked ->
             if (!applyingRoadSenseConfig) persistRoadSense(checked)
         }
+        remoteCommunicationBinder = RemoteCommunicationSettingsBinder(view)
     }
 
     override fun onResume() {
@@ -127,9 +142,12 @@ class SettingsOverlayFragment : Fragment() {
         // This preference is also exposed on the RoadSense page. Refresh when the
         // user returns so both entry points always display the same stored value.
         refreshRoadSenseSwitch(forceReload = true)
+        remoteCommunicationBinder?.refresh()
     }
 
     override fun onDestroyView() {
+        remoteCommunicationBinder?.destroy()
+        remoteCommunicationBinder = null
         roadSenseSwitch = null
         roadSenseRow = null
         pillSwitch = null
@@ -182,10 +200,30 @@ class SettingsOverlayFragment : Fragment() {
      * toggle takes effect now instead of on the next 3-10s poll tick.
      * StatusOverlayService.onStartCommand re-uses the existing instance
      * and cancels any in-flight delayed poll, firing one synchronously.
+     * Persist the flag OFF the UI thread ([StatusOverlayUiWriter] — the write
+     * is a blocking IPC round-trip and updateSection is documented
+     * off-looper-only), then nudge the overlay service so the toggle takes
+     * effect now instead of on the next 3-10s poll tick.
+     * StatusOverlayService.onStartCommand re-uses the existing instance and
+     * cancels any in-flight delayed poll, firing one synchronously.
+     *
+     * On a failed write (daemon down and no local write possible) the switch
+     * reverts, mirroring the RoadSense switch below — the control never lies
+     * about the stored value.
      */
-    private fun persist(key: String, value: Boolean) {
-        UnifiedConfigManager.setStatusOverlay(JSONObject().put(key, value))
-        context?.let { com.overdrive.app.overlay.StatusOverlayService.startIfPermitted(it) }
+    private fun persist(key: String, value: Boolean, button: android.widget.CompoundButton) {
+        val appContext = context?.applicationContext
+        StatusOverlayUiWriter.write(key, value) { ok ->
+            if (ok) {
+                appContext?.let {
+                    com.overdrive.app.overlay.StatusOverlayService.startIfPermitted(it)
+                }
+            } else if (view != null) {  // fragment view still alive
+                applyingStatusOverlayConfig = true
+                button.isChecked = !value
+                applyingStatusOverlayConfig = false
+            }
+        }
     }
 
     private fun persistRoadSense(visible: Boolean) {
@@ -195,11 +233,20 @@ class SettingsOverlayFragment : Fragment() {
             refreshRoadSenseSwitch(forceReload = false)
             return
         }
-        if (RoadSenseConfig.setOverlayVisible(visible)) {
-            context?.let { RoadSenseOverlayService.syncWithConfig(it) }
-        } else {
-            refreshRoadSenseSwitch(forceReload = true)
-        }
+        // Off the looper with one retry, exactly like persist() above. Writing inline here
+        // blocked the UI thread on IPC, and an app-UID write that is deferred until the daemon
+        // provisions the stable .lock inode returned false, so the switch silently snapped back
+        // and RoadSense could not be enabled/disabled at all shortly after boot.
+        StatusOverlayUiWriter.writeWith(
+            "roadSense.overlayVisible",
+            { ok ->
+                if (ok) {
+                    context?.let { RoadSenseOverlayService.syncWithConfig(it) }
+                } else if (view != null) {  // fragment view still alive
+                    refreshRoadSenseSwitch(forceReload = true)
+                }
+            }
+        ) { RoadSenseConfig.setOverlayVisible(visible) }
     }
 
     private fun refreshRoadSenseSwitch(forceReload: Boolean) {

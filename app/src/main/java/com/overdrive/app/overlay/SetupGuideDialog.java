@@ -147,11 +147,7 @@ public class SetupGuideDialog {
         TextView btnOverlay = view.findViewById(R.id.btnOpenOverlay);
         View stepOverlayCheck = view.findViewById(R.id.ivOverlayCheck);
 
-        if (Settings.canDrawOverlays(context)) {
-            stepOverlayCheck.setVisibility(View.VISIBLE);
-            btnOverlay.setText(context.getString(R.string.setup_overlay_already_granted));
-            btnOverlay.setEnabled(false);
-        }
+        renderOverlayPermission(context, btnOverlay, stepOverlayCheck);
 
         btnOverlay.setOnClickListener(v -> {
             try {
@@ -190,6 +186,17 @@ public class SetupGuideDialog {
                 .setCancelable(true)
                 .create();
 
+        dialog.setOnShowListener(ignored -> {
+            renderOverlayPermission(context, btnOverlay, stepOverlayCheck);
+            dialog.getWindow().getDecorView().getViewTreeObserver()
+                    .addOnWindowFocusChangeListener(hasFocus -> {
+                        if (hasFocus) {
+                            renderOverlayPermission(
+                                    context, btnOverlay, stepOverlayCheck);
+                        }
+                    });
+        });
+
         // "Don't show again" — record current install time so the dialog stays
         // suppressed until PackageInfo.lastUpdateTime advances (next install
         // or update). BYD wipes the autostart whitelist on every install, so
@@ -206,6 +213,17 @@ public class SetupGuideDialog {
         view.findViewById(R.id.btnSkip).setOnClickListener(v -> dialog.dismiss());
 
         dialog.show();
+    }
+
+    private static void renderOverlayPermission(
+            Context context, TextView button, View check) {
+        boolean granted = OverlayPermissionChecker.isGranted(context);
+        check.setVisibility(granted ? View.VISIBLE : View.GONE);
+        button.setText(context.getString(
+                granted
+                        ? R.string.setup_overlay_already_granted
+                        : R.string.setup_overlay_button));
+        button.setEnabled(!granted);
     }
 
     /**

@@ -52,12 +52,13 @@ public class LocationSidecarService extends Service implements LocationListener 
     private volatile float heading = 0.0f;
     private volatile float accuracy = 0.0f;
     private volatile double altitude = 0.0;
-    // The fix's OWN timestamp (Location.getTime(), epoch ms) — distinct from
-    // the send time. GNSS fixes are already ~0.7s old on delivery and several
-    // seconds old through turns on this HAL, so downstream consumers (video
-    // sync in particular) need the true fix time to correct per-point instead
-    // of guessing a constant lag.
-    private volatile long fixTimeMs = 0;
+    // Reported 1-sigma vertical accuracy (m); 0 = unreported by this fix. Flows
+    // to the daemon so the trip recorder can gate elevation on it.
+    private volatile float verticalAccuracy = 0.0f;
+    // True when `altitude` is MSL (geoid-corrected) rather than ellipsoidal.
+    // Per-fix flag: an intermittent HAL can flip sources mid-trip, and the
+    // ~tens-of-metres geoid step must reset elevation deltas, not bank as climb.
+    private volatile boolean altitudeIsMsl = false;
     // MONOTONIC since-boot timestamp (SystemClock.elapsedRealtime ms) of the GPS
     // fix currently published — distinct from the "time" field we send (send/
     // receive-time, on purpose, for the RoadSense 5s cutoff + puck dead-reckon
@@ -450,9 +451,6 @@ public class LocationSidecarService extends Service implements LocationListener 
         // Consumers already treat heading as noise when stationary, so holding is safe.
         if (location.hasBearing()) heading = location.getBearing();
         accuracy = location.hasAccuracy() ? location.getAccuracy() : 0.0f;
-        altitude = location.hasAltitude() ? location.getAltitude() : 0.0;
-        fixTimeMs = location.getTime();
-        
         // Altitude: PREFER mean-sea-level (MSL) height when the platform can
         // supply it. Location.getAltitude() returns height above the WGS84
         // ELLIPSOID, which differs from MSL by the local geoid undulation
@@ -469,8 +467,20 @@ public class LocationSidecarService extends Service implements LocationListener 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
                 && location.hasMslAltitude()) {
             altitude = location.getMslAltitudeMeters();
+            altitudeIsMsl = true;
         } else {
             altitude = location.hasAltitude() ? location.getAltitude() : 0.0;
+            altitudeIsMsl = false;
+        }
+        // Vertical accuracy: MSL fixes carry their own figure; otherwise use the
+        // standard per-fix vertical accuracy. 0 = unreported (consumers treat it
+        // as "no gate available", never as a perfect fix).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+                && location.hasMslAltitude() && location.hasMslAltitudeAccuracy()) {
+            verticalAccuracy = location.getMslAltitudeAccuracyMeters();
+        } else {
+            verticalAccuracy = location.hasVerticalAccuracy()
+                    ? location.getVerticalAccuracyMeters() : 0.0f;
         }
         // Fix age basis = the MONOTONIC since-boot clock, NOT UTC getTime(). The
         // earlier attempt used location.getTime() (GNSS-UTC) and aged it against
@@ -530,15 +540,12 @@ public class LocationSidecarService extends Service implements LocationListener 
             if (isFirstFix) {
                 Log.i(TAG, "First location fix: " + latitude + ", " + longitude);
             } else if (Log.isLoggable(TAG, Log.DEBUG)) {
-                // Opt-in per fix, and the gate has to be isLoggable rather than
-                // BuildConfig.DEBUG: every custom build IS a debug build, so that check was
-                // always true and this line ran at the provider's 1 Hz. At that rate it
-                // alone held the main logcat buffer down to about 20 SECONDS of history,
-                // which made the buffer useless for diagnosing anything — a home-panel
-                // outage on 2026-08-14 was first misread as "the code never ran" because
-                // its log lines had already rotated out. Turn it back on when needed with
+                // Opt-in per fix. The gate has to be isLoggable, not BuildConfig.DEBUG: that
+                // is a compile-time constant which is true for every debug build, so the line
+                // always ran at the provider's 1 Hz, and Log.d reaches logcat regardless —
+                // there was no mechanism behind "only shown if explicitly requested". Enable
+                // at runtime, no reinstall:
                 //   adb shell setprop log.tag.LocationSidecar DEBUG
-                // which takes effect without a reinstall.
                 Log.d(TAG, "Location update (moved=" + String.format("%.1f", distanceMoved) + "m): " + latitude + ", " + longitude);
             }
             
@@ -712,6 +719,11 @@ public class LocationSidecarService extends Service implements LocationListener 
             json.put("heading", heading);
             json.put("accuracy", accuracy);
             json.put("altitude", altitude);
+            // Vertical accuracy + altitude source for the elevation pipeline
+            // (TripTelemetryRecorder → ElevationEstimator). Older daemons ignore
+            // unknown keys; a missing key on the daemon side defaults to 0/false.
+            json.put("vAcc", verticalAccuracy);
+            json.put("altMsl", altitudeIsMsl);
             // SEND-TIME (receive-time), NOT the GPS fix's own getTime(). This field flows
             // to GpsMonitor.lastUpdate, which LocationSource.latest() ages against a 5 s
             // cutoff (DEFAULT_MAX_FIX_AGE_MS); a fresh re-send must read as fresh. Stamping
@@ -722,10 +734,6 @@ public class LocationSidecarService extends Service implements LocationListener 
             // anchored to ingestion as designed (feedMotionTruth re-anchors on a NEW ts; the
             // estimator + feedMotionTruth already de-dupe identical re-polls by position/ts).
             json.put("time", System.currentTimeMillis());
-            // The fix's own timestamp — "time" above is the SEND time and keeps
-            // feeding GpsMonitor.lastUpdate (staleness checks); fix_time is the
-            // per-point truth consumers use to correct GNSS latency.
-            json.put("fix_time", fixTimeMs);
             // MONOTONIC since-boot fix timestamp — SEPARATE from "time". Geo-tagging
             // ages this against the daemon's own elapsedRealtime() so a parked car's
             // stale fix (re-sent every 4s by the keep-alive, which keeps "time"

@@ -28,8 +28,9 @@ import java.util.concurrent.Executors;
  * This gives our app the highest possible process priority — same tier as the
  * keyboard or phone call — preventing the 24-hour kill cycle on newer BYD firmware.
  *
- * The service itself is a no-op for accessibility events. Its sole purpose is
- * process keep-alive. The foreground notification provides user visibility.
+ * Accessibility events are used only to cache the active package for conditional
+ * key mappings; no window content is inspected. The foreground notification
+ * provides user visibility.
  *
  * Enable via ADB (one-time):
  *   settings put secure enabled_accessibility_services com.overdrive.app/com.overdrive.app.services.KeepAliveAccessibilityService
@@ -39,28 +40,24 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     private static final String TAG = "KeepAliveA11y";
 
-    // Live instance, so callers (e.g. the setup wizard's autostart button) can
-    // reach the bound service to drive AutoStartEnabler. volatile: written on the
-    // main thread in onServiceConnected/onUnbind/onDestroy, read from callers.
+    // volatile: written on the main thread, read from callers on other threads
+    // (the setup wizard's autostart button).
     private static volatile KeepAliveAccessibilityService instance;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    public static boolean isRunning() {
-        return instance != null;
-    }
-
-    /** The bound service, or null when the a11y service isn't enabled/connected. */
+    /** The bound service, or null when the a11y service isn't enabled or connected. */
     public static KeepAliveAccessibilityService getInstance() {
         return instance;
     }
 
-    /**
-     * Result of a deliberate, button-triggered autostart-enable run.
-     * Posted on the main thread so UI callers can update views directly.
-     */
+    /** Result of a deliberate, button-triggered autostart-enable run. */
     public interface Callback {
         void onResult(boolean success, AutoStartEnabler.Result result);
+    }
+
+    public static boolean isRunning() {
+        return instance != null;
     }
 
     @Override
@@ -106,21 +103,15 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         // Mirror the proven OEM config EXACTLY (no extra flags): subscribe to a
         // real event type + report-view-ids + filter-key-events. Adding more than
         // the known-good set risks a different firmware quirk, so match it 1:1.
-        // FORK-LOCAL ADDITION on top of the proven OEM shape: AutoStartEnabler needs
-        // TYPE_WINDOWS_CHANGED + FLAG_RETRIEVE_INTERACTIVE_WINDOWS to reach BYD's
-        // com.byd.appstartmanagement dialog through getWindows(). The upstream comment
-        // above cautions against extra flags because the key-filter wiring is
-        // firmware-sensitive; both shapes were validated separately on this DiLink
-        // build (enabler 2026-07-07, key filtering upstream) but NOT together, so a
-        // deploy must re-verify hardware keys as well as the enabler. If keys regress,
-        // the fix is to raise these two only for the duration of an enabler run and
-        // restore the OEM shape afterwards, rather than carrying them permanently.
-        // FORK-LOCAL ADDITION (2): seat-position capture subscribes to
+        // One addition on top of that shape: seat-position capture subscribes to
         // TYPE_VIEW_LONG_CLICKED so onAccessibilityEvent sees the user long-pressing
-        // BYD's seat-position buttons. Same firmware-sensitivity caveat as the enabler
-        // additions above — a deploy carrying this MUST re-verify hardware key mapping
-        // still fires (press a mapped steering/dash key), since eventTypes changes have
-        // regressed key delivery on this firmware before.
+        // BYD's seat-position buttons. No extra flags — the handler reads the event
+        // source's resource-id, which flagReportViewIds already covers. eventTypes
+        // changes have regressed key delivery on this firmware before, so a build
+        // carrying this should re-verify that a mapped hardware key still fires.
+        // TYPE_WINDOWS_CHANGED and FLAG_RETRIEVE_INTERACTIVE_WINDOWS are AutoStartEnabler's:
+        // BYD's appstartmanagement dialog is mShowToOwnerOnly, so getWindows() is the only way
+        // to reach it. The home panel reads the same window list for foreground detection.
         info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 | AccessibilityEvent.TYPE_WINDOWS_CHANGED
                 | AccessibilityEvent.TYPE_VIEW_LONG_CLICKED;
@@ -144,6 +135,26 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
         instance = this;
 
+        // Seed the conditional-keymap foreground cache in case the active window
+        // was already open before this service connected. Future window changes
+        // update the same cache from onAccessibilityEvent().
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                    root != null ? stringValue(root.getPackageName()) : null);
+        } catch (Throwable t) {
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            Log.w(TAG, "Unable to seed active package: " + t.getMessage());
+        } finally {
+            if (root != null) {
+                try {
+                    root.recycle();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+
         // Prime the key-mapping snapshot off-thread so the first hardware key
         // press already has its bindings (onKeyEvent never reads disk itself).
         try {
@@ -160,49 +171,6 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             DaemonStartupManager.Companion.startOnBoot(getApplicationContext());
         } catch (Exception e) {
             Log.w(TAG, "Daemon startup from A11y service: " + e.getMessage());
-        }
-
-        // NOTE: the BYD-autostart enabler is NO LONGER auto-triggered here. It
-        // re-fired on every reconnect/app-churn and repeatedly popped the BYD
-        // dialog. It now runs ONLY from the setup wizard's autostart button
-        // (SetupGuideDialog -> runAutoStartEnabler), which happens once per fresh
-        // install with the user present and the display on.
-    }
-
-    /**
-     * Drive AutoStartEnabler once, off the main thread, and report the outcome
-     * back on the main thread. Triggered deliberately by the user (setup wizard
-     * button) — never auto-run. Single-flight is enforced inside AutoStartEnabler,
-     * so a double-tap can't double-run. Wrapped so it can never crash the service.
-     */
-    public void runAutoStartEnabler(final Callback callback) {
-        try {
-            final AutoStartEnabler enabler = new AutoStartEnabler(this);
-            Thread worker = new Thread(() -> {
-                AutoStartEnabler.Result result = null;
-                try {
-                    result = enabler.run();
-                } catch (Throwable t) {
-                    Log.w(TAG, "runAutoStartEnabler worker threw: " + t);
-                }
-                final AutoStartEnabler.Result fResult = result;
-                final boolean success = result == AutoStartEnabler.Result.SUCCESS
-                        || result == AutoStartEnabler.Result.ALREADY_OFF;
-                mainHandler.post(() -> {
-                    if (callback == null) return;
-                    try {
-                        callback.onResult(success, fResult);
-                    } catch (Throwable t) {
-                        Log.w(TAG, "AutoStartEnabler callback threw: " + t);
-                    }
-                });
-            }, "autostart-enabler");
-            worker.start();
-        } catch (Throwable t) {
-            Log.w(TAG, "runAutoStartEnabler failed to start worker: " + t);
-            if (callback != null) {
-                mainHandler.post(() -> callback.onResult(false, null));
-            }
         }
     }
 
@@ -228,25 +196,28 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        // Two consumers now share this callback, so dispatch on event type rather than
+        // assuming one. Upstream tracks the foreground package from window-state changes for
+        // conditional key mappings; seat capture watches for a long-press on BYD's own
+        // position buttons. Neither is interested in the other's event.
         if (event == null) return;
+        final int type = event.getEventType();
 
-        // Window changes tell the home dashboard whether the launcher is the thing on
-        // screen. This service is already subscribed to both event types (see
-        // onServiceConnected), so this costs no new permission.
-        //
-        // BOTH types are needed, learned on the car 2026-08-13: coming back to the
-        // ALREADY-RUNNING launcher fires TYPE_WINDOWS_CHANGED, not
-        // TYPE_WINDOW_STATE_CHANGED — the launcher's window already exists, so its
-        // state does not change, only the window stack does. Handling only
-        // WINDOW_STATE_CHANGED meant the panel never appeared when you pressed home,
-        // which is the only way anyone actually gets there.
-        //
-        // WINDOWS_CHANGED carries no useful getPackageName(), so the package comes from
-        // the active window instead. That read is not free and this event is chatty, so
-        // it is gated on the feature being switched on at all.
-        int type = event.getEventType();
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 || type == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            // Key mapping only cares about an actual activity change, so it stays on
+            // window-state. The home panel also needs TYPE_WINDOWS_CHANGED, because the
+            // BYD launcher swaps windows without changing activity.
+            if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                try {
+                    KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                            stringValue(event.getPackageName()));
+                } catch (Throwable t) {
+                    // Foreground detection is advisory. Unknown must fail open so a
+                    // conditional mapping never suppresses the vehicle's default key action.
+                    KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+                }
+            }
             try {
                 if (HomePanelFocus.isWanted()) {
                     String fg = null;
@@ -254,9 +225,6 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
                     if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                             && event.getPackageName() != null) {
                         fg = event.getPackageName().toString();
-                        // The activity class distinguishes the launcher's home screen
-                        // from its app drawer and customize screens, which are separate
-                        // activities in the same package.
                         if (event.getClassName() != null) cls = event.getClassName().toString();
                     } else {
                         fg = activeWindowPackage();
@@ -272,7 +240,7 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
         // Only interested in the user long-pressing a BYD seat-position button (the
         // "save current position" gesture). Everything else is ignored cheaply.
-        if (event.getEventType() != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
+        if (type != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
         CharSequence pkg = event.getPackageName();
         if (pkg == null) return;
         if (!SEAT_POS_PKG.contentEquals(pkg) && !SEAT_POS_WIDGET_PKG.contentEquals(pkg)) return;
@@ -280,6 +248,10 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         if (slot < 1) return;
         Log.i(TAG, "seat-position long-press: slot " + slot + " — capturing geometry");
         captureSeatPosition(slot);
+    }
+
+    private static String stringValue(CharSequence value) {
+        return value != null ? value.toString() : null;
     }
 
     /**
@@ -335,88 +307,6 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             if (src != null) { try { src.recycle(); } catch (Throwable ignored) {} }
         }
         return -1;
-    }
-
-    /**
-     * Package owning the active window, or null. Used for the events that do not carry
-     * a useful package name, and by the home dashboard's own watchdog through
-     * {@link #getRootInActiveWindow()}.
-     */
-    public String activeWindowPackage() {
-        AccessibilityNodeInfo root = null;
-        try {
-            root = getRootInActiveWindow();
-            if (root == null) return null;
-            CharSequence pkg = root.getPackageName();
-            return pkg == null ? null : pkg.toString();
-        } catch (Throwable t) {
-            return null;
-        } finally {
-            if (root != null) {
-                try { root.recycle(); } catch (Throwable ignored) { }
-            }
-        }
-    }
-
-    /**
-     * Titles of the launcher windows that identify which launcher surface is up. The BYD
-     * launcher keeps ONE window at a fixed id and retitles it per surface, so the title is
-     * the only thing that distinguishes them — the activity never changes. Observed on the
-     * car 2026-08-14 by driving the UI: plain home carries {@code BydLauncher_CardBarwindow};
-     * entering "edit home layout" replaces it with {@code EditWindow} at the same window id;
-     * the app drawer has neither (it is a real activity, {@code .Launcher}).
-     */
-    private static final String LAUNCHER_HOME_WINDOW = "BydLauncher_CardBarwindow";
-    private static final String LAUNCHER_EDIT_WINDOW = "EditWindow";
-
-    /** What the accessibility window list says is on screen right now. */
-    public static final class Surfaces {
-        /** Package owning the active window, or null when it cannot be read. */
-        public final String activePackage;
-        /** The launcher's plain-home window is present. */
-        public final boolean homeWindow;
-        /** The launcher's edit-layout window is present. */
-        public final boolean editWindow;
-
-        Surfaces(String activePackage, boolean homeWindow, boolean editWindow) {
-            this.activePackage = activePackage;
-            this.homeWindow = homeWindow;
-            this.editWindow = editWindow;
-        }
-    }
-
-    /**
-     * Read the current surfaces from the accessibility window list.
-     *
-     * <p>This exists because the window list answers questions the event stream cannot. An
-     * event's activity class is absent on window-stack changes and unchanged for a launcher
-     * that swaps surfaces inside one activity, so any verdict cached from the last event that
-     * happened to carry a class goes stale — which is what left the home panel drawn over the
-     * edit-layout screen, and made returning home take two presses (2026-08-14).
-     *
-     * <p>Titles only, deliberately: no {@code getRoot()} per window, which would walk node
-     * trees on a chatty callback.
-     */
-    public Surfaces surfaces() {
-        String active = activeWindowPackage();
-        boolean home = false;
-        boolean edit = false;
-        try {
-            List<AccessibilityWindowInfo> windows = getWindows();
-            if (windows != null) {
-                for (AccessibilityWindowInfo w : windows) {
-                    if (w == null) continue;
-                    CharSequence title = w.getTitle();
-                    if (title == null) continue;
-                    if (LAUNCHER_HOME_WINDOW.contentEquals(title)) home = true;
-                    else if (LAUNCHER_EDIT_WINDOW.contentEquals(title)) edit = true;
-                }
-            }
-        } catch (Throwable t) {
-            // A window-list read must never break key filtering or seat capture.
-            Log.w(TAG, "surfaces() failed: " + t.getMessage());
-        }
-        return new Surfaces(active, home, edit);
     }
 
     /**
@@ -479,16 +369,141 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
     }
 
-    @Override
-    public void onInterrupt() {
-        // No-op
+
+    /**
+     * Drive AutoStartEnabler once, off the main thread, and report the outcome
+     * back on the main thread. Triggered deliberately by the user (setup wizard
+     * button) — never auto-run. Single-flight is enforced inside AutoStartEnabler,
+     * so a double-tap can't double-run. Wrapped so it can never crash the service.
+     */
+    public void runAutoStartEnabler(final Callback callback) {
+        try {
+            final AutoStartEnabler enabler = new AutoStartEnabler(this);
+            Thread worker = new Thread(() -> {
+                AutoStartEnabler.Result result = null;
+                try {
+                    result = enabler.run();
+                } catch (Throwable t) {
+                    Log.w(TAG, "runAutoStartEnabler worker threw: " + t);
+                }
+                final AutoStartEnabler.Result fResult = result;
+                final boolean success = result == AutoStartEnabler.Result.SUCCESS
+                        || result == AutoStartEnabler.Result.ALREADY_OFF;
+                mainHandler.post(() -> {
+                    if (callback == null) return;
+                    try {
+                        callback.onResult(success, fResult);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "AutoStartEnabler callback threw: " + t);
+                    }
+                });
+            }, "autostart-enabler");
+            worker.start();
+        } catch (Throwable t) {
+            Log.w(TAG, "runAutoStartEnabler failed to start worker: " + t);
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(false, null));
+            }
+        }
     }
+
 
     @Override
     public boolean onUnbind(Intent intent) {
         Log.i(TAG, "AccessibilityService unbound — clearing instance");
         instance = null;
         return super.onUnbind(intent);
+    }
+
+
+    /**
+     * Titles of the launcher windows that identify which launcher surface is up. The BYD
+     * launcher keeps ONE window at a fixed id and retitles it per surface, so the title is
+     * the only thing that distinguishes them — the activity never changes. Observed on the
+     * car 2026-08-14 by driving the UI: plain home carries {@code BydLauncher_CardBarwindow};
+     * entering "edit home layout" replaces it with {@code EditWindow} at the same window id;
+     * the app drawer has neither (it is a real activity, {@code .Launcher}).
+     */
+    private static final String LAUNCHER_HOME_WINDOW = "BydLauncher_CardBarwindow";
+    private static final String LAUNCHER_EDIT_WINDOW = "EditWindow";
+
+
+    /**
+     * Package owning the active window, or null. Used for the events that do not carry
+     * a useful package name, and by the home dashboard's own watchdog through
+     * {@link #getRootInActiveWindow()}.
+     */
+    public String activeWindowPackage() {
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            if (root == null) return null;
+            CharSequence pkg = root.getPackageName();
+            return pkg == null ? null : pkg.toString();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (root != null) {
+                try { root.recycle(); } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+
+    /**
+     * Read the current surfaces from the accessibility window list.
+     *
+     * <p>This exists because the window list answers questions the event stream cannot. An
+     * event's activity class is absent on window-stack changes and unchanged for a launcher
+     * that swaps surfaces inside one activity, so any verdict cached from the last event that
+     * happened to carry a class goes stale — which is what left the home panel drawn over the
+     * edit-layout screen, and made returning home take two presses (2026-08-14).
+     *
+     * <p>Titles only, deliberately: no {@code getRoot()} per window, which would walk node
+     * trees on a chatty callback.
+     */
+    public Surfaces surfaces() {
+        String active = activeWindowPackage();
+        boolean home = false;
+        boolean edit = false;
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo w : windows) {
+                    if (w == null) continue;
+                    CharSequence title = w.getTitle();
+                    if (title == null) continue;
+                    if (LAUNCHER_HOME_WINDOW.contentEquals(title)) home = true;
+                    else if (LAUNCHER_EDIT_WINDOW.contentEquals(title)) edit = true;
+                }
+            }
+        } catch (Throwable t) {
+            // A window-list read must never break key filtering or seat capture.
+            Log.w(TAG, "surfaces() failed: " + t.getMessage());
+        }
+        return new Surfaces(active, home, edit);
+    }
+
+
+    /** What the accessibility window list says is on screen right now. */
+    public static final class Surfaces {
+        /** Package owning the active window, or null when it cannot be read. */
+        public final String activePackage;
+        /** The launcher's plain-home window is present. */
+        public final boolean homeWindow;
+        /** The launcher's edit-layout window is present. */
+        public final boolean editWindow;
+
+        Surfaces(String activePackage, boolean homeWindow, boolean editWindow) {
+            this.activePackage = activePackage;
+            this.homeWindow = homeWindow;
+            this.editWindow = editWindow;
+        }
+    }
+
+    @Override
+    public void onInterrupt() {
+        // No-op
     }
 
     @Override
