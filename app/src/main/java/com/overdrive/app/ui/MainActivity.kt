@@ -350,8 +350,15 @@ class MainActivity : AppCompatActivity() {
 
         if (hasPermission) {
             com.overdrive.app.overlay.StatusOverlayService.startIfPermitted(this)
+        com.overdrive.app.homepanel.HomePanelOverlayService.syncWithConfig(this)
             logsViewModel.info("Overlay", "Status overlay service started")
         }
+
+        // Home dashboard: a separate window with its own master switch, so it is
+        // synced rather than started — syncWithConfig stops it when the feature is
+        // off. Whether it actually shows is a second question the service answers
+        // for itself (the home screen also has to be in focus).
+        com.overdrive.app.homepanel.HomePanelOverlayService.syncWithConfig(this)
 
         // RoadSense floating overlay (D-024): start only when the feature is enabled.
         // It's a separate window from the status overlay and renders the pill/card.
