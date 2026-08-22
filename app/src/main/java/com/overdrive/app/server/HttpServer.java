@@ -995,6 +995,13 @@ public class HttpServer {
             return SeatDebugApiHandler.handle(method, path, body, out);
         }
 
+        // Telenav OEM user-data AIDL — READ-ONLY spike: bind TnNaviService and read
+        // the favourite buckets + recents to confirm the bind and learn the heart's
+        // FavoriteType. No writes. See TelenavDebugApiHandler / TelenavClient.
+        if (path.startsWith("/api/debug/telenav/")) {
+            return TelenavDebugApiHandler.handle(method, path, body, out);
+        }
+
         // Interior-ambient READS, side by side across the SDK per-area getters,
         // the Light-device feature ids and BYD's own carsettings provider. The
         // ambient write path is proven but the read path is not, and a saved
