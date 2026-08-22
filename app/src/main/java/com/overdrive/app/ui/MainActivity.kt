@@ -378,6 +378,7 @@ open class MainActivity : AppCompatActivity() {
 
         if (hasPermission) {
             com.overdrive.app.overlay.StatusOverlayService.startIfPermitted(this)
+        com.overdrive.app.homepanel.HomePanelOverlayService.syncWithConfig(this)
             logsViewModel.info("Overlay", "Status overlay service started")
         }
 
