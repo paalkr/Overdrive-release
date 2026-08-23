@@ -515,10 +515,14 @@ public class CameraDaemon {
 
     /**
      * Re-assert secure setting location_mode=3 whenever the system flips it
-     * off (the head unit sets 0 on car-off/standby). Daemon-only: guarded on
-     * uid 2000 (shell), the uid this daemon always runs as and the one allowed
-     * to write secure settings — a defensive no-op anywhere else. Checks every
-     * 60s; logs only on an actual re-assert, not every tick.
+     * off (the head unit sets 0 on car-off/standby), so GPS keeps tracking while
+     * parked and departures start with a warm fix. Daemon-only: guarded on uid
+     * 2000 (shell), the uid allowed to write secure settings.
+     *
+     * OFF BY DEFAULT and gated on config {@code location.keepGpsWhileParked} —
+     * it keeps the GNSS chip powered while parked (a battery cost), so it only
+     * runs when the user opts in (Settings → Privacy). The flag is re-read every
+     * tick, so toggling it takes effect within 60s without a daemon restart.
      */
     private static void startLocationModeKeeper() {
         if (android.os.Process.myUid() != 2000) {
@@ -528,19 +532,21 @@ public class CameraDaemon {
         Thread keeper = new Thread(() -> {
             while (true) {
                 try {
-                    Process p = Runtime.getRuntime().exec(
-                            new String[]{"settings", "get", "secure", "location_mode"});
-                    String mode;
-                    try (java.io.BufferedReader r = new java.io.BufferedReader(
-                            new java.io.InputStreamReader(p.getInputStream()))) {
-                        mode = r.readLine();
-                    }
-                    p.waitFor();
-                    if (mode != null && !"3".equals(mode.trim())) {
-                        Runtime.getRuntime().exec(
-                                new String[]{"settings", "put", "secure", "location_mode", "3"})
-                                .waitFor();
-                        log("LocationModeKeeper: re-asserted location_mode=3 (was " + mode.trim() + ")");
+                    if (com.overdrive.app.config.UnifiedConfigManager.isKeepGpsWhileParkedEnabled()) {
+                        Process p = Runtime.getRuntime().exec(
+                                new String[]{"settings", "get", "secure", "location_mode"});
+                        String mode;
+                        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                                new java.io.InputStreamReader(p.getInputStream()))) {
+                            mode = r.readLine();
+                        }
+                        p.waitFor();
+                        if (mode != null && !"3".equals(mode.trim())) {
+                            Runtime.getRuntime().exec(
+                                    new String[]{"settings", "put", "secure", "location_mode", "3"})
+                                    .waitFor();
+                            log("LocationModeKeeper: re-asserted location_mode=3 (was " + mode.trim() + ")");
+                        }
                     }
                 } catch (Throwable t) {
                     // settings binary missing/denied — stay quiet, retry next tick

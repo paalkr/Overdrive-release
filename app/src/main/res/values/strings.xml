@@ -563,6 +563,9 @@
     <string name="daemons_hero_title">Background services</string>
     <!-- Subtitle on the Daemons hero header before the first state arrives. -->
     <string name="daemons_count_pending">Loading services…</string>
+    <string name="daemons_keepgps_title">Keep GPS on while parked</string>
+    <string name="daemons_keepgps_subtitle">Keeps location tracking alive at car-off so a departure starts with a warm GPS fix (better trip and dashcam sync). Uses more battery while parked. Off by default.</string>
+    <string name="daemons_keepgps_save_failed">Could not save the keep-GPS setting.</string>
     <!-- Subtitle on the Daemons hero header. %1$d running, %2$d total. -->
     <string name="daemons_count_fmt">%1$d of %2$d running</string>
     <string name="daemons_wifi_auto_enable_title">Automatically enable Wi&#8209;Fi</string>

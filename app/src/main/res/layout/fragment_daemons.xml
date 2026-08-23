@@ -2,13 +2,15 @@
 <!--
   SOTA Daemons page — portrait (1080×1920 / ~540dp × 960dp).
 
-  Hero header (title + live "X of Y running" subtitle), an OverDrive Wi-Fi
-  keep-alive preference, then a flat RecyclerView of daemon cards. Card surface alternation comes from
-  M3 surface tier (?attr/colorSurfaceContainer); side padding is owned
-  by the recycler so individual cards can use marginHorizontal=0.
+  Hero header (title + live "X of Y running" subtitle), the OverDrive Wi-Fi
+  keep-alive preference and the keep-GPS-while-parked preference, then a flat
+  RecyclerView of daemon cards. Card surface alternation comes from M3 surface
+  tier (?attr/colorSurfaceContainer); side padding is owned by the recycler so
+  individual cards can use marginHorizontal=0.
 
   IDs read by DaemonsFragment.kt:
-    recyclerDaemons, tvDaemonsCount, rowWifiAutoEnable, swWifiAutoEnable
+    recyclerDaemons, tvDaemonsCount, rowWifiAutoEnable, swWifiAutoEnable,
+    rowKeepGpsParked, swKeepGpsParked
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -49,6 +51,7 @@
             tools:text="3 of 8 running" />
     </LinearLayout>
 
+    <!-- Wi-Fi keep-alive preference (upstream PR #228) -->
     <com.google.android.material.card.MaterialCardView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -104,6 +107,57 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:contentDescription="@string/daemons_wifi_auto_enable_title" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- Keep GPS on while parked (opt-in; battery cost) -->
+    <com.google.android.material.card.MaterialCardView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="@dimen/page_padding_horizontal"
+        android:layout_marginBottom="@dimen/card_gap_vertical"
+        app:cardBackgroundColor="?attr/colorSurfaceContainer"
+        app:cardCornerRadius="@dimen/card_radius_standard"
+        app:cardElevation="0dp">
+
+        <LinearLayout
+            android:id="@+id/rowKeepGpsParked"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:padding="@dimen/card_padding_standard">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/daemons_keepgps_title"
+                    android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
+                    android:textColor="?attr/colorOnSurface" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="@string/daemons_keepgps_subtitle"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+            </LinearLayout>
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/swKeepGpsParked"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="@string/daemons_keepgps_title" />
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 

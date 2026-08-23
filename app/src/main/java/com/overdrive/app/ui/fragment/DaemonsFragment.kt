@@ -38,8 +38,10 @@ class DaemonsFragment : Fragment() {
     private lateinit var recyclerDaemons: RecyclerView
     private lateinit var tvDaemonsCount: TextView
     private lateinit var swWifiAutoEnable: SwitchMaterial
+    private lateinit var swKeepGpsParked: SwitchMaterial
     private lateinit var daemonAdapter: DaemonAdapter
     private var applyingWifiAutoEnable = false
+    private var applyingKeepGpsParked = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -86,19 +88,42 @@ class DaemonsFragment : Fragment() {
                 ).show()
             }
         }
+
+        swKeepGpsParked = view.findViewById(R.id.swKeepGpsParked)
+
+        refreshKeepGpsParked()
+        view.findViewById<View>(R.id.rowKeepGpsParked).setOnClickListener {
+            swKeepGpsParked.isChecked = !swKeepGpsParked.isChecked
+        }
+        swKeepGpsParked.setOnCheckedChangeListener { _, checked ->
+            if (applyingKeepGpsParked) return@setOnCheckedChangeListener
+            if (!UnifiedConfigManager.setKeepGpsWhileParked(checked)) {
+                applyingKeepGpsParked = true
+                swKeepGpsParked.isChecked = !checked
+                applyingKeepGpsParked = false
+                Toast.makeText(context, R.string.daemons_keepgps_save_failed, Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        // Automation and key-mapping radio actions share this preference. Reflect any
+        // Automation and key-mapping radio actions share the WiFi preference. Reflect any
         // change made through those entry points when the user returns to this page.
         if (::swWifiAutoEnable.isInitialized) refreshWifiAutoEnable()
+        if (::swKeepGpsParked.isInitialized) refreshKeepGpsParked()
     }
 
     private fun refreshWifiAutoEnable() {
         applyingWifiAutoEnable = true
         swWifiAutoEnable.isChecked = !UnifiedConfigManager.isWifiKeepAliveSuppressed()
         applyingWifiAutoEnable = false
+    }
+
+    private fun refreshKeepGpsParked() {
+        applyingKeepGpsParked = true
+        swKeepGpsParked.isChecked = UnifiedConfigManager.isKeepGpsWhileParkedEnabled()
+        applyingKeepGpsParked = false
     }
     
     private fun setupRecyclerView() {

@@ -2285,6 +2285,22 @@ object UnifiedConfigManager {
     fun setAutomationShellAllowed(allow: Boolean): Boolean =
         updateValues("automation", mapOf("allowShell" to allow))
 
+    /** Whether OverDrive keeps GPS tracking while parked (re-asserts location_mode=3
+     *  from the daemon so departures start with a warm fix). OFF by default: it keeps
+     *  the GNSS chip powered while parked, a battery cost, so it's opt-in. Read every
+     *  tick by CameraDaemon.startLocationModeKeeper. Fails closed to false. */
+    @JvmStatic
+    fun isKeepGpsWhileParkedEnabled(): Boolean =
+        try { (loadConfig().optJSONObject("location")?.optBoolean("keepGpsWhileParked", false)) ?: false }
+        catch (t: Throwable) { false }
+
+    /** Persist the keep-GPS-while-parked flag (single-key merge on the "location"
+     *  section, off the main looper — updateValues routes an app-process write to the
+     *  daemon). */
+    @JvmStatic
+    fun setKeepGpsWhileParked(enabled: Boolean): Boolean =
+        updateValues("location", mapOf("keepGpsWhileParked" to enabled))
+
     /** Whether the user has explicitly disabled OverDrive's WiFi keep-alive via the
      *  Background services setting or turned WiFi OFF via an automation / key-mapping
      *  radio action. The WiFi keep-alive watchdog (AccSentryDaemon.ensureWifiEnabled,
