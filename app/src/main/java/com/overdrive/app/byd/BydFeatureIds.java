@@ -27,6 +27,29 @@ public final class BydFeatureIds {
     public static final int BODYWORK_EMERGENCY_ALARM = resolveOrFallback(
         "BODYWORK_EMERGENCY_ALARM_STATE", 692060190);
 
+    /**
+     * Unlock SOURCE, not lock state. REMOTE_CONTROL_UNLOCK fires value 1 when the
+     * car is unlocked with the physical key fob BUTTON, and stays silent for
+     * keyless/passive door-handle entry — verified on-car 2026-08-31 by diffing
+     * every HAL event across four real unlocks (sub 48). It latches for ~240 ms
+     * then clears, so it is event-only: polling misses it.
+     *
+     * Values are platform-conditional in BYDAutoFeatureIds (isCanFD / isToyota),
+     * hence resolveOrFallback rather than a bare constant. Fallbacks are the
+     * isCanFD values observed live on this car (0x18000008 / 0x18000009).
+     */
+    public static final int BODYWORK_REMOTE_CONTROL_UNLOCK = resolveOrFallback(
+        "BODYWORK_REMOTE_CONTROL_UNLOCK", 402653192);
+
+    public static final int BODYWORK_REMOTE_CONTROL_LOCK = resolveOrFallback(
+        "BODYWORK_REMOTE_CONTROL_LOCK", 402653193);
+
+    /** int[] filter for the 2-arg bodywork registerListener overload. */
+    public static final int[] BODYWORK_UNLOCK_SOURCE_IDS = {
+        BODYWORK_REMOTE_CONTROL_UNLOCK,
+        BODYWORK_REMOTE_CONTROL_LOCK,
+    };
+
     // ==================== ENGINE ====================
     /** Engine power kW */
     public static final int ENGINE_POWER = resolveOrFallback("ENGINE_POWER", 339738656);

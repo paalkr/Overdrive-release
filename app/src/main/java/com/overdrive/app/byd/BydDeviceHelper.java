@@ -657,13 +657,42 @@ public final class BydDeviceHelper {
                     public void onPowerLevelChanged(int level) {
                         invokeCallback(callback, "onPowerLevelChanged", new Object[]{level});
                     }
+                    // Generic feature-ID channel. There is NO typed callback for
+                    // REMOTE_CONTROL_UNLOCK, so the unlock SOURCE only arrives here,
+                    // and only when the listener is also registered via the 2-arg
+                    // overload with an int[] filter (same pattern as tyre/engine).
+                    public void onDataEventChanged(int eventId, android.hardware.bydauto.BYDAutoEventValue value) {
+                        invokeCallback(callback, "onDataEventChanged", new Object[]{eventId, value});
+                    }
                 };
+
+            // Strategy 1: 2-arg overload with the unlock/lock feature-ID filter,
+            // which is what makes onDataEventChanged deliver those ids at all.
+            Method registerWithIds = findRegisterMethodWithIds(device.getClass(),
+                android.hardware.bydauto.bodywork.AbsBYDAutoBodyworkListener.class);
+            boolean twoArgRegistered = false;
+            if (registerWithIds != null) {
+                try {
+                    registerWithIds.invoke(device, listener,
+                        com.overdrive.app.byd.BydFeatureIds.BODYWORK_UNLOCK_SOURCE_IDS);
+                    logger.info("Bodywork listener registered via 2-arg overload with unlock-source feature IDs");
+                    twoArgRegistered = true;
+                } catch (Exception e) {
+                    logger.info("Bodywork 2-arg registration with unlock-source IDs failed: " + e.getMessage());
+                }
+            } else {
+                logger.info("Bodywork: no 2-arg registerListener(listener,int[]) overload on this firmware");
+            }
+
+            // Strategy 2: 1-arg registration, additive — keeps the typed
+            // door/window/power callbacks arriving regardless of the above.
             Method register = findRegisterMethod(device.getClass(),
                 android.hardware.bydauto.bodywork.AbsBYDAutoBodyworkListener.class);
             if (register != null) {
                 register.invoke(device, listener);
                 return true;
             }
+            if (twoArgRegistered) return true;
             logger.debug("registerBodyworkListener: no registerListener method on "
                 + device.getClass().getName());
         } catch (NoClassDefFoundError e) {

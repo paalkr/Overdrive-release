@@ -9453,6 +9453,31 @@ public class BydDataCollector {
             int state = (args[1] instanceof Integer) ? (Integer) args[1] : -1;
             notifyDoorStateListeners(area, state);
         }
+
+        // Unlock SOURCE. Arrives only on the generic feature-ID channel (no typed
+        // callback exists), so it needs the 2-arg filtered registration. Logged
+        // here so a real unlock proves whether the HAL delivers it to a
+        // sideloaded app; value 1 == this unlock came from the fob BUTTON,
+        // keyless/passive entry never fires it.
+        if ("onDataEventChanged".equals(method) && args != null && args.length >= 2) {
+            int eventId = (args[0] instanceof Integer) ? (Integer) args[0] : Integer.MIN_VALUE;
+            int intValue = Integer.MIN_VALUE;
+            try {
+                java.lang.reflect.Field f = args[1].getClass().getField("intValue");
+                intValue = f.getInt(args[1]);
+            } catch (Exception ignored) {}
+            String which =
+                (eventId == BydFeatureIds.BODYWORK_REMOTE_CONTROL_UNLOCK) ? "REMOTE_CONTROL_UNLOCK"
+              : (eventId == BydFeatureIds.BODYWORK_REMOTE_CONTROL_LOCK)   ? "REMOTE_CONTROL_LOCK"
+              : null;
+            if (which != null) {
+                logger.info("UNLOCK_SOURCE: " + which + " id=0x" + Integer.toHexString(eventId)
+                    + " intValue=" + intValue);
+            } else {
+                logger.info("UNLOCK_SOURCE: bodywork generic event id=0x"
+                    + Integer.toHexString(eventId) + " intValue=" + intValue + " (unmapped)");
+            }
+        }
         notifyLockSnapshotListeners(updated);
     }
 
