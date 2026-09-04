@@ -1,5 +1,5 @@
 {
-  "version": 9,
+  "version": 10,
   "default": "seal",
   "baseUrl": "https://github.com/yash-srivastava/Overdrive-release/releases/download/models-v1/",
   "batteryChemistryDefinitions": {
@@ -145,6 +145,24 @@
         "verifiedOn": "2026-08-02"
       },
       "nominalKwh": 60.48
+    },
+    {
+      "id": "atto2",
+      "name": "BYD Atto 2",
+      "file": "atto2.glb",
+      "sizeBytes": 1244776,
+      "sha256": "17840d59fda3870dc17c3b2a2c86ac940ce3211d4e17d6e31c72bc2ff0300afb",
+      "bundled": false,
+      "batteryChemistry": "lfp",
+      "batteryChemistryEvidence": {
+        "authority": "BYD",
+        "technology": "blade",
+        "nominalKwh": 45.1,
+        "configuration": "European 45.1 kWh Blade Battery",
+        "sourceUrl": "https://www.byd.com/es-es/vehiculos-electricos/atto-2.html",
+        "verifiedOn": "2026-09-04"
+      },
+      "nominalKwh": 45.1
     },
     {
       "id": "han",
