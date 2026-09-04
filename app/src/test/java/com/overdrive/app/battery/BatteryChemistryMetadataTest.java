@@ -41,7 +41,7 @@ public class BatteryChemistryMetadataTest {
     @Test
     public void everySupportedConfigurationHasManufacturerEvidenceAndResolvesLfp() throws Exception {
         JSONObject manifest = manifest();
-        assertEquals(10, manifest.getInt("version"));
+        assertEquals(11, manifest.getInt("version"));
 
         JSONArray models = manifest.getJSONArray("models");
         Set<String> actual = new HashSet<>();
