@@ -1,9 +1,16 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
 
 val openh264Version = "2.6.0"
+
+// Build-time stamp for the custom debug build's version string (configuration-time),
+// so each assembleDebug self-identifies: e.g. custom-v50.0-20260906-0930. Local-only.
+val customBuildStamp: String = SimpleDateFormat("yyyyMMdd-HHmm").format(Date())
 
 // Auto-download OpenH264 from Cisco's official binary releases
 tasks.register("downloadOpenH264") {
@@ -388,8 +395,14 @@ android {
         debug {
             isMinifyEnabled = false
 
-            // Debug builds match the active braveheart channel
-            buildConfigField("String", "UPDATE_CHANNEL", "\"braveheart\"")
+            // [local] Custom build: timestamped versionName so getInstalledVersion
+            // reads custom-v<versionName>-<ts>. Local-only — never on an upstream branch.
+            versionNameSuffix = "-$customBuildStamp"
+
+            // [local] Channel "custom": staleness guard shows the BuildConfig identity,
+            // and the self-updater checks a nonexistent "custom" channel so it never
+            // offers official builds over our changes.
+            buildConfigField("String", "UPDATE_CHANNEL", "\"custom\"")
         }
         // Braveheart: the rolling/bleeding-edge channel, shipped as a RELEASE build but
         // with diagnostics ON so braveheart customers can upload complete per-daemon
