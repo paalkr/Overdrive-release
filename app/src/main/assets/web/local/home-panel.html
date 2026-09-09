@@ -1,0 +1,968 @@
+<!--
+  Home dashboard renderer.
+
+  Deliberately ONE self-contained file with no external references, because it is
+  loaded two different ways:
+
+    1. In the car, HomePanelOverlayService reads it straight out of the APK assets
+       and hands it to a WebView via loadDataWithBaseURL. There is no HTTP in that
+       path at all — WebViewFragment already shows how much pain localhost costs on
+       this unit (sing-box sets a system proxy that WebView honours), and an overlay
+       that fails to paint because :8080 is down would be worse than no overlay.
+    2. In a browser, served from /local/home-panel.html by HttpServer, for eyeballing
+       a layout without deploying. Phase 2's designer will drive the same renderer.
+
+  Transport is abstracted for exactly that reason: window.ODPanel (the Java bridge)
+  when it exists, fetch() otherwise. Keep it that way; do not reach for either
+  directly from render code.
+
+  NO TEXT INPUT ANYWHERE. The overlay window keeps FLAG_NOT_FOCUSABLE so it can
+  never steal focus from the launcher, which means an input would silently refuse
+  the keyboard. Every control here is a tap.
+-->
+<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" id="vp" content="width=device-width, initial-scale=1">
+<script>
+/* Cell coordinates in a layout are DEVICE pixels: the grid is 40 device px per cell,
+   matching HomePanelGeometry.CELL_PX, and that is what the design was drawn against.
+   This head unit reports devicePixelRatio 1.5, so a default viewport would lay the
+   page out in 1280x487 CSS px and put every cell off-screen. Widening the layout
+   viewport to the real device width makes 1 CSS px == 1 device px again, on any
+   density, with no hardcoded resolution. Must run before any layout: keep it in head.
+   Needs WebSettings.setUseWideViewPort(true) on the hosting WebView. */
+(function () {
+  var dpr = window.devicePixelRatio || 1;
+  if (dpr === 1) return;
+  // screen.width, NOT innerWidth: this runs in <head>, where innerWidth is still 0
+  // and would set width=0 (which collapses the viewport to 256px). The panel always
+  // spans the full display width, so the screen is the right reference.
+  var w = Math.round((window.screen && screen.width ? screen.width : 0) * dpr);
+  if (w > 0) document.getElementById("vp").setAttribute("content", "width=" + w);
+})();
+</script>
+<title>Hjemflate</title>
+<style>
+  /* Grid unit. 1920x730 usable area = 48 x 18 cells. Keep in sync with
+     HomePanelGeometry.CELL_PX on the Java side. */
+  :root {
+    --cell: 40px;
+    --ink: #f1f5f8;
+    --ink2: #aab6c0;
+    --ink3: #78848d;
+    /* 0.70 relied on the backdrop blur for legibility, and this WebView (Chromium 74)
+       has no backdrop-filter, so the wallpaper's bright trees showed straight through
+       the trip tile. Denser fill instead of a blur we cannot have. */
+    --glass: rgba(11, 15, 18, 0.86);
+    --fill: rgba(255, 255, 255, 0.055);
+    --fill2: rgba(255, 255, 255, 0.10);
+    --blue: #37a6ea;
+    --blue-dim: rgba(55, 166, 234, 0.22);
+    --mint: #5ddbb6;
+    --mint-dim: rgba(93, 219, 182, 0.20);
+    --warn: #ffb870;
+    /* Card sheen, shadow and the split-pair wash are theme-dependent too, so they are
+       tokens rather than literals — otherwise the day palette below can only reach half
+       the surface. */
+    --sheen: rgba(255, 255, 255, 0.075);
+    --shadow: 0 12px 34px rgba(0, 0, 0, 0.30);
+    --pair-a: rgba(55, 166, 234, 0.20);
+    --pair-b: rgba(93, 219, 182, 0.14);
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  /* ---- DAY palette ----
+     Sampled from the native launcher in day mode rather than invented: its widget-row
+     cards are a cool blue-white #E7F4FE (not pure white) with near-black text. The panel
+     matches that so it reads as part of the home screen in daylight, the same way the
+     night palette matches the dark widget row.
+     Applied by the host as data-theme="day" on <html>; night is the default because the
+     screen is dark most of the time this car gets used. */
+  :root[data-theme="day"] {
+    --ink: #14181c;
+    --ink2: #46525f;
+    /* Labels sit on a bright card in daylight and 0.55-contrast grey washed out; this is
+       still clearly secondary but survives sun on the screen. */
+    --ink3: #5c6875;
+    /* Nearly opaque, deliberately. At 0.90 the card lost its edge against the pale sky in
+       the wallpaper and the trip tile all but disappeared. The native day cards are close
+       to opaque for the same reason, and the BYD grammar gives us no outline to fall back
+       on. Night can afford 0.86 because the wallpaper is dark there anyway. */
+    --glass: rgba(233, 243, 252, 0.96);
+    --fill: rgba(10, 40, 70, 0.06);
+    --fill2: rgba(10, 40, 70, 0.12);
+    /* Both accents darken for contrast on a light fill; the night values fail WCAG here. */
+    --blue: #1273b8;
+    --blue-dim: rgba(18, 115, 184, 0.16);
+    --mint: #00705a;
+    --mint-dim: rgba(0, 112, 90, 0.18);
+    --warn: #a6601c;
+    --sheen: rgba(255, 255, 255, 0.55);
+    --shadow: 0 10px 26px rgba(20, 45, 75, 0.22);
+    --pair-a: rgba(18, 115, 184, 0.15);
+    --pair-b: rgba(0, 112, 90, 0.11);
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden;
+    /* The window itself is translucent; the wallpaper must show through. */
+    background: transparent;
+    color: var(--ink);
+    font-family: var(--sans);
+    user-select: none; -webkit-user-select: none;
+  }
+
+  #panel { position: relative; width: 100%; height: 100%; }
+
+  /* ---- one cell = one control, each on its own glass surface ----
+     Grouping several controls under a shared card is a later feature (a
+     container cell type). On a free canvas, one cell one surface is the
+     honest default: whatever you place is what you see. */
+  .cell {
+    position: absolute;
+    background: var(--glass);
+    border-radius: 30px;
+    box-shadow: var(--shadow);
+    color: var(--ink);
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+    -webkit-backdrop-filter: blur(22px) saturate(1.18);
+    backdrop-filter: blur(22px) saturate(1.18);
+  }
+  /* Soft top highlight instead of a border. Native BYD cards have no outline;
+     an outline is what makes a wall of these read as brickwork. */
+  .cell::after {
+    content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; border-radius: inherit;
+    background: linear-gradient(var(--sheen), rgba(255, 255, 255, 0) 42%);
+    pointer-events: none;
+  }
+
+  .tap {
+    appearance: none; border: 0; background: transparent; font: inherit; color: inherit;
+    width: 100%; height: 100%; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 10px 8px;
+    transition: background 140ms, transform 90ms;
+    position: relative; z-index: 1;
+  }
+  .tap:active { transform: scale(0.965); }
+  .tap.pressed { background: var(--fill); }
+
+  .ic {
+    width: 68px; height: 68px; border-radius: 50%; background: var(--fill);
+    display: flex; align-items: center; justify-content: center; flex: 0 0 auto;
+    transition: background 160ms, color 160ms;
+  }
+  .ic img { width: 44px; height: 44px; border-radius: 10px; display: block; }
+  .ic svg { display: block; }
+  .lbl {
+    font-size: 21px; font-weight: 400; color: var(--ink2);
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* Applied to the tapped ELEMENT, not the card: inside a group tile the button
+     that was pressed is the thing that should react. */
+  .busy .ic { background: var(--mint-dim); color: var(--mint); }
+  .ok .ic { background: var(--mint-dim); color: var(--mint); }
+  /* Explicit per-theme washes rather than color-mix(): that is Chrome 111 and this
+     WebView is 74, and a later same-specificity fallback would override it everywhere
+     anyway, so it would have been dead code dressed up as progressive enhancement. */
+  .fail .ic { background: rgba(255, 184, 112, 0.22); color: var(--warn); }
+  :root[data-theme="day"] .fail .ic { background: rgba(166, 96, 28, 0.16); }
+  .ok .lbl, .busy .lbl { color: var(--ink); }
+
+  /* ---- group tile: several related buttons on one surface ----
+     Three seat positions do not need three cards. One card, three buttons, and
+     the space that used to be gaps between cards becomes button. */
+  .sgrow {
+    width: 100%; height: 100%; padding: 12px 14px;
+    display: flex; align-items: stretch;
+    position: relative; z-index: 1;
+  }
+  .sgbtn {
+    appearance: none; border: 0; font: inherit; cursor: pointer;
+    flex: 1 1 0; min-width: 0; background: var(--fill); border-radius: 22px;
+    color: var(--ink2); display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 6px;
+    transition: background 140ms, color 140ms, transform 90ms;
+  }
+  .sgbtn:hover { background: var(--fill2); }
+  .sgbtn:active { transform: scale(0.97); }
+  .sgbtn:focus-visible { outline: 3px solid var(--mint); outline-offset: 2px; }
+  .sgbtn[aria-pressed="true"] { background: var(--mint-dim); color: var(--ink); }
+  /* The icon circle would be a bubble inside a bubble here. */
+  .sgbtn .ic { background: transparent; width: 46px; height: 46px; }
+  /* Ellipsis backstop: the Java side caps the string, but a rename or an alias arriving live
+     from the store has not been through that cap when it lands, and a label that overflows its
+     button is worse than one that ends in a dot. */
+  .sgbtn .lbl {
+    font-size: 19px; max-width: 100%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .hintline { align-self: center; margin: auto; font-size: 20px; color: var(--ink3); }
+
+  /* ---- splitPair: one frame divided down the middle, label underneath ----
+     The frame is a picture of what the tile does: two panes side by side, which is the
+     same idiom the native system bar uses for its split-screen button. That is why there
+     is no "delt skjerm" eyebrow any more, and why the label uses a pipe rather than a
+     plus: the separator and the frame say the same thing.
+
+     The tile is 5 cells wide (200px), sized to this content. It used to be 9, sized for
+     the old side-by-side layout, and the content then floated in a box twice its size. */
+  .cell.type-splitPair {
+    background:
+      linear-gradient(100deg, var(--pair-a), var(--pair-b)),
+      var(--glass);
+  }
+  .cell.type-splitPair .tap { padding: 14px 12px; gap: 0; }
+  .pairframe {
+    display: flex; width: 100%; height: 72px; margin-bottom: 9px;
+    border-radius: 14px; overflow: hidden; background: var(--fill2); flex: 0 0 auto;
+  }
+  .pairframe > span { flex: 1; display: flex; align-items: center; justify-content: center; }
+  /* Card-coloured, not a hairline: it should read as one object split in two, and a thin
+     grey rule reads as a table border instead. */
+  .pairframe > span + span { border-left: 2px solid var(--glass); }
+  .pairframe img { display: block; width: 42px; height: 42px; border-radius: 10px; }
+  .pairtext { min-width: 0; max-width: 100%; text-align: center; }
+  /* 20px measures ~171px against 176px of usable width, so it fits with the ellipsis as
+     a safety net rather than as the normal case. */
+  .pairtext .n {
+    display: block; font-size: 20px; color: var(--ink);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* A control the car currently will not accept. Dimmed rather than hidden: a
+     button that vanishes is more confusing than one that explains itself. */
+  .cell.unavailable .tap, .cell.unavailable .sgrow { opacity: 0.45; }
+
+  /* glance is read-only: no press state, no pointer */
+  .cell.type-glance { cursor: default; }
+  .glance {
+    width: 100%; height: 100%; padding: 0 26px;
+    display: flex; flex-direction: column; align-items: flex-start; justify-content: center;
+    position: relative; z-index: 1;
+  }
+  .glance .v {
+    font-size: 54px; font-weight: 500; letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums; line-height: 1.05;
+    /* Never wrap mid-value: "24,7" splitting across two lines is worse than a
+       clipped tile, and it silently steals the line the subtitle needs. */
+    white-space: nowrap; max-width: 100%;
+  }
+  .glance .v small { font-size: 24px; font-weight: 400; color: var(--ink2); letter-spacing: 0; }
+  /* A long unit ("kWh/100km") cannot sit beside a 54px number in a narrow tile, so
+     it drops to its own line and the number gives up some size for it. */
+  .glance.long-unit .v { font-size: 44px; }
+  .glance.long-unit .v small { display: block; font-size: 19px; line-height: 1.2; }
+  .glance .s { font-size: 20px; color: var(--ink2); font-variant-numeric: tabular-nums; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .glance .t { font-size: 18px; color: var(--ink3); }
+  .stale .v, .stale .s { color: var(--ink3); }
+
+  /* ---- metrics tile: hero number, rule, labelled list ----
+     A 3x2 GRID, not two flex columns: the headers ("Batteri", "Rekkevidde") sit in row 1
+     and the values in row 2, so they line up because the grid says so, not because two
+     independently-centred columns happened to match. `align-content: center` centres the
+     whole two-row block, so aligning the headers costs no extra air at the bottom. The
+     rule spans both rows, and the column gap equals the tile's side padding so the rule
+     sits on the same rhythm as the tile edges. */
+  .tsum {
+    width: 100%; height: 100%; padding: 20px 22px;
+    display: grid;
+    grid-template-columns: auto 1px minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    align-content: center; column-gap: 22px;
+    position: relative; z-index: 1;
+  }
+  /* Hero-less variant: some metrics tiles are just a labelled list. Keeping an empty hero
+     column would leave exactly the dead area it is meant to avoid, so the grid collapses to
+     one column and the list spans it. */
+  .tsum.nohero { grid-template-columns: minmax(0, 1fr); }
+  .tsum.nohero .sk { grid-column: 1; grid-row: 1; }
+  .tsum.nohero .list { grid-column: 1; grid-row: 2; }
+
+  .tsum .hk { grid-column: 1; grid-row: 1; }
+  .tsum .hero { grid-column: 1; grid-row: 2; min-width: 0; }
+  .tsum .rule { grid-column: 2; grid-row: 1 / span 2; background: rgba(255, 255, 255, 0.09); }
+  :root[data-theme="day"] .tsum .rule { background: rgba(20, 45, 75, 0.14); }
+  .tsum .sk { grid-column: 3; grid-row: 1; }
+  .tsum .list { grid-column: 3; grid-row: 2; min-width: 0; }
+
+  /* One rule for both headers, so they cannot drift apart. */
+  .tsum .hk, .tsum .sk {
+    font-size: 18px; color: var(--ink3); line-height: 1.25; margin-bottom: 4px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tsum .hero .v {
+    font-size: 58px; font-weight: 500; letter-spacing: -0.03em; line-height: 1.0;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  /* A charge reads "97", a consumption reads "21,4". At 58px the short one buys nothing and
+     costs the width the rows beside it need, so it steps down automatically. */
+  .tsum .hero.short .v { font-size: 48px; }
+  /* A short unit rides on the number's line; only a long one gets its own. */
+  .tsum .hero .v small {
+    font-size: 20px; font-weight: 400; color: var(--ink2); letter-spacing: 0; margin-left: 5px;
+  }
+  .tsum .hero .u { font-size: 18px; color: var(--ink2); line-height: 1.25; margin-top: 1px; }
+  .tsum .hero .u:empty { display: none; }
+
+  /* Two columns: label, then number-with-unit. Numbers are LEFT-aligned, so they share a
+     left edge and a row without a unit (Tid) lines up with the rest for free. The unit is
+     NOT its own column here: with mixed units an aligned unit column leaves a short number
+     detached from the unit it belongs to. Pål's call (2026-08-14), for the trip tile. */
+  .tsum .list {
+    display: grid;
+    /* No column-gap: the label-to-number air and the number-to-unit hair are different
+       jobs and one gap cannot serve both — tightening the tile for width crushed the first
+       and shoved units against the numbers. They are margins below instead. The label
+       column is 1fr, so any width the tile has beyond its content widens the label gap
+       rather than pooling at the edge. */
+    align-content: start; column-gap: 0; row-gap: 6px;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .tsum .list .k {
+    font-size: 20px; color: var(--ink3); align-self: baseline;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tsum .list .val {
+    font-size: 25px; font-weight: 500; text-align: left; white-space: nowrap;
+    font-variant-numeric: tabular-nums; letter-spacing: -0.01em; align-self: baseline;
+    margin-left: 18px;   /* minimum air after the label; 1fr adds any surplus */
+  }
+  .tsum .list .val .unit {
+    font-size: 17px; font-weight: 400; color: var(--ink2); letter-spacing: 0; margin-left: 4px;
+  }
+
+  /* Third column, RIGHT-aligned numbers — used when every row in the list carries the same
+     unit (the battery tile: two km figures). The objection above does not apply then, since
+     an aligned unit column is the row's own unit for every row, and right alignment lines
+     the digits up so the two numbers can be compared. Pål's call (2026-08-14): A for the
+     trip tile, B for the battery tile. `buildTripSummary` picks per tile from UNITS, so a
+     tile configured later gets whichever fits its field set. */
+  .tsum .list.numcol { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .tsum .list.numcol .val { text-align: right; }
+  .tsum .list.numcol > .unit {
+    font-size: 17px; font-weight: 400; color: var(--ink2); letter-spacing: 0;
+    align-self: baseline; margin-left: 4px; white-space: nowrap;
+  }
+
+  /* The trip tile reads at a glance while driving, so its type is ~12% larger than the
+     battery tile's — Pål's call (2026-08-14). Scoped to the hero-less variant so the battery
+     tile, which is read while parked and sits in a shorter cell, keeps its own scale. Sizes
+     are stepped, not transform-scaled: a transform would blur the digits on this DPI. The
+     cell is widened to match (see HomePanelLayouts) — at the old 8 cells this overflowed. */
+  .tsum.nohero .sk { font-size: 20px; }
+  /* Slightly more leading than the battery tile: the cell has to step to 8 grid rows to fit
+     the header, which leaves ~32px over, and spending it between the rows reads better than
+     leaving a hole at the bottom. Larger type wants the extra leading anyway. */
+  .tsum.nohero .list { row-gap: 9px; }
+  .tsum.nohero .list .k { font-size: 22px; }
+  .tsum.nohero .list .val { font-size: 28px; }
+  .tsum.nohero .list .val .unit { font-size: 19px; }
+  .tsum.nohero .list.numcol > .unit { font-size: 19px; }
+
+  .tsum .stale { color: var(--ink3); }
+  /* ---- Chromium 74 compatibility ----
+     NOTE: the flex `gap` declarations these margins replace have been REMOVED rather than
+     left in place. Both apply on a modern engine, so every gap rendered at double width in
+     the browser previews while the car showed the intended value — which made the previews
+     a misleading thing to judge spacing by. Found by measuring gap-vs-padding, 2026-08-14.
+     This head unit's WebView is Chromium 74 (2019). Flexbox `gap` did not ship until
+     Chrome 84, so every flex gap above is inert here and the tiles would render with
+     their contents touching. These sibling margins do the same job on this engine.
+     `inset` (Chrome 87) is expanded to its four longhands for the same reason, and
+     -webkit-backdrop-filter (Chrome 76) simply does not apply — the cards keep their
+     translucent fill without the blur, which is a small aesthetic loss, not a break.
+     Revisit if the unit ever ships a newer WebView. */
+  .tap > * + * { margin-top: 11px; }
+  .cell.type-splitPair .tap > * + * { margin-top: 0; margin-left: 18px; }
+  .sgrow > * + * { margin-left: 8px; }
+  .sgbtn > * + * { margin-top: 6px; }
+  .glance > * + * { margin-top: 2px; }
+
+  /* toast, bottom centre of the panel area */
+  #toast {
+    position: absolute; left: 50%; bottom: 18px; transform: translate(-50%, 10px);
+    background: rgba(8, 12, 11, 0.94); color: var(--mint);
+    font-size: 21px; padding: 12px 26px; border-radius: 999px;
+    opacity: 0; transition: opacity 180ms, transform 180ms; pointer-events: none;
+    max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.fail { color: var(--warn); }
+
+  #empty {
+    position: absolute; top: 0; right: 0; bottom: 0; left: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink3); font-size: 24px; text-align: center; padding: 0 60px;
+  }
+  #empty[hidden] { display: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition-duration: 1ms !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <p id="empty">Laster oppsett…</p>
+  <div id="toast"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var CELL = 40;
+
+  /* ================= transport =================
+     Bridge in the car, fetch in a browser. Bridge methods are synchronous and
+     return JSON strings; actions are fire-and-forget because the Java side does
+     IPC for some of them and must not block the JS thread. Results come back
+     through window.ODPanelHost.onResult. */
+  var T = (function () {
+    var b = window.ODPanel;
+    if (b) {
+      return {
+        kind: "bridge",
+        layout: function () { return Promise.resolve(JSON.parse(b.getLayout())); },
+        state: function () { return Promise.resolve(JSON.parse(b.getState())); },
+        invoke: function (action, ref) { b.invoke(action, ref || ""); }
+      };
+    }
+    function j(url, opts) {
+      return fetch(url, opts || {}).then(function (r) {
+        if (!r.ok) throw new Error(r.status + " " + url);
+        return r.json();
+      });
+    }
+    return {
+      kind: "http",
+      layout: function () { return j("/api/home/layout"); },
+      state: function () { return j("/api/home/state"); },
+      invoke: function (action, ref) {
+        j("/api/home/invoke", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: action, ref: ref || "" })
+        }).then(function (res) {
+          window.ODPanelHost.onResult(JSON.stringify(res));
+        }).catch(function (e) {
+          window.ODPanelHost.onResult(JSON.stringify({ ok: false, message: String(e.message || e) }));
+        });
+      }
+    };
+  })();
+
+  /* ================= icons ================= */
+  var ICON = {
+    seat: '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v8h8"/><path d="M15 12v8H5"/></svg>',
+    app: '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><rect x="4" y="4" width="16" height="16" rx="4"/></svg>',
+    split: '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="4" width="8" height="16" rx="2"/><rect x="13" y="4" width="8" height="16" rx="2"/></svg>',
+    spin: '<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>',
+    ok: '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>',
+    fail: '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 7v7M12 17h.01"/><circle cx="12" cy="12" r="9" stroke-width="1.4"/></svg>'
+  };
+
+  function el(tag, cls) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    return e;
+  }
+
+  /* ================= render ================= */
+  var panel = document.getElementById("panel");
+  var toastEl = document.getElementById("toast");
+  var emptyEl = document.getElementById("empty");
+  var cells = [];          // {def, node, iconNode}
+  var lastState = {};
+
+  function place(node, def) {
+    node.style.left = (def.x * CELL) + "px";
+    node.style.top = (def.y * CELL) + "px";
+    node.style.width = (def.w * CELL) + "px";
+    node.style.height = (def.h * CELL) + "px";
+  }
+
+  function iconMarkup(def, fallback) {
+    if (def.icon) return '<img src="' + def.icon + '" alt="">';
+    return fallback;
+  }
+
+  function buildSeat(def) {
+    var btn = el("button", "tap");
+    btn.type = "button";
+    btn.innerHTML = '<span class="ic">' + ICON.seat + '</span><span class="lbl"></span>';
+    btn.querySelector(".lbl").textContent = def.label || "Seteposisjon";
+    btn.addEventListener("click", function () {
+      // Same gate the Seat Positions page uses to enable its Apply button. Note
+      // this is not the whole truth: the car itself refuses a seat write out of P,
+      // below OverDrive, so an available-looking cell can still be refused. The
+      // toast for that case comes back from the daemon.
+      if (seatBlocked()) {
+        toast(seatBlockMessage(), false);
+        return;
+      }
+      fire(def, "seatApply", def.ref);
+    });
+    return btn;
+  }
+
+  function seatBlocked() {
+    var s = lastState.seat;
+    if (!s || s.known === false) return false;   // unknown: let the car answer
+    return !s.acc || !!s.movementBlocked;
+  }
+
+  function seatBlockMessage() {
+    var s = lastState.seat || {};
+    return !s.acc
+      ? "Bilen er av, så setemotorene har ingen strøm."
+      : "Bilen er i bevegelse.";
+  }
+
+  function paintSeatGate() {
+    var blocked = seatBlocked();
+    /* Names come from the position store with every state push, so a rename in the seat
+       system shows up here within one poll instead of waiting for the layout to be re-seeded.
+       The layout's own label stays the fallback: a ref the store no longer knows keeps the
+       text it was given rather than blanking, and an unreachable daemon changes nothing. */
+    var names = (lastState.seat && lastState.seat.names) || null;
+    cells.forEach(function (c) {
+      if (c.def.type === "seatProfile" || c.def.type === "seatGroup") {
+        c.node.classList.toggle("unavailable", blocked);
+      }
+      if (!names) return;
+      c.node.querySelectorAll(".sgbtn").forEach(function (b) {
+        var ref = b.getAttribute("data-ref");
+        if (!ref) return;
+        var name = names[ref];
+        var lbl = b.querySelector(".lbl");
+        if (name && lbl && lbl.textContent !== name) lbl.textContent = name;
+      });
+    });
+  }
+
+  function buildApp(def) {
+    var btn = el("button", "tap");
+    btn.type = "button";
+    btn.innerHTML = '<span class="ic">' + iconMarkup(def, ICON.app) + '</span><span class="lbl"></span>';
+    btn.querySelector(".lbl").textContent = def.label || def.ref || "App";
+    btn.addEventListener("click", function () { fire(def, "launchApp", def.ref); });
+    return btn;
+  }
+
+  function buildSplit(def) {
+    var btn = el("button", "tap");
+    btn.type = "button";
+    var refs = String(def.ref || "").split("+");
+    var halves = "";
+    for (var i = 0; i < 2; i++) {
+      var ic = def.icons && def.icons[i];
+      // A missing icon keeps its half of the frame, empty. Collapsing it would make the
+      // frame stop looking like a split screen over one uninstalled app.
+      halves += "<span>" + (ic ? '<img src="' + ic + '" alt="">' : "") + "</span>";
+    }
+    btn.innerHTML =
+      '<span class="pairframe">' + halves + '</span>' +
+      '<span class="pairtext"><span class="n"></span></span>';
+    btn.querySelector(".n").textContent = def.label || refs.join(" | ");
+    btn.addEventListener("click", function () { fire(def, "launchSplit", def.ref); });
+    return btn;
+  }
+
+  function buildGlance(def) {
+    var box = el("div", "glance");
+    box.innerHTML = '<span class="t"></span><span class="v"></span><span class="s"></span>';
+    box.querySelector(".t").textContent = def.label || "";
+    return box;
+  }
+
+  function paintGlance(entry) {
+    var def = entry.def;
+    var g = entry.node.querySelector(".glance");
+    if (!g) return;
+    var f = (lastState.fields || {})[def.ref];
+    var v = g.querySelector(".v");
+    var s = g.querySelector(".s");
+    if (!f || f.value === null || f.value === undefined) {
+      v.innerHTML = "&ndash;";
+      s.textContent = "";
+      entry.node.classList.add("stale");
+      return;
+    }
+    entry.node.classList.toggle("stale", !!f.stale);
+    // "kWh/100km" beside a 54px number needs a tile nobody would place. Six
+    // characters is where "km/h" still fits inline and "kWh/100km" does not.
+    g.classList.toggle("long-unit", !!f.unit && f.unit.length > 6);
+    v.innerHTML = String(f.value) + (f.unit ? ' <small>' + f.unit + "</small>" : "");
+    s.textContent = f.sub || "";
+  }
+
+  /* The only place display text for a metric lives, so the eventual move to
+     string resources has one site to change rather than six. */
+  var LABELS = {
+    "soc": "Batteri",
+    /* Inside a metrics list the two ranges sit together, so they need telling apart.
+       Naming is Pål's call (2026-08-14). Worth recording that "WLTP" is his label for the
+       car's own figure, not a verified claim about how the car derives it — it may be an
+       adaptive estimate rather than a WLTP derivation. "Estimert" is ours, from recent
+       real consumption. */
+    "range": "WLTP",
+    "range.recent": "Estimert",
+    /* The trip's average so far (energy since start / distance since start x 100), NOT a
+       rolling window — the rolling figure is `range.recent`'s input and lives on the
+       battery tile as Estimert. */
+    "trip.consumption": "Forbruk",
+    "trip.energy": "Energi",
+    "trip.distance": "Distanse",
+    "trip.duration": "Tid",
+    "trip.speed": "Snitt",
+    "trip.maxSpeed": "Maks",
+    "recent.consumption": "Snittforbruk"
+  };
+
+  /* Units per field, mirroring HomePanelState.field(...). Used ONLY to decide the list's
+     number alignment at build time — the unit actually rendered still comes from the state,
+     so a wrong entry here costs alignment, never a wrong unit. Deciding from the configured
+     field set rather than the painted values matters: a null value paints "–" with no unit,
+     and deciding from that would flip the whole column's alignment whenever one row went
+     stale. */
+  var UNITS = {
+    "soc": "%",
+    "range": "km", "range.recent": "km",
+    "trip.consumption": "kWh/100km", "trip.energy": "kWh", "trip.distance": "km",
+    "trip.duration": "", "trip.speed": "km/h", "trip.maxSpeed": "km/h",
+    "recent.consumption": "kWh/100km"
+  };
+
+  /* True when every row carries the same non-empty unit — see the .numcol CSS. */
+  function unitsUniform(keys) {
+    if (keys.length < 2) return false;
+    var first = UNITS[keys[0]];
+    if (!first) return false;
+    for (var i = 1; i < keys.length; i++) {
+      if (UNITS[keys[i]] !== first) return false;
+    }
+    return true;
+  }
+
+  /* First key is the hero, the rest are the list. */
+  /* range.recent moved to the battery tile, where it sits next to the car's own number —
+     that comparison is the point of computing it. */
+  var TRIP_SUMMARY_DEFAULT = [
+    "trip.consumption",
+    "trip.energy", "trip.distance", "trip.duration", "trip.speed", "trip.maxSpeed"
+  ];
+
+  function buildTripSummary(def) {
+    var keys = def.ref ? String(def.ref).split(",").map(function (k) { return k.trim(); })
+                       : TRIP_SUMMARY_DEFAULT;
+    keys = keys.filter(Boolean);
+
+    var box = el("div", "tsum");
+    // hero:false makes every ref a list row, including the first.
+    var withHero = def.hero !== false;
+    if (!withHero) box.classList.add("nohero");
+
+    if (withHero) {
+      var hk = el("span", "hk");
+      hk.textContent = LABELS[keys[0]] || keys[0] || "";
+      box.appendChild(hk);
+
+      var hero = el("div", "hero");
+      hero.setAttribute("data-field", keys[0] || "");
+      hero.innerHTML = '<span class="v">&ndash;</span><span class="u"></span>';
+      box.appendChild(hero);
+
+      box.appendChild(el("div", "rule"));
+    }
+
+    var sk = el("span", "sk");
+    sk.textContent = def.listLabel || "";
+    box.appendChild(sk);
+
+    var listKeys = withHero ? keys.slice(1) : keys;
+    var list = el("div", "list");
+    var numcol = unitsUniform(listKeys);
+    if (numcol) list.classList.add("numcol");
+    listKeys.forEach(function (key) {
+      var k = el("span", "k");
+      k.textContent = LABELS[key] || key;
+      var v = el("span", "val");
+      v.setAttribute("data-field", key);
+      v.innerHTML = "&ndash;";
+      list.appendChild(k);
+      list.appendChild(v);
+      // The unit is its own grid cell only in numcol; otherwise the painter nests it in .val.
+      if (numcol) list.appendChild(el("span", "unit"));
+    });
+    box.appendChild(list);
+    return box;
+  }
+
+  function paintTripSummary(entry) {
+    var fields = lastState.fields || {};
+
+    var hero = entry.node.querySelector(".tsum .hero");
+    if (hero) {   // absent on a hero-less tile
+      var hf = fields[hero.getAttribute("data-field")];
+      var hv = hero.querySelector(".v");
+      var hu = hero.querySelector(".u");
+      var unit = hf ? (hf.unit || "") : "";
+      // A short unit rides on the number's line: "100 %" reads as one value, whereas the
+      // stacked form is only needed by something like kWh/100km that cannot fit beside it.
+      var inlineUnit = unit.length <= 2;
+      if (!hf || hf.value === null || hf.value === undefined) {
+        hv.innerHTML = "&ndash;";
+        hu.textContent = inlineUnit ? "" : unit;
+        hero.classList.add("stale");
+        hero.classList.add("short");
+      } else {
+        hero.classList.toggle("stale", !!hf.stale);
+        hv.innerHTML = "";
+        hv.appendChild(document.createTextNode(String(hf.value)));
+        if (inlineUnit && unit) {
+          var u = document.createElement("small");
+          u.textContent = unit;
+          hv.appendChild(u);
+        }
+        hu.textContent = inlineUnit ? "" : unit;
+        hero.classList.toggle("short", String(hf.value).length <= 3);
+      }
+    }
+
+    entry.node.querySelectorAll(".tsum .list .val").forEach(function (v) {
+      var f = fields[v.getAttribute("data-field")];
+      // In numcol the unit lives in a sibling cell, built alongside this one.
+      var sib = v.nextElementSibling;
+      var cell = (sib && sib.className === "unit") ? sib : null;
+      if (!f || f.value === null || f.value === undefined) {
+        v.innerHTML = "&ndash;";
+        v.classList.add("stale");
+        // Keep the unit: a dash under "km" still reads as a missing range, and dropping it
+        // would collapse the column's width mid-session.
+        if (cell) cell.textContent = UNITS[v.getAttribute("data-field")] || "";
+        return;
+      }
+      v.classList.toggle("stale", !!f.stale);
+      v.innerHTML = "";
+      v.appendChild(document.createTextNode(String(f.value)));
+      if (cell) {
+        cell.textContent = f.unit || "";
+      } else if (f.unit) {
+        var u = document.createElement("span");
+        u.className = "unit";
+        u.textContent = f.unit;
+        v.appendChild(u);
+      }
+    });
+  }
+
+  /**
+   * Several seat positions on one surface. Items come from the layout
+   * (`items:[{ref,label}]`), so which positions appear here is configuration, not
+   * code, and the designer will edit the same list.
+   */
+  function buildSeatGroup(def) {
+    var wrap = el("div", "sgrow");
+    var items = (def.items && def.items.length) ? def.items : [];
+    if (!items.length) {
+      var hint = el("span", "hintline");
+      hint.textContent = "Ingen posisjoner valgt";
+      wrap.appendChild(hint);
+      return wrap;
+    }
+    items.forEach(function (it) {
+      var b = el("button", "sgbtn");
+      b.type = "button";
+      b.setAttribute("aria-pressed", "false");
+      b.setAttribute("data-ref", it.ref || "");
+      b.innerHTML = '<span class="ic">' + ICON.seat + '</span><span class="lbl"></span>';
+      b.querySelector(".lbl").textContent = it.label || "Posisjon";
+      b.addEventListener("click", function () {
+        if (seatBlocked()) { toast(seatBlockMessage(), false); return; }
+        wrap.querySelectorAll(".sgbtn").forEach(function (o) {
+          o.setAttribute("aria-pressed", String(o === b));
+        });
+        fire(def, "seatApply", it.ref, b, ICON.seat);
+      });
+      wrap.appendChild(b);
+    });
+    return wrap;
+  }
+
+  var BUILDERS = {
+    /* `metrics` is the honest name: hero plus an aligned list of whatever refs the cell
+       names. `tripSummary` stays as an alias so a stored layout keeps working. */
+    metrics: buildTripSummary,
+    seatProfile: buildSeat,
+    seatGroup: buildSeatGroup,
+    app: buildApp,
+    splitPair: buildSplit,
+    glance: buildGlance,
+    tripSummary: buildTripSummary
+  };
+
+  function render(layout) {
+    cells.forEach(function (c) { c.node.remove(); });
+    cells = [];
+    var defs = (layout && layout.cells) || [];
+    emptyEl.hidden = defs.length > 0;
+    if (!defs.length) emptyEl.textContent = "Ingen elementer plassert enn\u00e5.";
+
+    defs.forEach(function (def) {
+      var build = BUILDERS[def.type];
+      if (!build) return;   // unknown type: skip rather than draw a broken box
+      var node = el("div", "cell type-" + def.type);
+      place(node, def);
+      node.appendChild(build(def));
+      panel.insertBefore(node, toastEl);
+      var entry = { def: def, node: node };
+      cells.push(entry);
+      if (def.type === "glance") paintGlance(entry);
+      if (def.type === "tripSummary" || def.type === "metrics") paintTripSummary(entry);
+    });
+    paintSeatGate();
+  }
+
+  /* ================= actions ================= */
+  var pending = null;
+
+  function setIcon(target, markup) {
+    var ic = target.querySelector(".ic");
+    if (ic) ic.innerHTML = markup;
+  }
+
+  /**
+   * Run an action and animate the element that was actually tapped. For a plain
+   * cell that is its button; for a group tile it is the one button inside it, so a
+   * three-position tile does not flash all three.
+   */
+  function fire(def, action, ref, target, restoreIcon) {
+    var entry = cells.filter(function (c) { return c.def === def; })[0];
+    if (!target && entry) target = entry.node.querySelector(".tap");
+    if (target) {
+      if (pending && pending.target === target) return;   // ignore a double tap
+      target.classList.remove("ok", "fail");
+      target.classList.add("busy");
+      if (!restoreIcon) restoreIcon = defaultIcon(def);
+      setIcon(target, ICON.spin);
+      pending = { target: target, restoreIcon: restoreIcon };
+    }
+    T.invoke(action, ref);
+  }
+
+  function defaultIcon(def) {
+    return def.type === "seatProfile" || def.type === "seatGroup" ? ICON.seat
+      : def.type === "app" ? iconMarkup(def, ICON.app)
+      : ICON.split;
+  }
+
+  function restore(p) {
+    if (!p || !p.target) return;
+    p.target.classList.remove("busy", "ok", "fail");
+    setIcon(p.target, p.restoreIcon);
+  }
+
+  function toast(msg, ok) {
+    toastEl.textContent = msg;
+    toastEl.classList.toggle("fail", !ok);
+    toastEl.classList.add("show");
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { toastEl.classList.remove("show"); }, 2600);
+  }
+
+  /* Called from Java (evaluateJavascript) and from the HTTP transport. */
+  /**
+   * Day or night, decided by the host (which resolves the app's theme preference and the
+   * head unit's own night mode) and pushed with the state. Night is the default, so a
+   * host that never says anything keeps today's appearance.
+   */
+  function applyTheme(theme) {
+    var day = theme === "day";
+    var root = document.documentElement;
+    if (day) root.setAttribute("data-theme", "day");
+    else root.removeAttribute("data-theme");
+  }
+
+  window.ODPanelHost = {
+    onTheme: function (theme) { applyTheme(theme); },
+
+    onResult: function (json) {
+      var res;
+      try { res = JSON.parse(json); } catch (e) { res = { ok: false, message: String(json) }; }
+      var p = pending;
+      pending = null;
+      if (p && p.target) {
+        p.target.classList.remove("busy");
+        p.target.classList.add(res.ok ? "ok" : "fail");
+        setIcon(p.target, res.ok ? ICON.ok : ICON.fail);
+        setTimeout(function () { restore(p); }, res.ok ? 1400 : 2400);
+      }
+      if (res.message) toast(res.message, !!res.ok);
+    },
+    onLayout: function (json) {
+      try { render(JSON.parse(json)); } catch (e) { /* keep the old layout on bad JSON */ }
+    },
+    onState: function (json) {
+      try { lastState = JSON.parse(json); } catch (e) { return; }
+      if (lastState.theme) applyTheme(lastState.theme);
+      cells.forEach(function (c) {
+        if (c.def.type === "glance") paintGlance(c);
+        if (c.def.type === "tripSummary" || c.def.type === "metrics") paintTripSummary(c);
+      });
+      paintSeatGate();
+    }
+  };
+
+  /* ================= boot ================= */
+  function refreshState() {
+    T.state().then(function (s) {
+      lastState = s;
+      if (s.theme) applyTheme(s.theme);
+      cells.forEach(function (c) {
+        if (c.def.type === "glance") paintGlance(c);
+        if (c.def.type === "tripSummary" || c.def.type === "metrics") paintTripSummary(c);
+      });
+      paintSeatGate();
+    }).catch(function () { /* leave the last good values on screen */ });
+  }
+
+  T.layout()
+    .then(function (l) { render(l); refreshState(); })
+    .catch(function (e) {
+      emptyEl.hidden = false;
+      emptyEl.textContent = "Kunne ikke laste oppsettet.";
+    });
+
+  /* Only the glance cells need polling, and only while we are actually visible.
+     The Java side also pushes onState/onLayout, so this is the fallback, not the
+     primary path. */
+  var timer = null;
+  function startPolling() {
+    if (timer) return;
+    timer = setInterval(function () {
+      if (cells.some(function (c) {
+        return c.def.type === "glance" || c.def.type === "tripSummary"
+               || c.def.type === "metrics";
+      })) refreshState();
+    }, 5000);
+  }
+  function stopPolling() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) stopPolling(); else { startPolling(); refreshState(); }
+  });
+  startPolling();
+})();
+</script>
+</body>
+</html>

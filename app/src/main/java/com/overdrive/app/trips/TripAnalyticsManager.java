@@ -8,6 +8,8 @@ import com.overdrive.app.monitor.GearMonitor;
 import com.overdrive.app.storage.StorageManager;
 import com.overdrive.app.telemetry.TelemetryDataCollector;
 
+import org.json.JSONObject;
+
 import java.io.File;
 import java.util.List;
 
@@ -134,6 +136,187 @@ public class TripAnalyticsManager {
 
         // 3. Log shutdown
         logger.info("TripAnalyticsManager shut down");
+    }
+
+    // ==================== LIVE TRIP READOUT ====================
+
+    /**
+     * How much driving the "recent consumption" figure averages over. Long enough
+     * to wash out the winter cabin-heating spike that dominates the first few km,
+     * short enough to still describe how the car is being driven now.
+     */
+    private static final double RECENT_CONSUMPTION_TARGET_KM = 50.0;
+
+    /** How far back to look for those kilometres before giving up. */
+    private static final int RECENT_CONSUMPTION_MAX_DAYS = 60;
+    private static final int RECENT_CONSUMPTION_MAX_TRIPS = 80;
+
+    /**
+     * Below this distance a live kWh/100km figure is arithmetic noise: the energy
+     * reading is integer-ish, the distance is small, and the quotient swings wildly.
+     * Reported as null rather than as a number nobody should read.
+     */
+    private static final double MIN_DISTANCE_FOR_CONSUMPTION_KM = 0.5;
+
+    /**
+     * A snapshot of the trip in progress, for live readouts (the home dashboard's
+     * glance cells, and anything else that wants "so far this trip").
+     *
+     * <p>Everything here is either tracked live by {@link TripTelemetryRecorder} or
+     * derived from the trip's own start values. Nothing is invented: a value that is
+     * not knowable yet is JSON null, never zero. In particular {@code consumption}
+     * is deliberately absent for the first {@value #MIN_DISTANCE_FOR_CONSUMPTION_KM}
+     * km, because a fresh trip's kWh/100km is dominated by the heating spike and the
+     * quotient's own instability.
+     *
+     * <p>Distance comes from the recorder's fused live figure, NOT the hardware
+     * odometer delta that {@code finalizeActiveTrip} prefers, because the odometer
+     * delta only exists once the trip has ended. The two can differ by a little; the
+     * live one is what the driver is watching change.
+     */
+    public synchronized JSONObject currentTripSnapshot() {
+        JSONObject o = new JSONObject();
+        try {
+            boolean active = enabled && detector != null && detector.isTripActive();
+            o.put("active", active);
+            Double recent = recentConsumptionKwhPer100Km(RECENT_CONSUMPTION_TARGET_KM);
+            o.put("recentConsumptionKwhPer100Km", orNull(recent));
+            o.put("recentConsumptionWindowKm", RECENT_CONSUMPTION_TARGET_KM);
+
+            // Remaining energy and the range it implies at the recent real-world rate.
+            // Computed HERE, in the daemon, because VehicleDataMonitor only has data in
+            // the daemon process — the app process holds an empty instance of it. The
+            // home panel learned that the hard way on 2026-08-13, showing a dash for a
+            // battery reading the car knew perfectly well.
+            Double remainingKwh = null;
+            try {
+                double k = com.overdrive.app.monitor.VehicleDataMonitor.getInstance()
+                        .getBatteryRemainPowerKwh();
+                if (k > 0) remainingKwh = k;
+            } catch (Throwable ignored) {
+            }
+            o.put("remainingKwh", orNull(remainingKwh));
+            o.put("rangeFromRecentKm",
+                    (remainingKwh != null && recent != null && recent > 0)
+                            ? (Object) Math.round(remainingKwh / recent * 100.0)
+                            : JSONObject.NULL);
+            if (!active) return o;
+
+            TripRecord trip = detector.getActiveTrip();
+            if (trip == null) {
+                o.put("active", false);
+                return o;
+            }
+
+            double distanceKm = recorder != null ? recorder.getTotalDistanceKm() : 0;
+            long durationSec = Math.max(0, (System.currentTimeMillis() - trip.startTime) / 1000);
+
+            o.put("distanceKm", distanceKm);
+            o.put("durationSeconds", durationSec);
+            o.put("avgSpeedKmh", recorder != null ? recorder.getAvgSpeedKmh() : JSONObject.NULL);
+            o.put("maxSpeedKmh", recorder != null ? recorder.getMaxSpeedKmh() : JSONObject.NULL);
+
+            // Energy used so far, tiered exactly like TripRecord.getEnergyUsedKwh() so
+            // the live figure and the one this trip finally records come from the same
+            // source in the same order. Getting this wrong would put a tile on the home
+            // screen that disagrees with the trip log for the same drive.
+            //
+            // Tier 1 is the net remaining-energy delta (regen-inclusive). Tier 2 is the
+            // car's gross electricity accumulator, which matters MORE here than at
+            // finalize: remaining energy is derived from an integer SoC whose smallest
+            // step is several km, so for the first part of a trip the net delta reads
+            // exactly zero. That is the stretch where a consumption tile is most looked
+            // at, and where reporting nothing would look broken.
+            Double energyUsedKwh = null;
+            String energySource = null;
+            double kwhNow = 0, elecConNow = Double.NaN;
+            try {
+                kwhNow = com.overdrive.app.monitor.VehicleDataMonitor.getInstance()
+                        .getBatteryRemainPowerKwh();
+            } catch (Throwable ignored) {
+            }
+            try {
+                elecConNow = com.overdrive.app.monitor.VehicleDataMonitor.getInstance()
+                        .getTotalElecCon();
+            } catch (Throwable ignored) {
+            }
+
+            boolean haveNet = trip.kwhStart > 0 && kwhNow > 0;
+            if (haveNet && trip.kwhStart > kwhNow) {
+                energyUsedKwh = trip.kwhStart - kwhNow;
+                energySource = "net";
+            } else if (haveNet && kwhNow > trip.kwhStart) {
+                // Regenerated more than drawn so far (a descent). On balance nothing
+                // was consumed; report zero rather than a negative or the gross draw.
+                energyUsedKwh = 0.0;
+                energySource = "net";
+            } else if (trip.elecConStart >= 0 && !Double.isNaN(elecConNow)
+                    && elecConNow >= trip.elecConStart) {
+                energyUsedKwh = elecConNow - trip.elecConStart;
+                energySource = "metered";
+            }
+            o.put("energyUsedKwh", orNull(energyUsedKwh));
+            o.put("energySource", energySource == null ? JSONObject.NULL : energySource);
+
+            Double consumption = null;
+            if (energyUsedKwh != null && distanceKm >= MIN_DISTANCE_FOR_CONSUMPTION_KM) {
+                consumption = energyUsedKwh / distanceKm * 100.0;
+            }
+            o.put("consumptionKwhPer100Km", orNull(consumption));
+            o.put("socStart", trip.socStart > 0 ? trip.socStart : JSONObject.NULL);
+        } catch (Throwable t) {
+            logger.warn("currentTripSnapshot failed: " + t.getMessage());
+        }
+        return o;
+    }
+
+    /**
+     * Real-world consumption over roughly the last {@code targetKm} of driving,
+     * assembled from completed trips newest-first.
+     *
+     * <p>Per trip, energy prefers the metered BMS delta (kwhStart - kwhEnd) and falls
+     * back to {@code energyPerKm × distanceKm}. Trips with a negative delta (charged
+     * mid-trip) or no usable energy figure are skipped rather than guessed at, and the
+     * distance of a skipped trip does not count toward the window either — otherwise
+     * the average would silently dilute.
+     *
+     * <p>Returns null when less than half the window could be assembled: an average
+     * over 4 km is not the number this is supposed to be.
+     */
+    public Double recentConsumptionKwhPer100Km(double targetKm) {
+        if (!enabled || database == null) return null;
+        try {
+            List<TripRecord> trips =
+                    database.getTrips(RECENT_CONSUMPTION_MAX_DAYS, RECENT_CONSUMPTION_MAX_TRIPS);
+            if (trips == null || trips.isEmpty()) return null;
+
+            double km = 0, kwh = 0;
+            for (TripRecord t : trips) {
+                if (t == null || t.distanceKm <= 0) continue;
+
+                Double used = null;
+                if (t.kwhStart > 0 && t.kwhEnd > 0) {
+                    double d = t.kwhStart - t.kwhEnd;
+                    if (d >= 0) used = d;
+                } else if (t.energyPerKm > 0) {
+                    used = t.energyPerKm * t.distanceKm;
+                }
+                if (used == null) continue;
+
+                km += t.distanceKm;
+                kwh += used;
+                if (km >= targetKm) break;
+            }
+            if (km < targetKm / 2 || kwh <= 0) return null;
+            return kwh / km * 100.0;
+        } catch (Throwable t) {
+            logger.warn("recentConsumption failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static Object orNull(Double d) {
+        return (d == null || d.isNaN() || d.isInfinite()) ? JSONObject.NULL : d;
     }
 
     // ==================== GEAR FORWARDING ====================
