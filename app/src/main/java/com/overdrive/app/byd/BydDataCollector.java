@@ -2488,6 +2488,14 @@ public class BydDataCollector {
                 // before the corresponding collector value becomes externally stable.
                 com.overdrive.app.monitor.ChargingDetector.getInstance().updateAccState(isOn);
 
+                // ACC just turned ON: easy-entry's job is done (or never started) — disarm,
+                // mirroring the lock-edge reset. Keeps a mid-poll episode from surviving into
+                // a drive if ACC comes on before the seat settles (sub 48).
+                if (isOn && anyReferenced(com.overdrive.app.automation.condition.BydEvent.EASY_ENTRY)) {
+                    stopEasyEntryPoll();
+                    publishEasyEntry("idle");
+                }
+
                 // ACC just transitioned OFF: also clear the snapshot's enginePowerKw so direct
                 // snapshot consumers cannot retain the last drive's value while parked.
                 if (!isOn) {
@@ -9899,7 +9907,187 @@ public class BydDataCollector {
             int state = (args[1] instanceof Integer) ? (Integer) args[1] : -1;
             notifyDoorStateListeners(area, state);
         }
+
+        // Unlock-source fallback events. Arrive only on this generic channel (no
+        // typed callback exists) and only because registerBodyworkListener also
+        // registers the 2-arg overload. The HAL ignores its int[] filter and
+        // delivers EVERY bodywork event here — sub 48's probe build found this
+        // extremely chatty, so only the two mapped ids are handled; everything
+        // else is silently dropped, no logging.
+        if ("onDataEventChanged".equals(method) && args != null && args.length >= 2) {
+            int eventId = (args[0] instanceof Integer) ? (Integer) args[0] : Integer.MIN_VALUE;
+            if (eventId == BydFeatureIds.BODYWORK_REMOTE_CONTROL_UNLOCK) {
+                lastFobEventAtMs = System.currentTimeMillis();
+            } else if (eventId == BydFeatureIds.BODYWORK_CARD_NFC_KEY_STATE) {
+                lastNfcEventAtMs = System.currentTimeMillis();
+            }
+        }
         notifyLockSnapshotListeners(updated);
+    }
+
+    // ==================== UNLOCK SOURCE / EASY ENTRY (sub 48) ====================
+    // Two automation signals so the seat-on-unlock automation is config, not code:
+    // unlockSource (how the car was unlocked) and easyEntry (whether the driver
+    // seat's easy-entry motion has settled). Both self-gated by anyReferenced so
+    // they cost nothing unless an automation actually uses one.
+
+    /** Raw SDK lock state last seen from onDoorLockCallback, for edge detection. */
+    private volatile int lastRawLockState = -1;
+    /** sys.cloud.unlock_index last seen, so a stale persisted unlock_type is never trusted. */
+    private volatile int lastSeenUnlockIndex = Integer.MIN_VALUE;
+    /** Timestamps of the last bodywork fob/NFC events, for the unlock_type==0 fallback. */
+    private volatile long lastFobEventAtMs = 0;
+    private volatile long lastNfcEventAtMs = 0;
+    private static final long BODYWORK_EVENT_FRESHNESS_MS = 1500;
+
+    private volatile java.util.concurrent.ScheduledExecutorService easyEntryScheduler;
+    private static final long EASY_ENTRY_POLL_INTERVAL_MS = 100;
+    /** Consecutive unchanged reads AFTER motion has started before declaring "settled". */
+    private static final int EASY_ENTRY_STATIONARY_SAMPLES = 3;
+    /** Disarm quietly if nothing ever settles (e.g. the door was never opened). */
+    private static final long EASY_ENTRY_ARM_WINDOW_MS = 30_000;
+
+    /**
+     * Called from onDoorLockCallback on every raw SDK lock/unlock event. Detects the
+     * LOCK/UNLOCK edge (raw SDK: UNLOCK=1, LOCK=2) and drives unlockSource + easyEntry.
+     */
+    private void handleUnlockSourceEdge(int sdkState) {
+        if (sdkState == lastRawLockState) return; // not an edge
+        lastRawLockState = sdkState;
+        boolean referenced =
+                anyReferenced(com.overdrive.app.automation.condition.BydEvent.UNLOCK_SOURCE)
+                || anyReferenced(com.overdrive.app.automation.condition.BydEvent.EASY_ENTRY);
+        if (!referenced) return;
+
+        if (sdkState == 2) { // LOCK edge
+            stopEasyEntryPoll();
+            publishUnlockSource("none");
+            publishEasyEntry("idle");
+            return;
+        }
+        if (sdkState != 1) return; // not a genuine UNLOCK edge
+
+        publishUnlockSource(deriveUnlockSource());
+        armEasyEntryPoll();
+    }
+
+    /**
+     * Derive the unlock source at an unlock edge. `persist.sys.cloud.unlock_type` is a
+     * `persist.` property that SURVIVES REBOOT holding a stale value, so a non-zero
+     * reading is only trusted when `sys.cloud.unlock_index` has also changed since the
+     * last check — otherwise it falls through to the bodywork-event fallback exactly
+     * like the type==0 (cleared) case. 3=nfc_card, 4=app, 6=fob (sub 48, measured).
+     */
+    private String deriveUnlockSource() {
+        int unlockType = getIntSystemProperty("persist.sys.cloud.unlock_type", 0);
+        int unlockIndex = getIntSystemProperty("sys.cloud.unlock_index", Integer.MIN_VALUE);
+        boolean indexFresh = unlockIndex != lastSeenUnlockIndex;
+        lastSeenUnlockIndex = unlockIndex;
+        if (indexFresh) {
+            if (unlockType == 6) return "fob";
+            if (unlockType == 4) return "app";
+            if (unlockType == 3) return "nfc_card";
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastFobEventAtMs <= BODYWORK_EVENT_FRESHNESS_MS) return "fob";
+        if (now - lastNfcEventAtMs <= BODYWORK_EVENT_FRESHNESS_MS) return "nfc_card";
+        return "keyless";
+    }
+
+    /** Reflection read of an Android int system property; returns {@code def} on any failure. */
+    private static int getIntSystemProperty(String key, int def) {
+        try {
+            Class<?> systemProperties = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method getInt =
+                    systemProperties.getMethod("getInt", String.class, int.class);
+            return (Integer) getInt.invoke(null, key, def);
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /**
+     * Arm the easy-entry poll: read {@code BODYWORK_SEAT_HORIZONTAL} at ~100ms, in
+     * process (no HTTP), for up to {@link #EASY_ENTRY_ARM_WINDOW_MS}. Publishes
+     * "moving" on the first observed change, then "settled" once
+     * {@link #EASY_ENTRY_STATIONARY_SAMPLES} consecutive reads come back unchanged —
+     * but only AFTER motion has been observed at least once, so an unlock where the
+     * door is never opened (nobody getting in) stays idle and never fires the
+     * automation (measured + confirmed with Pal on-car, sub 48, 2026-09-09).
+     */
+    private synchronized void armEasyEntryPoll() {
+        stopEasyEntryPoll(); // restart cleanly on a fresh unlock edge
+        if (bodyworkDevice == null) return;
+        publishEasyEntry("idle");
+        final long armedAt = System.currentTimeMillis();
+        final double[] lastValue = {Double.NaN};
+        final boolean[] hasMoved = {false};
+        final int[] stationaryCount = {0};
+        easyEntryScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "EasyEntryPoll");
+            t.setDaemon(true);
+            return t;
+        });
+        easyEntryScheduler.scheduleWithFixedDelay(() -> {
+            try {
+                if (System.currentTimeMillis() - armedAt > EASY_ENTRY_ARM_WINDOW_MS) {
+                    stopEasyEntryPoll();
+                    publishEasyEntry("idle");
+                    return;
+                }
+                Object raw = BydDeviceHelper.callGet(bodyworkDevice,
+                        BydFeatureIds.BODYWORK_SEAT_HORIZONTAL, Double.TYPE);
+                double v = raw != null ? BydDeviceHelper.getDoubleValue(raw) : Double.NaN;
+                if (Double.isNaN(v)) return; // unreadable tick, don't disturb state
+
+                if (Double.isNaN(lastValue[0])) {
+                    lastValue[0] = v; // first sample is the baseline, not yet "moved"
+                    return;
+                }
+                if (v != lastValue[0]) {
+                    lastValue[0] = v;
+                    stationaryCount[0] = 0;
+                    if (!hasMoved[0]) {
+                        hasMoved[0] = true;
+                        publishEasyEntry("moving");
+                    }
+                    return;
+                }
+                if (!hasMoved[0]) return; // stationary before any motion: still idle
+                if (++stationaryCount[0] >= EASY_ENTRY_STATIONARY_SAMPLES) {
+                    publishEasyEntry("settled");
+                    stopEasyEntryPoll();
+                }
+            } catch (Throwable t) {
+                logger.debug("Easy-entry poll error: " + t.getMessage());
+            }
+        }, 0, EASY_ENTRY_POLL_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    /** Stop the easy-entry poll if running (idempotent). */
+    private synchronized void stopEasyEntryPoll() {
+        if (easyEntryScheduler != null) {
+            easyEntryScheduler.shutdownNow();
+            easyEntryScheduler = null;
+        }
+    }
+
+    private void publishUnlockSource(String word) {
+        try {
+            com.overdrive.app.automation.Automations.update(
+                    com.overdrive.app.automation.condition.BydEvent.UNLOCK_SOURCE, word);
+        } catch (Throwable t) {
+            logger.debug("publishUnlockSource failed: " + t.getMessage());
+        }
+    }
+
+    private void publishEasyEntry(String word) {
+        try {
+            com.overdrive.app.automation.Automations.update(
+                    com.overdrive.app.automation.condition.BydEvent.EASY_ENTRY, word);
+        } catch (Throwable t) {
+            logger.debug("publishEasyEntry failed: " + t.getMessage());
+        }
     }
 
     /**
@@ -9924,6 +10112,7 @@ public class BydDataCollector {
             int area = (args[0] instanceof Integer) ? (Integer) args[0] : -1;
             int sdkState = (args[1] instanceof Integer) ? (Integer) args[1] : -1;
             notifyDoorLockListeners(area, sdkState);
+            handleUnlockSourceEdge(sdkState);
         }
         notifyLockSnapshotListeners(updated);
     }

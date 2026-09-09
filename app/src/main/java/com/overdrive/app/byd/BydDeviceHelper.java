@@ -768,13 +768,40 @@ public final class BydDeviceHelper {
                     public void onPowerLevelChanged(int level) {
                         invokeCallback(callback, "onPowerLevelChanged", new Object[]{level});
                     }
+                    // Generic feature-ID channel. There is no typed callback for the
+                    // unlock-source ids (fob button / NFC card), so they arrive only
+                    // here — and only when the listener is ALSO registered via the
+                    // 2-arg int[] overload below (same requirement as charging/instrument).
+                    public void onDataEventChanged(int eventId, android.hardware.bydauto.BYDAutoEventValue value) {
+                        invokeCallback(callback, "onDataEventChanged", new Object[]{eventId, value});
+                    }
                 };
+
+            // Strategy 1: 2-arg with empty int[] (subscribe-all). The HAL ignores this
+            // filter regardless of what is passed (sub 48, verified on-car), so an
+            // empty array is honest about what actually happens; filtering happens in
+            // the collector.
+            Method registerWithIds = findRegisterMethodWithIds(device.getClass(),
+                android.hardware.bydauto.bodywork.AbsBYDAutoBodyworkListener.class);
+            boolean twoArgRegistered = false;
+            if (registerWithIds != null) {
+                try {
+                    registerWithIds.invoke(device, listener, new int[0]);
+                    twoArgRegistered = true;
+                } catch (Exception e) {
+                    logger.debug("Bodywork 2-arg registration failed: " + e.getMessage());
+                }
+            }
+
+            // Strategy 2: 1-arg typed — unchanged, additive. Keeps the typed
+            // door/window/power callbacks arriving regardless of the above.
             Method register = findRegisterMethod(device.getClass(),
                 android.hardware.bydauto.bodywork.AbsBYDAutoBodyworkListener.class);
             if (register != null) {
                 register.invoke(device, listener);
                 return true;
             }
+            if (twoArgRegistered) return true;
             logger.debug("registerBodyworkListener: no registerListener method on "
                 + device.getClass().getName());
         } catch (NoClassDefFoundError e) {
