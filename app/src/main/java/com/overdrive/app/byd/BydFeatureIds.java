@@ -27,6 +27,38 @@ public final class BydFeatureIds {
     public static final int BODYWORK_EMERGENCY_ALARM = resolveOrFallback(
         "BODYWORK_EMERGENCY_ALARM_STATE", 692060190);
 
+    /**
+     * Unlock SOURCE, not lock state. Fires value 1 when the car is unlocked with the
+     * physical key fob BUTTON, and stays silent for keyless/passive door-handle entry —
+     * verified on-car 2026-08-31 by diffing every HAL event across four real unlocks
+     * (sub 48). Latches ~240ms then clears: event-only, polling misses it.
+     *
+     * <p>Values are platform-conditional in BYDAutoFeatureIds (isCanFD / isToyota),
+     * hence resolveOrFallback rather than a bare constant. Fallbacks are the isCanFD
+     * values observed live on this car.
+     */
+    public static final int BODYWORK_REMOTE_CONTROL_UNLOCK = resolveOrFallback(
+        "BODYWORK_REMOTE_CONTROL_UNLOCK", 402653192);
+    public static final int BODYWORK_REMOTE_CONTROL_LOCK = resolveOrFallback(
+        "BODYWORK_REMOTE_CONTROL_LOCK", 402653193);
+    /**
+     * NFC key-card presented/removed state. Also fires when LOCKING with the card, so
+     * a fresh event alone doesn't distinguish lock from unlock — only used as an
+     * unlock-source fallback when a genuine unlock edge has just been observed by
+     * some other means. From CarSetting's Body.java (sub 48 decompile).
+     */
+    public static final int BODYWORK_CARD_NFC_KEY_STATE = resolveOrFallback(
+        "BODYWORK_CARD_NFC_KEY_STATE", 0x40334013);
+    /**
+     * Driver seat horizontal position (double, 0..127.5). Polled at ~100ms while armed
+     * to detect easy-entry motion settling — measured on-car 2026-09-09 (sub 48): a
+     * real easy-entry retract sweep runs ~1.9s with no inter-sample gap above ~95ms.
+     * Same id {@link BodyworkSeatProbe} uses as the READ id for this axis; kept as its
+     * own named constant here since it is read on a tight poll loop, not the probe's
+     * one-shot multi-id JSON report.
+     */
+    public static final int BODYWORK_SEAT_HORIZONTAL = 988807176;
+
     // ==================== ENGINE ====================
     /** Engine power kW */
     public static final int ENGINE_POWER = resolveOrFallback("ENGINE_POWER", 339738656);

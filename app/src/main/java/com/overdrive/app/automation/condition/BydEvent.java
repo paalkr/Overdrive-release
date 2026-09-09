@@ -54,6 +54,19 @@ public class BydEvent {
     // source converges through) so a trigger can fire "when the car locks" and a
     // condition can gate "only while locked". NOT read from the dead BYDAutoDoorLockDevice.
     public static final EventData LOCK = new EventData("lock");
+    /**
+     * How the car was unlocked: none|fob|nfc_card|app|digital_key|keyless|unknown.
+     * Latched from the unlock edge, reset to "none" on the lock edge. See
+     * BydDataCollector#handleUnlockSourceEdge (sub 48).
+     */
+    public static final EventData UNLOCK_SOURCE = new EventData("unlockSource");
+    /**
+     * Easy-entry seat motion: idle|moving|settled. Armed only within a short window of
+     * an unlock edge; never reaches "settled" unless the seat actually moved first, so
+     * an unlock with no door open (nobody getting in) stays idle rather than firing
+     * early. See BydDataCollector#armEasyEntryPoll (sub 48).
+     */
+    public static final EventData EASY_ENTRY = new EventData("easyEntry");
     // Energy-recuperation / regen-braking strength (standard/high/max), read locally via
     // BYDAutoSettingDevice.getEnergyFeedback (app-level 0/1/2) on the telemetry snapshot.
     // A trigger fires "when regen → max"; a condition gates "only if regen is standard".

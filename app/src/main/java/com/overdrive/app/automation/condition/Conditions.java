@@ -151,6 +151,33 @@ public class Conditions {
                         new Label("state", "automation.state"),
                         new Label("locked", "automation.locked"),
                         new Label("unlocked", "automation.unlocked"))));
+        // Unlock SOURCE as a trigger (on-change) and condition, same pattern as lock
+        // above. Latched from persist.sys.cloud.unlock_type (index-freshness gated)
+        // with a bodywork-event fallback for the keyless case; reset to "none" on the
+        // lock edge (sub 48).
+        addCondition(new EventCondition(
+                new Label("unlockSource", "automation.unlock_source"),
+                "automation.unlock_source_description",
+                new EnumType(
+                        new Label("state", "automation.state"),
+                        new Label("none", "automation.unlock_source_none"),
+                        new Label("fob", "automation.unlock_source_fob"),
+                        new Label("nfc_card", "automation.unlock_source_nfc_card"),
+                        new Label("app", "automation.unlock_source_app"),
+                        new Label("digital_key", "automation.unlock_source_digital_key"),
+                        new Label("keyless", "automation.unlock_source_keyless"),
+                        new Label("unknown", "automation.unlock_source_unknown"))));
+        // Easy-entry seat motion as a trigger (on-change) and condition, same pattern.
+        // "settled" only fires after the seat has actually moved and then held still —
+        // an unlock with no door opened never reaches it (sub 48).
+        addCondition(new EventCondition(
+                new Label("easyEntry", "automation.easy_entry"),
+                "automation.easy_entry_description",
+                new EnumType(
+                        new Label("state", "automation.state"),
+                        new Label("idle", "automation.easy_entry_idle"),
+                        new Label("moving", "automation.easy_entry_moving"),
+                        new Label("settled", "automation.easy_entry_settled"))));
         // Energy-recuperation (regen) level as a trigger (on-change) and condition. The
         // state IS the word (standard/high/max) published by BydEvent from the SDK
         // getEnergyFeedback read, self-gated so it costs nothing unless a regen rule exists.
