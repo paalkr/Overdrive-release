@@ -378,7 +378,7 @@ public class TripTelemetryRecorder {
             TelemetrySample sample = new TelemetrySample(
                     now, speedKmh, accelPedal, brakePedal,
                     brakePedalPressed, gearMode, lat, lon, altitude,
-                    fix.verticalAccuracy, fix.altitudeIsMsl);
+                    fix.verticalAccuracy, fix.altitudeIsMsl, fix.fixTimeUtc);
 
             // ── Distance fusion (CAN-speed primary, accuracy-gated GPS fallback) ──
             // dt since the previous sample, clamped so a scheduler stall or a
