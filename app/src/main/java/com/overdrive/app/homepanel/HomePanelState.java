@@ -95,6 +95,20 @@ public final class HomePanelState {
     private static volatile long lastTripAttemptAt;
 
     /**
+     * The personalized range prediction is a separate daemon read because building it needs
+     * current SoC, speed, temperature and the driving-DNA score, all of which
+     * {@code TripApiHandler.handleGetRange} already gathers. Duplicating that into the
+     * trip-snapshot payload would mean maintaining the same condition-gathering twice.
+     * Longer TTL than the trip snapshot: this number moves with the conditions bucket, not
+     * with the live trip counters.
+     */
+    private static final long RANGE_TTL_MS = 15_000;
+
+    private static volatile JSONObject cachedRange;
+    private static volatile long cachedRangeAt;
+    private static volatile long lastRangeAttemptAt;
+
+    /**
      * "So far this trip" values plus the recent real-world consumption, from
      * {@code GET /api/trips/current}. The trip system lives in the daemon, so this
      * is an HTTP read, cached briefly — the panel polls every 5s and several cells
@@ -157,7 +171,7 @@ public final class HomePanelState {
                     field(recent == null ? null : one(recent), "kWh/100km",
                             "siste " + Math.round(window) + " km"));
 
-            addRangeField(fields, recent);
+            addRangeField(fields);
         } catch (Throwable t) {
             Log.w(TAG, "trip fields failed: " + t.getMessage());
         }
@@ -212,31 +226,39 @@ public final class HomePanelState {
     }
 
     /**
-     * Range from recent real-world consumption: usable energy now divided by the
-     * kWh/100km the car has actually been doing.
+     * OverDrive's personalized range prediction, from {@code GET /api/trips/range}.
      *
-     * <p>Deliberately NOT the car's own range number (that is what {@code range} is)
-     * and NOT OverDrive's bucket estimator on {@code /api/trips/range} either, which
-     * conditions on speed, temperature and terrain from trip history. This one is the
-     * simple honest arithmetic the Audi shows: what the last {@code ~50 km} imply.
+     * <p>This used to be local arithmetic — remaining energy divided by the rolling
+     * 50 km consumption — which is what the Audi shows. Pål's call to replace it
+     * (2026-09-12): <i>"last 50km has nothing to do with the next 50km, it might be
+     * totally different type of rode and conditions"</i>. The bucket estimator conditions
+     * on speed, temperature and terrain from trip history, and additionally scales for
+     * SoH and reserves the BMS buffer, so it predicts the drive ahead rather than
+     * replaying the one behind. It also removes a genuine confusion: two OverDrive
+     * range numbers that shared no input and never agreed.
      *
-     * <p>Absent unless BOTH the recent consumption and remaining energy are known.
-     * No fallback to a nominal capacity, because a range figure derived from a guessed
-     * pack size is exactly the kind of number that gets trusted and shouldn't be.
+     * <p>Absent when the estimator returns nothing. In practice that needs a fresh
+     * install or a data reset — the estimator's fallback chain ends at the overall
+     * average, so any real trip history resolves. Still no fallback to a nominal pack
+     * size: a range figure derived from a guessed capacity is exactly the kind of number
+     * that gets trusted and shouldn't be.
      */
-    private static void addRangeField(JSONObject fields, Double recentKwhPer100Km) throws Throwable {
-        // The arithmetic happens in the daemon (rangeFromRecentKm), for the same reason
-        // the battery reading does: remaining energy is only knowable there.
-        JSONObject trip = tripSnapshot();
+    private static void addRangeField(JSONObject fields) throws Throwable {
+        JSONObject range = rangeSnapshot();
         Integer km = null;
-        if (trip != null && !trip.isNull("rangeFromRecentKm")) {
-            int v = trip.optInt("rangeFromRecentKm", -1);
+        if (range != null && !range.isNull("predictedRangeKm")) {
+            int v = (int) Math.round(range.optDouble("predictedRangeKm", -1));
             if (v > 0) km = v;
         }
-        fields.put("range.recent", field(km, "km",
-                (km == null || recentKwhPer100Km == null)
-                        ? "" : ("ved " + one(recentKwhPer100Km) + " kWh/100km"),
-                tripIsStale()));
+        // The subtitle names the conditions the estimate was made for, which is the whole
+        // reason this number differs from the car's: "bykjøring" tells you it assumed city
+        // driving. Falls back to no subtitle rather than inventing one.
+        String sub = "";
+        if (km != null && range != null) {
+            String bucket = range.optString("bucketKey", "");
+            if (!bucket.isEmpty()) sub = bucket.replace('_', ' ');
+        }
+        fields.put("range.recent", field(km, "km", sub, rangeIsStale()));
     }
 
     private static JSONObject tripSnapshot() {
@@ -318,6 +340,47 @@ public final class HomePanelState {
     private static boolean tripIsStale() {
         return cachedTrip != null
                 && System.currentTimeMillis() - cachedTripAt >= TRIP_TTL_MS;
+    }
+
+    private static boolean rangeIsStale() {
+        return cachedRange != null
+                && System.currentTimeMillis() - cachedRangeAt >= RANGE_TTL_MS;
+    }
+
+    /**
+     * The {@code range} object from {@code GET /api/trips/range}, or null. Same caching shape
+     * as {@link #tripSnapshot()}: a separate attempt clock keeps a down daemon from being
+     * re-dialled on every tick, while the data clock is what decides whether the tile is
+     * flagged stale. The endpoint answers {@code range: null} with a message when there is
+     * not enough history, which reads here as "no number" rather than an error.
+     */
+    private static JSONObject rangeSnapshot() {
+        long now = System.currentTimeMillis();
+        JSONObject cached = cachedRange;
+        if (cached != null && now - cachedRangeAt < RANGE_TTL_MS) return cached;
+        if (now - lastRangeAttemptAt < RANGE_TTL_MS) return cached;
+        lastRangeAttemptAt = now;
+
+        JSONObject range = null;
+        HttpURLConnection conn = null;
+        try {
+            conn = DaemonHttpClient.open("/api/trips/range", "GET", 2000, 4000);
+            if (conn.getResponseCode() == 200) {
+                range = new JSONObject(readAll(conn.getInputStream())).optJSONObject("range");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "range snapshot failed: " + t.getMessage());
+        } finally {
+            if (conn != null) { try { conn.disconnect(); } catch (Throwable ignored) {} }
+        }
+        if (range != null) {
+            cachedRange = range;
+            cachedRangeAt = now;
+            return range;
+        }
+        if (cached != null && now - cachedRangeAt < STALE_GRACE_MS) return cached;
+        cachedRange = null;
+        return null;
     }
 
     /**

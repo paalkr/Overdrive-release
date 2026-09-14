@@ -612,13 +612,17 @@
     /* Inside a metrics list the two ranges sit together, so they need telling apart.
        Naming is Pål's call (2026-08-14). Worth recording that "WLTP" is his label for the
        car's own figure, not a verified claim about how the car derives it — it may be an
-       adaptive estimate rather than a WLTP derivation. "Estimert" is ours, from recent
-       real consumption. */
+       adaptive estimate rather than a WLTP derivation. "Estimert" is ours: OverDrive's
+       personalized range from /api/trips/range. It was local arithmetic over the rolling
+       50 km consumption until 2026-09-12, when Pål replaced it — the last 50 km does not
+       predict the next 50 km, and having two OverDrive range numbers that shared no input
+       and never agreed was its own confusion. The field id stays `range.recent` so saved
+       layouts keep working. */
     "range": "WLTP",
     "range.recent": "Estimert",
     /* The trip's average so far (energy since start / distance since start x 100), NOT a
-       rolling window — the rolling figure is `range.recent`'s input and lives on the
-       battery tile as Estimert. */
+       rolling window — the rolling 50 km figure is `recent.consumption` below. Neither
+       feeds Estimert any more; that is the bucket estimator's job now. */
     "trip.consumption": "Forbruk",
     "trip.energy": "Energi",
     "trip.distance": "Distanse",
