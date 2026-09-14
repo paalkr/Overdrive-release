@@ -352,6 +352,30 @@ public final class KeymapApiHandler {
             handleInject(out, body);
             return true;
         }
+        // Re-assert the accessibility registration on demand. The self-heal above only runs
+        // on a keymap page load and only when key mapping is enabled, but the a11y service is
+        // shared: the home panel reads the foreground through it, and when its in-process
+        // instance is null the panel cannot attach OR correct itself, because both of its
+        // inputs go through that same instance. Observed on the car 2026-09-12: 63s with
+        // "no accessibility instance — panel stays detached" after a process restart. The
+        // caller is the app process, which cannot write Secure settings itself — only the
+        // daemon can, which is why this is an endpoint rather than a direct call.
+        // Rate limiting is the CALLER's job; this only de-duplicates concurrent heals.
+        if (cleanPath.equals("/api/keymap/a11y/heal") && method.equals("POST")) {
+            maybeSelfHealAccessibility();
+            HttpResponse.sendJson(out, "{\"success\":true}");
+            return true;
+        }
+        // Foreground read that does NOT go through accessibility, for the home panel to use
+        // while the a11y service is unbound. Measured on the car 2026-09-12: after ACC-on the
+        // service stayed unbound for ~110s, and the panel — whose only foreground signal is
+        // that service — could not appear at all until the bind watchdog force-restarted the
+        // app. The daemon runs as shell and can just ask the window manager, so the panel does
+        // not have to wait for a bind it does not otherwise need.
+        if (cleanPath.equals("/api/keymap/a11y/foreground") && method.equals("GET")) {
+            handleGetForeground(out);
+            return true;
+        }
         return false;
     }
 
@@ -672,6 +696,61 @@ public final class KeymapApiHandler {
      * ContentResolver is unreliable for Secure reads, whereas `settings get`
      * always works as shell. Returns "" on any failure.
      */
+    /**
+     * Report the focused window component and whether the launcher's edit-layout window is up,
+     * both straight from the window manager.
+     *
+     * <p>Deliberately raw: this returns what is focused, and the CALLER decides what that
+     * means. The panel's rule is "home only when the focused component is exactly the
+     * launcher's home activity and edit-layout is not showing" — anything else, including a
+     * failed read, must read as not-home so a degraded foreground signal can never leave the
+     * panel drawn on top of another app.
+     */
+    private static void handleGetForeground(java.io.OutputStream out) throws Exception {
+        String focus = "";
+        boolean edit = false;
+        try {
+            // mCurrentFocus carries "package/activity", which is what distinguishes the home
+            // screen from the app drawer — they are separate activities in the same package,
+            // so a package-level answer would wrongly call the drawer "home".
+            Process p = new ProcessBuilder("sh", "-c",
+                    "dumpsys window 2>/dev/null | grep -m1 mCurrentFocus; "
+                            + "dumpsys window 2>/dev/null | grep -c EditWindow")
+                    .redirectErrorStream(true).start();
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()));
+            String line;
+            java.util.List<String> lines = new java.util.ArrayList<>();
+            while ((line = r.readLine()) != null) lines.add(line.trim());
+            p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            p.destroyForcibly();
+            for (String l : lines) {
+                if (l.contains("mCurrentFocus")) {
+                    // "mCurrentFocus=Window{hash u0 pkg/activity}" — take the last token and
+                    // drop the trailing brace.
+                    int brace = l.lastIndexOf('{');
+                    if (brace >= 0) {
+                        String inner = l.substring(brace + 1).replace("}", "").trim();
+                        String[] parts = inner.split("\\s+");
+                        if (parts.length > 0) focus = parts[parts.length - 1];
+                    }
+                } else if (l.matches("\\d+")) {
+                    edit = Integer.parseInt(l) > 0;
+                }
+            }
+        } catch (Throwable t) {
+            logger.warn("foreground read failed: " + t.getMessage());
+            focus = "";   // caller treats empty as not-home
+        }
+        JSONObject o = new JSONObject();
+        try {
+            o.put("success", true);
+            o.put("focus", focus);
+            o.put("editWindow", edit);
+        } catch (Exception ignored) { }
+        HttpResponse.sendJson(out, o.toString());
+    }
+
     private static String readEnabledA11yServices() {
         try {
             Process p = new ProcessBuilder("sh", "-c",

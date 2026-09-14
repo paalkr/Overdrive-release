@@ -709,6 +709,15 @@ public class CameraDaemon {
         tcpServer = new TcpCommandServer(TCP_PORT);
         httpServer = new HttpServer(HTTP_PORT);
         ipcServer = new SurveillanceIpcServer(19877);
+        // Started here, before the slower subsystems: the home panel cannot show anything until
+        // it knows what is in front, and this is now its primary source. Cheap (one filtered
+        // logcat stream) and independent of everything below it, so a subsystem that fails to
+        // init must not take the panel's foreground signal down with it.
+        try {
+            ForegroundEventWatcher.start();
+        } catch (Throwable t) {
+            log("ForegroundEventWatcher start error: " + t.getMessage());
+        }
         aacIngestServer = new com.overdrive.app.server.AacIngestServer();
         accMonitor = new AccMonitor();
 

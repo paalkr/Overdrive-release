@@ -111,6 +111,67 @@ public class HomePanelOverlayService extends Service {
     private UnifiedConfigManager.ConfigChangeListener configListener;
 
     /**
+     * Watches the file the daemon writes the foreground to. A FileObserver is a push: the panel
+     * reacts when the system changes the foreground, instead of asking every tick. This is the
+     * primary path now; the accessibility events and the watchdog are the backstops.
+     */
+    private android.os.FileObserver foregroundObserver;
+
+    private void startForegroundObserver() {
+        try {
+            final String path =
+                    com.overdrive.app.daemon.ForegroundEventWatcher.STATE_FILE;
+            // Create it if the daemon has not written yet: FileObserver on a missing path never
+            // fires, and the daemon only writes on the first app switch after it starts.
+            try {
+                java.io.File f = new java.io.File(path);
+                if (f.getParentFile() != null) f.getParentFile().mkdirs();
+                if (!f.exists()) f.createNewFile();
+            } catch (Throwable ignored) { }
+            foregroundObserver = new android.os.FileObserver(path,
+                    android.os.FileObserver.MODIFY | android.os.FileObserver.CLOSE_WRITE) {
+                @Override public void onEvent(int event, String p) {
+                    final String value = readForegroundFile(path);
+                    if (value == null) return;
+                    main.post(() -> {
+                        if (!running.get()) return;
+                        if (HomePanelFocus.onForegroundEvent(
+                                HomePanelOverlayService.this, value)) {
+                            evaluate();
+                        }
+                    });
+                }
+            };
+            foregroundObserver.startWatching();
+            Log.i(TAG, "foreground observer watching " + path);
+
+            // Read what is already there. The observer only fires on CHANGE, and the daemon seeds
+            // the file when IT starts — so whichever of the two started first, the other would
+            // otherwise never learn the current foreground until the user switched apps.
+            final String initial = readForegroundFile(path);
+            if (initial != null) {
+                main.post(() -> {
+                    if (!running.get()) return;
+                    if (HomePanelFocus.onForegroundEvent(HomePanelOverlayService.this, initial)) {
+                        evaluate();
+                    }
+                });
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "foreground observer failed: " + t.getMessage());
+        }
+    }
+
+    private static String readForegroundFile(String path) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.FileReader(path))) {
+            return r.readLine();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
      * Application context of the running service, for helpers that need a Context but are
      * called from places that hold none (HomePanelTheme.current, reached from the state
      * builder). Null when the service is not running, which those helpers treat as
@@ -118,8 +179,33 @@ public class HomePanelOverlayService extends Service {
      */
     private static volatile Context appContext;
 
+    /**
+     * The live service, so a focus change can reach {@link #evaluate()} directly instead of
+     * round-tripping through {@code startForegroundService}. That round trip is the reason
+     * show/hide lagged: it goes through ActivityManagerService, and the hide case fires
+     * exactly while another app is launching — i.e. when AMS is busiest — so the request
+     * queued behind the launch and the real attach/detach only happened on the next watchdog
+     * tick (4s attached, 1.2s detached). Null when the service is not running, in which case
+     * {@link #syncWithConfig} still has to start it.
+     */
+    private static volatile HomePanelOverlayService instance;
+
     static Context appContext() {
         return appContext;
+    }
+
+    /**
+     * Apply a focus change NOW. Called from {@link HomePanelFocus} when the verdict flips.
+     * Falls back to the service-start path only when nothing is running, so the slow path
+     * is taken once (to launch the service) rather than on every focus change.
+     */
+    public static void onFocusVerdictChanged(Context context) {
+        HomePanelOverlayService live = instance;
+        if (live != null && live.running.get()) {
+            live.main.post(live::evaluate);
+            return;
+        }
+        syncWithConfig(context);
     }
 
     /** Repaint against a freshly-chosen theme. Mirrors StatusOverlayService.refreshTheme. */
@@ -132,12 +218,14 @@ public class HomePanelOverlayService extends Service {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         appContext = getApplicationContext();
+        instance = this;
         createNotificationChannel();
         startPanelForeground();
         registerConfigListener();
         // Tell the accessibility callback that someone is listening, so it starts
         // resolving the foreground package for us.
         HomePanelFocus.setWanted(true);
+        startForegroundObserver();
         Log.i(TAG, "service created");
     }
 
@@ -179,12 +267,20 @@ public class HomePanelOverlayService extends Service {
     public void onDestroy() {
         running.set(false);
         appContext = null;
+        // Only clear if we are still the published instance: a restart can construct the new
+        // service before the old one's onDestroy runs, and clearing unconditionally would
+        // null out the live one.
+        if (instance == this) instance = null;
         HomePanelFocus.setWanted(false);
         if (configListener != null) {
             // The listener list is process-wide and the lambda captures this service,
             // so leaving it behind would leak a whole service instance per restart.
             UnifiedConfigManager.removeListener(configListener);
             configListener = null;
+        }
+        if (foregroundObserver != null) {
+            try { foregroundObserver.stopWatching(); } catch (Throwable ignored) { }
+            foregroundObserver = null;
         }
         main.removeCallbacksAndMessages(null);
         io.shutdownNow();   // an in-flight daemon read must not outlive the service
@@ -443,16 +539,38 @@ public class HomePanelOverlayService extends Service {
             // returned early unless already attached, which made it useless for the
             // case that actually broke: never attached, so never corrected, so never
             // attached. It has to be able to turn the panel ON as well as off.
-            if (HomePanelFocus.refreshFromActiveWindow(HomePanelOverlayService.this)) {
+            boolean verdictChanged =
+                    HomePanelFocus.refreshFromActiveWindow(HomePanelOverlayService.this);
+            // Evaluating ONLY on a verdict change left a failed attach latched forever:
+            // attach() gives up when the overlay permission is missing or when
+            // HomePanelGeometry.freeArea() is empty (w<=0 / height<MIN_HEIGHT, reachable
+            // right after power-on while the display metrics are still settling), and the
+            // verdict is already "home" at that point — so nothing ever called evaluate()
+            // again and the panel stayed absent until the focus happened to change.
+            // Reconcile desired vs actual instead: this is the same self-healing shape the
+            // watchdog already has for the never-attached case, just extended to cover an
+            // attach that was attempted and failed.
+            if (verdictChanged || shouldShow() != attached) {
                 evaluate();
             }
             scheduleWatchdog();
         }
     };
 
+    /**
+     * Tick interval while degraded. The 4s attached interval assumes an accessibility event
+     * will beat the timer; on the daemon fallback there are no events, so the timer IS the
+     * detection and 4s meant the panel stayed drawn over an already-visible app. The daemon
+     * read behind it is a shell exec, so this is as fast as is reasonable to poll.
+     */
+    private static final long WATCHDOG_FALLBACK_MS = 700;
+
     private void scheduleWatchdog() {
         main.removeCallbacks(watchdog);
-        main.postDelayed(watchdog, attached ? WATCHDOG_MS : WATCHDOG_DETACHED_MS);
+        long delay;
+        if (HomePanelFocus.usingDaemonFallback()) delay = WATCHDOG_FALLBACK_MS;
+        else delay = attached ? WATCHDOG_MS : WATCHDOG_DETACHED_MS;
+        main.postDelayed(watchdog, delay);
     }
 
     // ==================== WebView ====================

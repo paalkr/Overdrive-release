@@ -197,7 +197,23 @@ class DaemonKeepaliveService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to kick RoadSense overlay: ${e.message}")
         }
-        
+
+        // And the home dashboard, for exactly the same reason as RoadSense above — it was
+        // simply never added here. Its only other launch paths are MainActivity.onResume and
+        // the settings toggle, both user-driven, and HomePanelOverlayService.onDestroy clears
+        // HomePanelFocus.wanted, which gates the accessibility callback's focus block. So once
+        // the process is killed across an ACC cycle the panel cannot restart itself: the focus
+        // path no longer evaluates, so it never reaches syncWithConfig. The panel stayed absent
+        // for the whole drive unless the user happened to open the app (Pål, intermittent after
+        // car-on, "never shows until the next power cycle"). syncWithConfig is a no-op when the
+        // feature is off, so this stays silent for anyone not using the panel.
+        try {
+            com.overdrive.app.homepanel.HomePanelOverlayService
+                .syncWithConfig(applicationContext)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to kick home panel overlay: ${e.message}")
+        }
+
         // START_STICKY ensures service restarts if killed
         return START_STICKY
     }

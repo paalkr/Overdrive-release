@@ -112,7 +112,21 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         // source's resource-id, which flagReportViewIds already covers. eventTypes
         // changes have regressed key delivery on this firmware before, so a build
         // carrying this should re-verify that a mapped hardware key still fires.
+        // TYPE_WINDOWS_CHANGED is REQUIRED by the home panel and was missing: this is a hard
+        // assignment, so it silently dropped the typeWindowsChanged declared in
+        // accessibility_service_config.xml. onAccessibilityEvent already handles that type and
+        // documents why it is needed — returning to the ALREADY-RUNNING launcher fires
+        // WINDOWS_CHANGED, not WINDOW_STATE_CHANGED — so its whole branch was dead code and the
+        // panel could only come back via the 1.2s watchdog tick. Confirmed on the car from
+        // `dumpsys accessibility`: our service listed eventTypes=[TYPE_VIEW_LONG_CLICKED,
+        // TYPE_WINDOW_STATE_CHANGED] while SystemUI's own service carried TYPE_WINDOWS_CHANGED,
+        // so the firmware delivers it fine. The extra events are chatty but the panel's handler
+        // is gated on HomePanelFocus.isWanted(), so nothing pays for them while the panel is off.
+        //
+        // eventTypes changes have regressed key delivery on this firmware before: a build
+        // carrying this MUST re-verify on-car that a mapped hardware key still fires.
         info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                | AccessibilityEvent.TYPE_WINDOWS_CHANGED
                 | AccessibilityEvent.TYPE_VIEW_LONG_CLICKED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
         info.notificationTimeout = 100;
@@ -346,6 +360,22 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
     private static final String LAUNCHER_HOME_WINDOW = "BydLauncher_CardBarwindow";
     private static final String LAUNCHER_EDIT_WINDOW = "EditWindow";
 
+    /**
+     * The launcher's own activity window, as the window list titles it. Observed on the car
+     * alongside {@code BydLauncher_CardBarwindow} whenever the home screen is up; the app
+     * drawer is the same activity window, which is why it is NOT enough on its own to mean
+     * "home" — it only means "still the launcher, not another app".
+     */
+    private static final String LAUNCHER_APP_WINDOW = "Launcher3";
+
+    /** Whether a window title belongs to the launcher rather than to another app. */
+    private static boolean isLauncherWindowTitle(CharSequence title) {
+        if (title == null) return false;
+        return LAUNCHER_APP_WINDOW.contentEquals(title)
+                || LAUNCHER_HOME_WINDOW.contentEquals(title)
+                || LAUNCHER_EDIT_WINDOW.contentEquals(title);
+    }
+
     /** What the accessibility window list says is on screen right now. */
     public static final class Surfaces {
         /** Package owning the active window, or null when it cannot be read. */
@@ -354,11 +384,27 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         public final boolean homeWindow;
         /** The launcher's edit-layout window is present. */
         public final boolean editWindow;
+        /**
+         * The top-most TYPE_APPLICATION window is not one of the launcher's.
+         *
+         * <p>This is the EARLY leave-home signal. Measured on the car 2026-09-12 launching
+         * DAB++: its window enters the window list at ~1060ms, but only becomes the ACTIVE
+         * window at ~1370ms. Keying the verdict off the active window therefore detached the
+         * panel ~300ms after the new app had already drawn, which is the "it lingers on top
+         * of the app you just opened" symptom. The window list sees it first.
+         *
+         * <p>Restricted to TYPE_APPLICATION on purpose: our own overlay is TYPE_SYSTEM (it
+         * reads as id=186 TYPE_SYSTEM in the dump), as are the status bar and navigation bar,
+         * so none of them can trip this.
+         */
+        public final boolean foreignAppOnTop;
 
-        Surfaces(String activePackage, boolean homeWindow, boolean editWindow) {
+        Surfaces(String activePackage, boolean homeWindow, boolean editWindow,
+                 boolean foreignAppOnTop) {
             this.activePackage = activePackage;
             this.homeWindow = homeWindow;
             this.editWindow = editWindow;
+            this.foreignAppOnTop = foreignAppOnTop;
         }
     }
 
@@ -378,12 +424,22 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         String active = activeWindowPackage();
         boolean home = false;
         boolean edit = false;
+        CharSequence topAppTitle = null;
+        int topAppLayer = Integer.MIN_VALUE;
         try {
             List<AccessibilityWindowInfo> windows = getWindows();
             if (windows != null) {
                 for (AccessibilityWindowInfo w : windows) {
                     if (w == null) continue;
                     CharSequence title = w.getTitle();
+                    // Track the top application window BEFORE the null-title skip: a window
+                    // with no title still covers the launcher, and skipping it would read a
+                    // covered home screen as "still home".
+                    if (w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION
+                            && w.getLayer() > topAppLayer) {
+                        topAppLayer = w.getLayer();
+                        topAppTitle = title;
+                    }
                     if (title == null) continue;
                     if (LAUNCHER_HOME_WINDOW.contentEquals(title)) home = true;
                     else if (LAUNCHER_EDIT_WINDOW.contentEquals(title)) edit = true;
@@ -393,7 +449,10 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             // A window-list read must never break key filtering or seat capture.
             Log.w(TAG, "surfaces() failed: " + t.getMessage());
         }
-        return new Surfaces(active, home, edit);
+        // Unknown (no application window seen, or the list read threw) is NOT "foreign":
+        // fail towards the existing active-window logic rather than detaching on a bad read.
+        boolean foreign = topAppLayer != Integer.MIN_VALUE && !isLauncherWindowTitle(topAppTitle);
+        return new Surfaces(active, home, edit, foreign);
     }
 
     /**

@@ -71,6 +71,105 @@ public final class HomePanelFocus {
     private static final long NO_A11Y_LOG_MS = 60_000L;
     private static volatile long lastNoA11yLogMs = -NO_A11Y_LOG_MS;
 
+    /**
+     * Consecutive watchdog ticks that found no accessibility instance, and the point at which
+     * we stop waiting and ask the daemon to re-assert the registration.
+     *
+     * <p>A null instance is not merely "no signal": it is unrecoverable from in here, because
+     * BOTH the event path and the watchdog read go through it, so the panel can neither attach
+     * nor notice that it should. Seen on the car 2026-09-12 for 63s after a process restart,
+     * and described in this class's own history as lasting 36 minutes once. The OS rebinds
+     * asynchronously and usually wins, so wait ~10s (the detached watchdog ticks at 1.2s)
+     * before touching anything — a heal fired on every brief rebind gap would re-register the
+     * service constantly, and eventTypes/registration churn is exactly what has broken
+     * hardware-key delivery on this firmware before.
+     */
+    private static final int A11Y_STUCK_TICKS = 8;
+    private static final long A11Y_HEAL_COOLDOWN_MS = 300_000L;
+    private static volatile int noA11yTicks = 0;
+    private static volatile long lastA11yHealAtMs = -A11Y_HEAL_COOLDOWN_MS;
+
+    /**
+     * Foreground verdict from the daemon, used ONLY while the accessibility instance is null.
+     *
+     * <p>Null means "no usable answer yet", which callers must treat as NOT home: a degraded
+     * signal may leave the panel hidden when it could have shown, but must never leave it
+     * drawn on top of another app.
+     *
+     * <p>Refreshed off-thread. {@link #refreshFromActiveWindow} runs on the panel service's
+     * main-looper watchdog, and this read execs a shell command in the daemon — blocking there
+     * would stall the UI thread every tick.
+     */
+    private static final String LAUNCHER_HOME_COMPONENT =
+            "com.android.launcher3/com.android.launcher3.home.MainActivity";
+    // Shorter than the fallback watchdog tick, so a tick is never served a cached answer that
+    // is already older than the tick itself.
+    private static final long FALLBACK_TTL_MS = 500L;
+    private static volatile Boolean fallbackHome = null;
+    private static volatile long fallbackAtMs = 0L;
+    private static final java.util.concurrent.atomic.AtomicBoolean fallbackInFlight =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Kick an async refresh of {@link #fallbackHome} when the cached answer is stale. */
+    private static void kickFallbackRefresh() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - fallbackAtMs < FALLBACK_TTL_MS) return;
+        if (!fallbackInFlight.compareAndSet(false, true)) return;
+        Thread t = new Thread(() -> {
+            Boolean verdict = null;
+            java.net.HttpURLConnection conn = null;
+            try {
+                conn = com.overdrive.app.util.DaemonHttpClient.open(
+                        "/api/keymap/a11y/foreground", "GET", 1500, 2500);
+                if (conn.getResponseCode() == 200) {
+                    java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+                    java.io.InputStream in = conn.getInputStream();
+                    byte[] chunk = new byte[1024];
+                    int n;
+                    while ((n = in.read(chunk)) != -1) buf.write(chunk, 0, n);
+                    org.json.JSONObject o = new org.json.JSONObject(buf.toString("UTF-8"));
+                    String focus = o.optString("focus", "");
+                    boolean edit = o.optBoolean("editWindow", false);
+                    // Exact component match, and never during edit-layout. The app drawer is
+                    // a different activity in the same package, so a package-level test would
+                    // wrongly call it home and draw the panel over the drawer.
+                    verdict = LAUNCHER_HOME_COMPONENT.equals(focus) && !edit;
+                }
+            } catch (Throwable th) {
+                Log.w(TAG, "daemon foreground read failed: " + th.getMessage());
+            } finally {
+                if (conn != null) { try { conn.disconnect(); } catch (Throwable ignored) {} }
+                fallbackHome = verdict;
+                fallbackAtMs = android.os.SystemClock.elapsedRealtime();
+                fallbackInFlight.set(false);
+            }
+        }, "home-panel-fg-fallback");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Ask the daemon to re-assert the accessibility registration. Fire-and-forget on a worker:
+     * the call blocks on settings execs for seconds, and this runs on the panel's watchdog.
+     * The app process cannot write Secure settings itself, which is why this is an HTTP hop.
+     */
+    private static void requestA11yHeal() {
+        Thread t = new Thread(() -> {
+            java.net.HttpURLConnection conn = null;
+            try {
+                conn = com.overdrive.app.util.DaemonHttpClient.open(
+                        "/api/keymap/a11y/heal", "POST", 2000, 8000);
+                conn.getResponseCode();
+            } catch (Throwable th) {
+                Log.w(TAG, "a11y heal request failed: " + th.getMessage());
+            } finally {
+                if (conn != null) { try { conn.disconnect(); } catch (Throwable ignored) {} }
+            }
+        }, "home-panel-a11y-heal");
+        t.setDaemon(true);
+        t.start();
+    }
+
     private HomePanelFocus() {}
 
     public static void setWanted(boolean value) {
@@ -79,6 +178,19 @@ public final class HomePanelFocus {
 
     public static boolean isWanted() {
         return wanted;
+    }
+
+    /**
+     * True while we have no accessibility instance and are therefore running on the daemon
+     * foreground read.
+     *
+     * <p>Matters for the watchdog cadence: in this mode NO events arrive at all, so the tick
+     * is the only thing that can notice a change. At the normal attached interval (4s) that
+     * left the panel drawn on top of an app that was already fully visible — reported from the
+     * car 2026-09-12 as "sticks on top for 3-6 seconds", with warm apps.
+     */
+    public static boolean usingDaemonFallback() {
+        return KeepAliveAccessibilityService.getInstance() == null;
     }
 
     /**
@@ -109,11 +221,37 @@ public final class HomePanelFocus {
                     Log.w(TAG, "no accessibility instance — cannot tell what is in front, "
                             + "panel stays " + (launcherForeground ? "attached" : "detached"));
                 }
-                return false;
+                // Stuck long enough that the OS is not going to rebind on its own — ask the
+                // daemon to re-assert the registration. Only while the panel is actually
+                // wanted: with the feature off, a null instance is nobody's problem.
+                if (++noA11yTicks >= A11Y_STUCK_TICKS && wanted
+                        && now - lastA11yHealAtMs > A11Y_HEAL_COOLDOWN_MS) {
+                    lastA11yHealAtMs = now;
+                    Log.w(TAG, "no accessibility instance for " + noA11yTicks
+                            + " ticks — requesting a11y re-registration from the daemon");
+                    requestA11yHeal();
+                }
+                // Keep working without accessibility: the daemon can read the foreground
+                // directly. This is what lets the panel appear seconds after the app process
+                // starts instead of waiting out the bind (~110s measured on 2026-09-12).
+                //
+                // But only when the event log is NOT live. This read is a dumpsys snapshot, so
+                // during a launch it still shows the launcher focused and would undo the early
+                // hide — observed 2026-09-13: early hide at 06.834, this path re-attached at
+                // 07.022, detached again at 08.596. Three authorities, same flicker.
+                if (eventLogAuthoritative()) return false;
+                kickFallbackRefresh();
+                return apply(context, "daemon foreground fallback");
             }
             // Same evaluation as the event path, so the watchdog cannot disagree with it.
             // It also no longer needs an activity class to be useful, which is what made the
             // old version silently do nothing on every tick.
+            noA11yTicks = 0;   // instance is back; any heal countdown restarts from scratch
+            // Same rule as the event path: while the event log is live it owns the verdict, and
+            // the window list must not second-guess it mid-transition. The watchdog still has a
+            // job — HomePanelOverlayService reconciles shouldShow() against attached — but that
+            // corrects a failed attach rather than re-deciding where we are.
+            if (eventLogAuthoritative()) return false;
             String pkg = a11y.activeWindowPackage();
             if (pkg != null && !pkg.isEmpty()
                     && !SYSTEM_UI_PKG.equals(pkg) && !pkg.equals(context.getPackageName())) {
@@ -189,8 +327,18 @@ public final class HomePanelFocus {
         // No class AND the launcher package: the fallback verdict keeps its last value. It is
         // only a fallback now — the window list below is what actually decides.
 
+        // Caches above are still worth updating (they feed the edit-mode refinement and the
+        // degraded paths), but the verdict itself is not ours to move while the event log is
+        // live — see eventLogAuthoritative().
+        if (eventLogAuthoritative()) return;
+
         String reason = "foreground " + pkg + (activityClass != null ? "/" + activityClass : "");
-        if (apply(context, reason)) HomePanelOverlayService.syncWithConfig(context);
+        // Dispatch straight to the running service rather than via startForegroundService:
+        // the attach/detach has to happen NOW, and the service-start path routes through
+        // ActivityManagerService, which is busiest during the app launch that triggers the
+        // hide. onFocusVerdictChanged still falls back to syncWithConfig when nothing is
+        // running, so the feature still starts from a cold state.
+        if (apply(context, reason)) HomePanelOverlayService.onFocusVerdictChanged(context);
     }
 
     /**
@@ -208,8 +356,23 @@ public final class HomePanelFocus {
     private static boolean homeShowing(Context context) {
         KeepAliveAccessibilityService a11y = KeepAliveAccessibilityService.getInstance();
         String launcher = resolveHomePackage(context);
+        if (a11y == null) {
+            // Degraded: accessibility is not bound, so the window list and the event-derived
+            // cache are both unavailable and stale respectively. Use the daemon's answer and
+            // nothing else — falling back to the cached verdict here is what would risk
+            // leaving the panel up over another app. Unknown (null) reads as not-home.
+            return fallbackHome == Boolean.TRUE;
+        }
         if (a11y != null) {
             KeepAliveAccessibilityService.Surfaces s = a11y.surfaces();
+            // Leave home as soon as another app's window is ON TOP, without waiting for it to
+            // become the ACTIVE window. Measured on the car 2026-09-12: opening DAB++ put its
+            // window in the list at ~1060ms but made it active only at ~1370ms, so the
+            // active-window test below detached us ~300ms after the app had already drawn.
+            // Checked first because it is the earliest true signal; everything below is about
+            // distinguishing WHICH launcher surface is up, which only matters once we know we
+            // are still on the launcher at all.
+            if (s.foreignAppOnTop) return false;
             String active = s.activePackage;
             // Our own package as the ACTIVE window means OverDrive's real UI is in front, so
             // the panel must go. It cannot be the overlay: that window is FLAG_NOT_FOCUSABLE
@@ -242,6 +405,101 @@ public final class HomePanelFocus {
         if (isHome == launcherForeground) return false;
         launcherForeground = isHome;
         Log.i(TAG, reason + " -> home=" + isHome);
+        return true;
+    }
+
+    /**
+     * Verdict from the daemon's event-log watcher — now the panel's primary signal.
+     *
+     * <p>Authoritative and early: the system emits these when it changes the foreground, not
+     * when a window finishes drawing and not when an accessibility service happens to be bound.
+     * Measured 0.5-0.7s ahead of the accessibility path on the same transitions.
+     *
+     * @param raw either {@code "PENDING"} (a task is coming forward, component not yet known)
+     *            or a full {@code package/activity}
+     * @return true when the verdict changed, so the caller can attach/detach
+     */
+    /**
+     * When the event log last spoke. While it is live it is the ONLY thing allowed to move the
+     * verdict.
+     *
+     * <p>Two authorities fought on the car 2026-09-13 and the panel attached on top of Telenav:
+     * the event log said the launcher had resumed, the accessibility window list still saw the
+     * previous app's window on top and said not-home, and a classless accessibility event
+     * ({@code com.telenav.app.arp/android.widget.FrameLayout}) then fell through to the cached
+     * verdict and said home. Attach/detach/attach inside 500ms, and one of those attaches was
+     * over another app. The event log is both earlier and unambiguous, so it wins outright and
+     * accessibility is demoted to refining edit-mode.
+     *
+     * <p>The staleness bound only exists so a dead watcher cannot freeze the panel forever; it
+     * is deliberately far longer than any gap between real foreground changes, because the log
+     * is silent by design when nothing moves.
+     */
+    private static final long EVENT_LOG_AUTHORITY_MS = 5L * 60_000L;
+    private static volatile long lastEventLogAtMs = 0L;
+
+    /** Task id the launcher's home screen was last seen in; null until one is observed. */
+    private static volatile String launcherTaskId = null;
+
+    /** True while the event-log watcher is the authority and accessibility must not override. */
+    private static boolean eventLogAuthoritative() {
+        long at = lastEventLogAtMs;
+        return at != 0L
+                && (android.os.SystemClock.elapsedRealtime() - at) < EVENT_LOG_AUTHORITY_MS;
+    }
+
+    public static boolean onForegroundEvent(Context context, String raw) {
+        if (raw == null) return false;
+        String v = raw.trim();
+        if (v.isEmpty()) return false;
+        lastEventLogAtMs = android.os.SystemClock.elapsedRealtime();
+
+        // Both kinds of line may carry "@<taskId>". Split it off first so the verdict logic
+        // below works on the bare value.
+        String task = null;
+        int at = v.lastIndexOf('@');
+        if (at > 0) {
+            task = v.substring(at + 1);
+            v = v.substring(0, at);
+        }
+
+        if ("PENDING".equals(v)) {
+            // The launcher's OWN task moving forward is not another app covering home. Without
+            // this the panel hid and re-showed on every launcher task move — a visible strobe
+            // during a relaunch on 2026-09-13. Unknown task ids fall through to the old
+            // behaviour rather than being ignored: missing an early hide is a lag, ignoring a
+            // real one leaves the panel over an app.
+            if (task != null && task.equals(launcherTaskId)) return false;
+            // Only ever used to HIDE, and only from the showing state. While the panel is up the
+            // launcher is by definition in front, so a task coming forward is necessarily
+            // something else about to cover it — act now rather than waiting for the resolved
+            // component, which for a cold app arrives hundreds of ms later. From the hidden
+            // state a task move is just as likely to be the launcher returning, so that case is
+            // left to the resolved line and cannot flicker.
+            if (!launcherForeground) return false;
+            launcherForeground = false;
+            Log.i(TAG, "task coming forward while home was showing -> home=false (early hide)");
+            return true;
+        }
+
+        boolean isHome = LAUNCHER_HOME_COMPONENT.equals(v);
+        // Learn which task the home screen lives in, so a PENDING for that task can be ignored.
+        // Re-learned on every home resume rather than cached once: the launcher's task is
+        // recreated on some transitions and a stale id would silently stop suppressing.
+        if (isHome && task != null) launcherTaskId = task;
+        if (isHome) {
+            // The launcher's edit-layout mode is a window inside the SAME activity, so the
+            // component cannot distinguish it and the panel would draw over the screen the user
+            // is editing. The window list can tell, when accessibility is up to be asked.
+            try {
+                KeepAliveAccessibilityService a11y = KeepAliveAccessibilityService.getInstance();
+                if (a11y != null && a11y.surfaces().editWindow) isHome = false;
+            } catch (Throwable ignored) { }
+        }
+        if (isHome == launcherForeground) return false;
+        launcherForeground = isHome;
+        lastRealPackage = v.substring(0, Math.max(0, v.indexOf('/')));
+        Log.i(TAG, "event log " + v + " -> home=" + isHome);
         return true;
     }
 
