@@ -152,9 +152,13 @@ public class Conditions {
                         new Label("locked", "automation.locked"),
                         new Label("unlocked", "automation.unlocked"))));
         // Unlock SOURCE as a trigger (on-change) and condition, same pattern as lock
-        // above. Latched from persist.sys.cloud.unlock_type (index-freshness gated)
-        // with a bodywork-event fallback for the keyless case; reset to "none" on the
-        // lock edge (sub 48).
+        // above. As of sub 48 the only value ever actually published is "fob", from the
+        // proven BODYWORK_REMOTE_CONTROL_UNLOCK bodywork event (BydDataCollector#
+        // onFobUnlockEvent). The rest of the vocabulary is reserved for future work —
+        // nfc_card has a real bodywork event but it also fires on locking with the
+        // card (needs disambiguation); app/digital_key/keyless have no bodywork event
+        // at all. No lock-triggered reset to "none" — see onFobUnlockEvent's comment
+        // for why that's not needed in practice.
         addCondition(new EventCondition(
                 new Label("unlockSource", "automation.unlock_source"),
                 "automation.unlock_source_description",
@@ -168,8 +172,9 @@ public class Conditions {
                         new Label("keyless", "automation.unlock_source_keyless"),
                         new Label("unknown", "automation.unlock_source_unknown"))));
         // Easy-entry seat motion as a trigger (on-change) and condition, same pattern.
-        // "settled" only fires after the seat has actually moved and then held still —
-        // an unlock with no door opened never reaches it (sub 48).
+        // "settled" only fires after the seat has actually moved and then held still.
+        // Armed ONLY by a fob-button unlock (sub 48) — an unlock with no door opened,
+        // or any non-fob unlock source, never arms this at all.
         addCondition(new EventCondition(
                 new Label("easyEntry", "automation.easy_entry"),
                 "automation.easy_entry_description",

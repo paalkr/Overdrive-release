@@ -9908,8 +9908,8 @@ public class BydDataCollector {
             notifyDoorStateListeners(area, state);
         }
 
-        // Unlock-source fallback events. Arrive only on this generic channel (no
-        // typed callback exists) and only because registerBodyworkListener also
+        // Unlock-source events. Arrive only on this generic channel (no typed
+        // callback exists) and only because registerBodyworkListener also
         // registers the 2-arg overload. The HAL ignores its int[] filter and
         // delivers EVERY bodywork event here — sub 48's probe build found this
         // extremely chatty, so only the two mapped ids are handled; everything
@@ -9917,10 +9917,22 @@ public class BydDataCollector {
         if ("onDataEventChanged".equals(method) && args != null && args.length >= 2) {
             int eventId = (args[0] instanceof Integer) ? (Integer) args[0] : Integer.MIN_VALUE;
             if (eventId == BydFeatureIds.BODYWORK_REMOTE_CONTROL_UNLOCK) {
-                lastFobEventAtMs = System.currentTimeMillis();
-            } else if (eventId == BydFeatureIds.BODYWORK_CARD_NFC_KEY_STATE) {
-                lastNfcEventAtMs = System.currentTimeMillis();
+                int intValue = BydDeviceHelper.getIntValue(args[1]);
+                // Proven on-car (sub 48, 2026-09-03): fires intValue=1 then clears
+                // to a sentinel/0 after ~240ms. Only the transition INTO 1 is a
+                // real fob-button press; the clear-back must never re-arm.
+                boolean isPressEdge = intValue == 1 && lastFobRawIntValue != 1;
+                lastFobRawIntValue = intValue;
+                if (isPressEdge) {
+                    onFobUnlockEvent();
+                }
             }
+            // BODYWORK_CARD_NFC_KEY_STATE (0x40334013) and BODYWORK_REMOTE_CONTROL_LOCK
+            // are declared in BydFeatureIds but deliberately not handled here yet: NFC
+            // fires on both lock and unlock with the card (ambiguous without extra
+            // logic) and app/keyless unlocks have no bodywork event at all. Wiring
+            // those needs their own design, not a fallback bolted onto a dead listener
+            // (see the removed handleUnlockSourceEdge/deriveUnlockSource, sub 48).
         }
         notifyLockSnapshotListeners(updated);
     }
@@ -9931,95 +9943,75 @@ public class BydDataCollector {
     // seat's easy-entry motion has settled). Both self-gated by anyReferenced so
     // they cost nothing unless an automation actually uses one.
 
-    /** Raw SDK lock state last seen from onDoorLockCallback, for edge detection. */
-    private volatile int lastRawLockState = -1;
-    /** sys.cloud.unlock_index last seen, so a stale persisted unlock_type is never trusted. */
-    private volatile int lastSeenUnlockIndex = Integer.MIN_VALUE;
-    /** Timestamps of the last bodywork fob/NFC events, for the unlock_type==0 fallback. */
-    private volatile long lastFobEventAtMs = 0;
-    private volatile long lastNfcEventAtMs = 0;
-    private static final long BODYWORK_EVENT_FRESHNESS_MS = 1500;
+    /** Raw intValue last seen from BODYWORK_REMOTE_CONTROL_UNLOCK, for press-edge detection. */
+    private volatile int lastFobRawIntValue = -1;
 
     private volatile java.util.concurrent.ScheduledExecutorService easyEntryScheduler;
-    private static final long EASY_ENTRY_POLL_INTERVAL_MS = 100;
+    // Timing below MATCHES the proven on-car script (artifacts/seat_unlock_test.sh,
+    // 2026-09-02, sub 48) exactly, rather than the tighter values used in the first
+    // in-process cut of this code — the script is the one thing actually verified
+    // end-to-end (seat moved to a saved position, car off) on this car.
+    private static final long EASY_ENTRY_POLL_INTERVAL_MS = 200;
     /** Consecutive unchanged reads AFTER motion has started before declaring "settled". */
     private static final int EASY_ENTRY_STATIONARY_SAMPLES = 3;
+    /** Displacement from the pre-motion baseline required to call it real motion, not noise. */
+    private static final double EASY_ENTRY_MOTION_THRESHOLD = 2.0;
+    /** Extra margin AFTER the stationary-samples threshold, before actually publishing settled. */
+    private static final long EASY_ENTRY_SETTLE_EXTRA_DELAY_MS = 1500;
     /** Disarm quietly if nothing ever settles (e.g. the door was never opened). */
     private static final long EASY_ENTRY_ARM_WINDOW_MS = 30_000;
 
     /**
-     * Called from onDoorLockCallback on every raw SDK lock/unlock event. Detects the
-     * LOCK/UNLOCK edge (raw SDK: UNLOCK=1, LOCK=2) and drives unlockSource + easyEntry.
+     * Called from the bodywork listener on a fob-button press edge (see
+     * onBodyworkCallback). This is the PROVEN signal (sub 48, 2026-09-03: fires only
+     * on a real fob-button unlock, never on keyless) — the primary arm trigger.
+     * unlockSource is set directly, with no property read needed for this case.
      */
-    private void handleUnlockSourceEdge(int sdkState) {
-        if (sdkState == lastRawLockState) return; // not an edge
-        lastRawLockState = sdkState;
+    private void onFobUnlockEvent() {
         boolean referenced =
                 anyReferenced(com.overdrive.app.automation.condition.BydEvent.UNLOCK_SOURCE)
                 || anyReferenced(com.overdrive.app.automation.condition.BydEvent.EASY_ENTRY);
         if (!referenced) return;
-
-        if (sdkState == 2) { // LOCK edge
-            stopEasyEntryPoll();
-            publishUnlockSource("none");
-            publishEasyEntry("idle");
-            return;
-        }
-        if (sdkState != 1) return; // not a genuine UNLOCK edge
-
-        publishUnlockSource(deriveUnlockSource());
+        publishUnlockSource("fob");
         armEasyEntryPoll();
     }
 
-    /**
-     * Derive the unlock source at an unlock edge. `persist.sys.cloud.unlock_type` is a
-     * `persist.` property that SURVIVES REBOOT holding a stale value, so a non-zero
-     * reading is only trusted when `sys.cloud.unlock_index` has also changed since the
-     * last check — otherwise it falls through to the bodywork-event fallback exactly
-     * like the type==0 (cleared) case. 3=nfc_card, 4=app, 6=fob (sub 48, measured).
-     */
-    private String deriveUnlockSource() {
-        int unlockType = getIntSystemProperty("persist.sys.cloud.unlock_type", 0);
-        int unlockIndex = getIntSystemProperty("sys.cloud.unlock_index", Integer.MIN_VALUE);
-        boolean indexFresh = unlockIndex != lastSeenUnlockIndex;
-        lastSeenUnlockIndex = unlockIndex;
-        if (indexFresh) {
-            if (unlockType == 6) return "fob";
-            if (unlockType == 4) return "app";
-            if (unlockType == 3) return "nfc_card";
-        }
-        long now = System.currentTimeMillis();
-        if (now - lastFobEventAtMs <= BODYWORK_EVENT_FRESHNESS_MS) return "fob";
-        if (now - lastNfcEventAtMs <= BODYWORK_EVENT_FRESHNESS_MS) return "nfc_card";
-        return "keyless";
-    }
-
-    /** Reflection read of an Android int system property; returns {@code def} on any failure. */
-    private static int getIntSystemProperty(String key, int def) {
-        try {
-            Class<?> systemProperties = Class.forName("android.os.SystemProperties");
-            java.lang.reflect.Method getInt =
-                    systemProperties.getMethod("getInt", String.class, int.class);
-            return (Integer) getInt.invoke(null, key, def);
-        } catch (Throwable t) {
-            return def;
-        }
-    }
+    // NOT implemented: a door-lock-edge fallback for app/nfc_card/keyless unlock
+    // sources, and a LOCK-triggered reset of unlockSource to "none". An earlier cut
+    // of this code had both, gated on AbsBYDAutoDoorLockListener.onDoorLockStatusChanged
+    // — removed as dead code (sub 48, 2026-09-09): CameraDaemon's own comments confirm
+    // that callback never fires on any firmware in the field, which is exactly why
+    // CameraDaemon itself polls (readDoorLockStatus, 5s) instead of listening for lock
+    // state. No lock-triggered reset is needed in practice: unlockSource is only ever
+    // read once easyEntry reaches "settled", and only onFobUnlockEvent can ever arm
+    // easyEntry — so unlockSource is always freshly "fob" at that point regardless of
+    // what it held before. A stale value can never cause a false fire.
+    //
+    // Reviving app/nfc_card/keyless needs a working trigger, not a fallback bolted onto
+    // a dead listener: nfc_card has a real bodywork event (BODYWORK_CARD_NFC_KEY_STATE)
+    // but it fires on both lock AND unlock with the card, so needs disambiguation logic
+    // of its own; app/keyless have no bodywork event at all and would need some other
+    // signal (system-property poll at minimum) — see the byd-projects KB for detail.
 
     /**
-     * Arm the easy-entry poll: read {@code BODYWORK_SEAT_HORIZONTAL} at ~100ms, in
-     * process (no HTTP), for up to {@link #EASY_ENTRY_ARM_WINDOW_MS}. Publishes
-     * "moving" on the first observed change, then "settled" once
-     * {@link #EASY_ENTRY_STATIONARY_SAMPLES} consecutive reads come back unchanged —
-     * but only AFTER motion has been observed at least once, so an unlock where the
-     * door is never opened (nobody getting in) stays idle and never fires the
-     * automation (measured + confirmed with Pal on-car, sub 48, 2026-09-09).
+     * Arm the easy-entry poll: read {@code BODYWORK_SEAT_HORIZONTAL} at
+     * {@link #EASY_ENTRY_POLL_INTERVAL_MS}, in process (no HTTP), for up to
+     * {@link #EASY_ENTRY_ARM_WINDOW_MS}. Publishes "moving" once the value has
+     * moved more than {@link #EASY_ENTRY_MOTION_THRESHOLD} from the pre-motion
+     * baseline, then "settled" once {@link #EASY_ENTRY_STATIONARY_SAMPLES}
+     * consecutive reads come back unchanged AND a further
+     * {@link #EASY_ENTRY_SETTLE_EXTRA_DELAY_MS} has passed — but only after
+     * motion was observed at least once, so an unlock where the door is never
+     * opened (nobody getting in) stays idle and never fires the automation.
+     * Every threshold here is copied from the proven on-car script
+     * (artifacts/seat_unlock_test.sh, 2026-09-02, sub 48), not re-derived.
      */
     private synchronized void armEasyEntryPoll() {
         stopEasyEntryPoll(); // restart cleanly on a fresh unlock edge
         if (bodyworkDevice == null) return;
         publishEasyEntry("idle");
         final long armedAt = System.currentTimeMillis();
+        final double[] baseline = {Double.NaN};
         final double[] lastValue = {Double.NaN};
         final boolean[] hasMoved = {false};
         final int[] stationaryCount = {0};
@@ -10040,24 +10032,46 @@ public class BydDataCollector {
                 double v = raw != null ? BydDeviceHelper.getDoubleValue(raw) : Double.NaN;
                 if (Double.isNaN(v)) return; // unreadable tick, don't disturb state
 
-                if (Double.isNaN(lastValue[0])) {
-                    lastValue[0] = v; // first sample is the baseline, not yet "moved"
-                    return;
-                }
-                if (v != lastValue[0]) {
+                if (Double.isNaN(baseline[0])) {
+                    baseline[0] = v;
                     lastValue[0] = v;
-                    stationaryCount[0] = 0;
-                    if (!hasMoved[0]) {
+                    return; // first sample: establish the pre-motion baseline only
+                }
+
+                if (!hasMoved[0]) {
+                    // Displacement from the FIXED baseline, matching the proven
+                    // script's `d>2` gate. A per-step compare here would latch
+                    // "moving" on a single unit of read noise.
+                    if (Math.abs(v - baseline[0]) > EASY_ENTRY_MOTION_THRESHOLD) {
                         hasMoved[0] = true;
+                        lastValue[0] = v;
+                        stationaryCount[0] = 0;
                         publishEasyEntry("moving");
                     }
                     return;
                 }
-                if (!hasMoved[0]) return; // stationary before any motion: still idle
-                if (++stationaryCount[0] >= EASY_ENTRY_STATIONARY_SAMPLES) {
-                    publishEasyEntry("settled");
-                    stopEasyEntryPoll();
+
+                // Already moving: track quiet vs changing against the PREVIOUS
+                // sample (exact compare), same as the proven script's settle loop.
+                if (v != lastValue[0]) {
+                    lastValue[0] = v;
+                    stationaryCount[0] = 0;
+                    return;
                 }
+                if (++stationaryCount[0] < EASY_ENTRY_STATIONARY_SAMPLES) return;
+
+                // Quiet for EASY_ENTRY_STATIONARY_SAMPLES ticks. The proven script
+                // waits a further fixed delay here before applying — reproduce that
+                // BEFORE publishing settled, not instead of it. Sleeping on this
+                // dedicated single-thread executor blocks nothing else; must run
+                // before stopEasyEntryPoll(), which self-interrupts this thread.
+                try {
+                    Thread.sleep(EASY_ENTRY_SETTLE_EXTRA_DELAY_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+                publishEasyEntry("settled");
+                stopEasyEntryPoll();
             } catch (Throwable t) {
                 logger.debug("Easy-entry poll error: " + t.getMessage());
             }
@@ -10112,7 +10126,6 @@ public class BydDataCollector {
             int area = (args[0] instanceof Integer) ? (Integer) args[0] : -1;
             int sdkState = (args[1] instanceof Integer) ? (Integer) args[1] : -1;
             notifyDoorLockListeners(area, sdkState);
-            handleUnlockSourceEdge(sdkState);
         }
         notifyLockSnapshotListeners(updated);
     }

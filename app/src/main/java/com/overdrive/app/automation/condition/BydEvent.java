@@ -55,16 +55,19 @@ public class BydEvent {
     // condition can gate "only while locked". NOT read from the dead BYDAutoDoorLockDevice.
     public static final EventData LOCK = new EventData("lock");
     /**
-     * How the car was unlocked: none|fob|nfc_card|app|digital_key|keyless|unknown.
-     * Latched from the unlock edge, reset to "none" on the lock edge. See
-     * BydDataCollector#handleUnlockSourceEdge (sub 48).
+     * How the car was unlocked. Vocabulary: none|fob|nfc_card|app|digital_key|keyless|
+     * unknown — but as of sub 48 the ONLY value ever actually published is "fob" (from
+     * the proven BODYWORK_REMOTE_CONTROL_UNLOCK bodywork event); the rest are reserved
+     * for future work, not currently reachable. See BydDataCollector#onFobUnlockEvent.
+     * No lock-triggered reset to "none" exists (or is needed — see that method's
+     * comment); the value simply holds "fob" from the last fob unlock.
      */
     public static final EventData UNLOCK_SOURCE = new EventData("unlockSource");
     /**
-     * Easy-entry seat motion: idle|moving|settled. Armed only within a short window of
-     * an unlock edge; never reaches "settled" unless the seat actually moved first, so
-     * an unlock with no door open (nobody getting in) stays idle rather than firing
-     * early. See BydDataCollector#armEasyEntryPoll (sub 48).
+     * Easy-entry seat motion: idle|moving|settled. Armed ONLY by a fob-button unlock
+     * (BydDataCollector#onFobUnlockEvent) — never reaches "settled" unless the seat
+     * actually moved first, so an unlock with no door open (nobody getting in) stays
+     * idle rather than firing early. See BydDataCollector#armEasyEntryPoll (sub 48).
      */
     public static final EventData EASY_ENTRY = new EventData("easyEntry");
     // Energy-recuperation / regen-braking strength (standard/high/max), read locally via
